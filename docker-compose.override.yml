@@ -1,0 +1,21 @@
+services:
+  app:
+    build:
+      context: ./
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgres://postgres:postgres@db:5432/marketplace
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./src:/app/src
+      - /app/node_modules
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    ports:
+      - "5432:5432"
