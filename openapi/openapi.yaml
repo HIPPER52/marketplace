@@ -1,0 +1,395 @@
+openapi: 3.0.3
+
+info:
+  title: Marketplace API
+  version: 1.0.0
+  license:
+    name: ISC
+    url: https://opensource.org/license/isc-license-txt
+  description: |
+    Contract-first API for a small marketplace: a product catalogue and customer orders.
+
+    Conventions that hold across every operation:
+
+    - **Money is integer minor units.** Every `*_cents` field is an integer number of
+      cents. There are no floats and no decimal strings anywhere in this contract.
+    - **Lists are cursor-paginated.** List operations take `limit` and `cursor` and
+      answer with `{ items, next_cursor }`. A `next_cursor` of `null` means the caller
+      has reached the end of the collection.
+    - **Errors are RFC 7807 problem documents** served as `application/problem+json`.
+
+security: []
+
+servers:
+  - url: https://api.marketplace.local
+    description: >-
+      Placeholder host; the service is not deployed yet. Run it locally with
+      `npm start` and call http://localhost:3000 — the server declares no base path,
+      so every route below sits at the root either way.
+
+tags:
+  - name: Products
+    description: Product catalogue
+  - name: Orders
+    description: Customer orders
+
+paths:
+  /products:
+    get:
+      tags: [Products]
+      operationId: listProducts
+      summary: List products
+      description: Returns a cursor-paginated page of the product catalogue.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of products to return in one page.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          required: false
+          description: >-
+            Opaque pagination token. Clients must treat it as a meaningless string:
+            pass back the `next_cursor` returned by the previous page and never parse,
+            decode or construct it by hand. Its encoding is an implementation detail
+            and may change without notice.
+          schema:
+            type: string
+            pattern: "^[A-Za-z0-9_-]+$"
+            minLength: 4
+            maxLength: 256
+      responses:
+        "200":
+          description: A page of products.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProductPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /products/{productId}:
+    get:
+      tags: [Products]
+      operationId: getProduct
+      summary: Get a product by id
+      description: Returns a single product from the catalogue.
+      parameters:
+        - name: productId
+          in: path
+          required: true
+          description: Identifier of the product.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The requested product.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Product"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /orders:
+    get:
+      tags: [Orders]
+      operationId: listOrders
+      summary: List orders
+      description: Returns a cursor-paginated page of orders, newest first.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of orders to return in one page.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          required: false
+          description: >-
+            Opaque pagination token. Clients must treat it as a meaningless string:
+            pass back the `next_cursor` returned by the previous page and never parse,
+            decode or construct it by hand. Its encoding is an implementation detail
+            and may change without notice.
+          schema:
+            type: string
+            pattern: "^[A-Za-z0-9_-]+$"
+            minLength: 4
+            maxLength: 256
+      responses:
+        "200":
+          description: A page of orders.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+    post:
+      tags: [Orders]
+      operationId: createOrder
+      summary: Create an order
+      description: |
+        Places a new order. The operation is idempotent: see the `Idempotency-Key`
+        header for the exact replay semantics.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: >-
+            Client-generated key that makes order creation safe to retry. Replaying the
+            same key with the same request body returns the original 201 response
+            unchanged, together with an `Idempotency-Replay: true` header, and creates
+            no second order. Reusing the same key with a different body is a client
+            bug and is rejected with 422. Use a fresh UUID per logical order and keep
+            it stable across network retries of that order.
+          schema:
+            type: string
+            minLength: 8
+            maxLength: 255
+          example: 3f1a9c1e-9a5e-4a54-8f2f-2b1f0d9c7a11
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateOrderRequest"
+      responses:
+        "201":
+          description: The order was created, or an identical request was replayed.
+          headers:
+            Idempotency-Replay:
+              description: >-
+                Present and `true` when this response is a replay of an earlier request
+                carrying the same `Idempotency-Key`. Absent on first creation.
+              schema:
+                type: boolean
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  /orders/{orderId}:
+    get:
+      tags: [Orders]
+      operationId: getOrder
+      summary: Get an order by id
+      description: Returns a single order with its line items.
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          description: Identifier of the order.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The requested order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+components:
+  responses:
+    BadRequest:
+      description: The request does not satisfy this contract.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+    NotFound:
+      description: The requested resource does not exist.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+    UnprocessableEntity:
+      description: The request is well-formed but cannot be processed.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+  schemas:
+    Problem:
+      type: object
+      description: An RFC 7807 problem document.
+      required: [type, title, status, detail, instance]
+      properties:
+        type:
+          type: string
+          format: uri
+          description: URI identifying the problem type.
+          example: https://api.marketplace.local/problems/validation-error
+        title:
+          type: string
+          description: Short, human-readable summary of the problem type.
+          example: Request validation failed
+        status:
+          type: integer
+          description: HTTP status code of this response.
+          example: 400
+        detail:
+          type: string
+          description: Human-readable explanation specific to this occurrence.
+          example: request/headers must have required property 'idempotency-key'
+        instance:
+          type: string
+          format: uri-reference
+          description: URI reference identifying this specific occurrence.
+          example: /orders
+
+    Product:
+      type: object
+      required: [id, title, price_cents, currency, in_stock]
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+          example: Mechanical keyboard
+        price_cents:
+          type: integer
+          minimum: 0
+          description: Price in minor units (cents).
+          example: 260000
+        currency:
+          $ref: "#/components/schemas/Currency"
+        in_stock:
+          type: integer
+          minimum: 0
+          description: Units currently available.
+          example: 7
+
+    ProductPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Product"
+        next_cursor:
+          type: string
+          nullable: true
+          description: >-
+            Opaque token pointing at the next page, or `null` when this is the last
+            page. Pass it back unchanged in the `cursor` query parameter.
+
+    Order:
+      type: object
+      required: [id, status, items, total_cents, currency, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [pending, paid, shipped, cancelled]
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/OrderItem"
+        total_cents:
+          type: integer
+          minimum: 0
+          description: Order total in minor units (cents).
+          example: 520000
+        currency:
+          $ref: "#/components/schemas/Currency"
+        created_at:
+          type: string
+          format: date-time
+
+    OrderPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Order"
+        next_cursor:
+          type: string
+          nullable: true
+          description: >-
+            Opaque token pointing at the next page, or `null` when this is the last
+            page. Pass it back unchanged in the `cursor` query parameter.
+
+    OrderItem:
+      type: object
+      required: [product_id, quantity, unit_price_cents, subtotal_cents]
+      properties:
+        product_id:
+          type: string
+          format: uuid
+        quantity:
+          type: integer
+          minimum: 1
+        unit_price_cents:
+          type: integer
+          minimum: 0
+          description: Price of one unit at the time the order was placed, in cents.
+        subtotal_cents:
+          type: integer
+          minimum: 0
+          description: quantity × unit_price_cents, in cents.
+
+    CreateOrderRequest:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          description: Line items to order. At least one is required.
+          items:
+            $ref: "#/components/schemas/CreateOrderItem"
+        currency:
+          $ref: "#/components/schemas/Currency"
+
+    CreateOrderItem:
+      type: object
+      additionalProperties: false
+      required: [product_id, quantity]
+      properties:
+        product_id:
+          type: string
+          format: uuid
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 100
+
+    Currency:
+      type: string
+      enum: [UAH, USD, EUR]
+      default: UAH
