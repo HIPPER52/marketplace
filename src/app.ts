@@ -5,7 +5,6 @@ import { errorHandler } from './problem.js';
 import { ordersRouter } from './routes/orders.js';
 import { productsRouter } from './routes/products.js';
 
-
 export const SPEC_PATH = fileURLToPath(new URL('../openapi/openapi.yaml', import.meta.url));
 
 export function createApp(): Express {

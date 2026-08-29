@@ -3,7 +3,6 @@ import type { components } from './generated/api.js';
 export type Product = components['schemas']['Product'];
 export type Order = components['schemas']['Order'];
 
-
 const products: Product[] = [
     {
         id: '6f1c2a34-0d51-4b8e-9a7d-1f2e3c4b5a60',

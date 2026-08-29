@@ -1,6 +1,5 @@
 import { ProblemError, ProblemType } from './problem.js';
 
-
 export function encodeCursor(offset: number): string {
     return Buffer.from(`offset:${offset}`, 'utf8').toString('base64url');
 }

@@ -3,6 +3,9 @@ openapi: 3.0.3
 info:
   title: Marketplace API
   version: 1.0.0
+  license:
+    name: ISC
+    url: https://opensource.org/license/isc-license-txt
   description: |
     Contract-first API for a small marketplace: a product catalogue and customer orders.
 
@@ -18,8 +21,11 @@ info:
 security: []
 
 servers:
-  - url: http://localhost:3000
-    description: Local development server
+  - url: https://api.marketplace.local
+    description: >-
+      Placeholder host; the service is not deployed yet. Run it locally with
+      `npm start` and call http://localhost:3000 — the server declares no base path,
+      so every route below sits at the root either way.
 
 tags:
   - name: Products
@@ -54,6 +60,9 @@ paths:
             and may change without notice.
           schema:
             type: string
+            pattern: "^[A-Za-z0-9_-]+$"
+            minLength: 4
+            maxLength: 256
       responses:
         "200":
           description: A page of products.
@@ -116,6 +125,9 @@ paths:
             and may change without notice.
           schema:
             type: string
+            pattern: "^[A-Za-z0-9_-]+$"
+            minLength: 4
+            maxLength: 256
       responses:
         "200":
           description: A page of orders.

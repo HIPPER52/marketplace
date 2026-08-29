@@ -13,7 +13,6 @@ export const ProblemType = {
     internal: `${BASE}/internal-error`,
 } as const;
 
-
 export class ProblemError extends Error {
     readonly status: number;
     readonly type: string;
