@@ -143,6 +143,113 @@ describe. Renaming `total_cents` to `totalCents` in the order handler is caught 
 is bypassed the runtime answers `500` with
 `detail: "/response must have required property 'total_cents'"`.
 
+## Configuration
+
+Every variable the service reads is declared in one place —
+[`src/config/schemas/env.schema.ts`](src/config/schemas/env.schema.ts) — and validated
+before the DI graph is built. A missing or malformed variable stops the process at
+startup with the name and the reason, rather than surfacing on the first request in
+production. Nothing outside that schema touches `process.env`.
+
+### Variables
+
+| Variable           | Required | Default                 | Meaning                                            |
+| ------------------ | -------- | ----------------------- | -------------------------------------------------- |
+| `NODE_ENV`         | no       | `development`           | `development` \| `test` \| `production`            |
+| `PORT`             | no       | `3000`                  | HTTP port                                          |
+| `DB_HOST`          | **yes**  | —                       | Postgres hostname                                  |
+| `DB_PORT`          | no       | `5432`                  | Postgres port                                      |
+| `DB_NAME`          | **yes**  | —                       | database name                                      |
+| `DB_USER`          | **yes**  | —                       | role the service connects as                       |
+| `DB_PASSWORD_FILE` | no       | `./secrets/db_password` | file holding the password — **not** the password   |
+| `DB_POOL_MAX`      | no       | `10`                    | maximum pooled connections                         |
+| `LOG_LEVEL`        | no       | `log`                   | `error` \| `warn` \| `log` \| `debug` \| `verbose` |
+
+[`.env.example`](.env.example) is the contract: every variable above, each with a
+comment, secret values faked. Copy it and fill it in — `cp .env.example .env`. The real
+`.env` is git-ignored and never enters the Docker image.
+
+**The database password is deliberately not an environment variable.** It lives in a
+file, and `pg.Pool` is given a _function_ that re-reads that file for every new
+connection — which is what makes rotation possible without a restart.
+
+### Running
+
+```bash
+cp .env.example .env          # the variable contract, filled in
+npm run setup:secrets         # creates secrets/db_password with the value init.sql expects
+docker compose up -d          # service + Postgres, dev mode with hot-reload
+curl -s localhost:3000/health
+```
+
+Both of those files are git-ignored, so a fresh clone has neither — and the first run
+needs both. `secrets/db_password` especially: Docker silently creates a _directory_ when
+a bind-mount source is missing, and the service then fails reading it.
+
+Without Docker, against a Postgres you supply:
+
+```bash
+cp .env.example .env
+npm run setup:secrets
+npm install                   # `prepare` builds: generates types, then tsc
+npm start                     # npm run build && node dist/main.js
+```
+
+### Rotating the database password
+
+`rotate.sh` changes the password in three ordered steps, and the service keeps serving
+throughout — no restart, no dropped uptime.
+
+```bash
+curl -s localhost:3000/health          # note uptime_seconds
+bash rotate.sh
+curl -s localhost:3000/readiness       # 200 — this one goes to the database
+curl -s localhost:3000/health          # uptime_seconds is larger than before
+```
+
+What the script does, and why in this order:
+
+1. **`ALTER ROLE`** — the database begins accepting the new password.
+2. **Write `secrets/db_password`** — the pool will read it on the next connection.
+3. **`pg_terminate_backend`** — live sessions are cut, forcing that next connection.
+
+Reversing steps 1 and 2 would leave a window where the pool offers a password the
+database does not know yet. Closing the window entirely needs two alternating roles;
+that is a later lecture.
+
+Two things worth knowing:
+
+- After `docker compose down -v` the volume is gone and `init.sql` re-creates the role
+  with its original password, while `secrets/db_password` still holds the rotated one.
+  That mismatch is the usual `password authentication failed` — restore the file to
+  `local_dev_password` or rotate again.
+- Terminating sessions makes the pool emit an `error` event for each dropped idle
+  client. `createPool` registers a listener for exactly that reason; without one, Node
+  would take the process down and rotation would look broken when it is not.
+
+### Verifying the configuration
+
+```bash
+# The schema stops a broken environment at startup, with a non-zero exit code.
+mv .env /tmp                      # dotenv would otherwise supply the value silently
+env -u DB_HOST npm run start      # names DB_HOST, DB_NAME, DB_USER; echo $? -> 1
+mv /tmp/.env .
+
+# .env.example has not drifted from the schema.
+npm run check:env                 # exit 0; delete any line from the file -> exit 1
+
+# The secret is not in git.
+git status --ignored --porcelain | grep -E '^!! .*\.env$'   # finds it
+git ls-files | grep -c '\.env$'                             # 0 — only .env.example
+
+# The secret is not in the image.
+docker build -t myapp .
+docker run --rm myapp ls -a /app                  # .env.example yes; .env and secrets/ no
+docker run --rm myapp sh -c 'cat /app/.env' 2>&1  # No such file or directory
+docker inspect --format '{{.Config.Env}}' myapp   # base image variables only
+docker history --no-trunc myapp | grep -i password  # empty
+```
+
 ## Development
 
 ```bash
