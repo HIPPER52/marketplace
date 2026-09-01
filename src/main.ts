@@ -39,6 +39,6 @@ async function bootstrap(): Promise<void> {
 
 bootstrap().catch((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`\nmarketplace-api failed to start.\n\n${message}\n`);
+    console.error(`\nServer failed to start.\n\n${message}\n`);
     process.exit(1);
 });

@@ -262,5 +262,5 @@ npm run check         # all of the above plus the spec lint
 
 The stack also runs in Docker: `docker compose up -d` starts the service with hot-reload
 alongside Postgres 17; `docker compose -f docker-compose.yml up -d --build` is the
-production path. Postgres is not used yet - it lands with the database schema in a later
-assignment.
+production path. Postgres backs `/readiness` and the password rotation described above;
+the data schema and migrations arrive in a later assignment.

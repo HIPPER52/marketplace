@@ -11,14 +11,27 @@ psql_super() {
         psql --username "$SUPERUSER" --dbname "$DB_NAME" --quiet --no-align --tuples-only "$@"
 }
 
+if [[ ! -f "$SECRET_FILE" ]]; then
+    echo "No secret file at ${SECRET_FILE}. Run 'npm run setup:secrets' first." >&2
+    exit 1
+fi
+
 new_password="$(openssl rand -hex 24)"
+old_password="$(cat "$SECRET_FILE")"
 
 echo "==> 1/3  ALTER ROLE ${DB_ROLE}"
 psql_super --command "ALTER ROLE ${DB_ROLE} WITH PASSWORD '${new_password}';" > /dev/null
 
 echo "==> 2/3  writing ${SECRET_FILE}"
 umask 077
-printf '%s' "$new_password" > "$SECRET_FILE"
+if ! printf '%s' "$new_password" > "$SECRET_FILE"; then
+    echo "!!  Could not write ${SECRET_FILE}; rolling the database password back." >&2
+    psql_super --command "ALTER ROLE ${DB_ROLE} WITH PASSWORD '${old_password}';" > /dev/null
+    echo "!!  Rolled back. The service still holds a password the database accepts." >&2
+    exit 1
+fi
+
+chmod 600 "$SECRET_FILE"
 
 echo "==> 3/3  terminating existing ${DB_ROLE} sessions"
 terminated="$(psql_super --command \
