@@ -1,4 +1,5 @@
-import { ProblemError, ProblemType } from './problem.js';
+import { ProblemError, ProblemType } from '../errors/problem.error';
+import type { Page } from '../types/pagination.types';
 
 export function encodeCursor(offset: number): string {
     return Buffer.from(`offset:${offset}`, 'utf8').toString('base64url');
@@ -18,11 +19,6 @@ function decodeCursor(cursor: string): number {
     }
 
     return Number(match[1]);
-}
-
-export interface Page<T> {
-    items: T[];
-    next_cursor: string | null;
 }
 
 export function paginate<T>(all: readonly T[], limit: number, cursor?: string): Page<T> {

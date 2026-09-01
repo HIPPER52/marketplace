@@ -6,12 +6,18 @@ services:
       target: dev
     environment:
       NODE_ENV: development
-      DATABASE_URL: postgres://postgres:postgres@db:5432/marketplace
-    ports:
-      - "3000:3000"
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: marketplace
+      DB_USER: marketplace_app
+      DB_PASSWORD_FILE: /run/secrets/db_password
     volumes:
       - ./src:/app/src
+      - ./openapi:/app/openapi
+      - ./secrets/db_password:/run/secrets/db_password:ro
       - /app/node_modules
+    ports:
+      - "3000:3000"
     depends_on:
       db:
         condition: service_healthy
