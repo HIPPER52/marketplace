@@ -6,10 +6,7 @@ services:
       target: dev
     environment:
       NODE_ENV: development
-      DB_HOST: db
-      DB_PORT: 5432
-      DB_NAME: marketplace
-      DB_USER: marketplace_app
+      DATABASE_URL: postgres://marketplace_app@db:5432/marketplace
       DB_PASSWORD_FILE: /run/secrets/db_password
     volumes:
       - ./src:/app/src
@@ -24,4 +21,4 @@ services:
 
   db:
     ports:
-      - "5432:5432"
+      - "25432:5432"

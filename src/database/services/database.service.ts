@@ -3,6 +3,7 @@ import { Inject, Injectable, Logger, type OnModuleDestroy } from '@nestjs/common
 import { ConfigService } from '@nestjs/config';
 import { Pool, type QueryResult, type QueryResultRow } from 'pg';
 import type { Env } from '../../config/schemas/env.schema';
+import { parseDatabaseUrl } from '../../config/utils/database-url.util';
 import { PG_POOL } from '../constants/database.constants';
 
 @Injectable()
@@ -26,14 +27,15 @@ export class DatabaseService implements OnModuleDestroy {
 }
 
 export function createPool(config: ConfigService<Env, true>): Pool {
+    const target = parseDatabaseUrl(config.get('DATABASE_URL', { infer: true }));
     const passwordFile = config.get('DB_PASSWORD_FILE', { infer: true });
     const logger = new Logger('PgPool');
 
     const pool = new Pool({
-        host: config.get('DB_HOST', { infer: true }),
-        port: config.get('DB_PORT', { infer: true }),
-        database: config.get('DB_NAME', { infer: true }),
-        user: config.get('DB_USER', { infer: true }),
+        host: target.host,
+        port: target.port,
+        database: target.database,
+        user: target.user,
         max: config.get('DB_POOL_MAX', { infer: true }),
 
         password: async () => (await readFile(passwordFile, 'utf8')).trim(),

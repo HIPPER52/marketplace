@@ -1,13 +1,20 @@
 import { z } from 'zod';
+import { databaseUrlProblem } from '../utils/database-url.util';
 
 export const envSchema = z.object({
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
     PORT: z.coerce.number().int().positive().max(65535).default(3000),
 
-    DB_HOST: z.string().min(1, 'required: hostname of the Postgres server'),
-    DB_PORT: z.coerce.number().int().positive().max(65535).default(5432),
-    DB_NAME: z.string().min(1, 'required: database name'),
-    DB_USER: z.string().min(1, 'required: database role the service connects as'),
+    DATABASE_URL: z
+        .string()
+        .min(1, 'required: postgres connection string')
+        .superRefine((value, ctx) => {
+            const problem = databaseUrlProblem(value);
+
+            if (problem !== null) {
+                ctx.addIssue({ code: 'custom', message: problem });
+            }
+        }),
 
     DB_PASSWORD_FILE: z.string().min(1).default('./secrets/db_password'),
 
