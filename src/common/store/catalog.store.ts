@@ -1,7 +1,4 @@
-import type { components } from './generated/api.js';
-
-export type Product = components['schemas']['Product'];
-export type Order = components['schemas']['Order'];
+import type { Order, Product } from '../types/api.types';
 
 const products: Product[] = [
     {
@@ -51,7 +48,6 @@ export function findProduct(id: string): Product | undefined {
     return products.find((product) => product.id === id);
 }
 
-/** Newest first, which is what the contract's list operation promises. */
 export function listOrders(): readonly Order[] {
     return [...orders].reverse();
 }
