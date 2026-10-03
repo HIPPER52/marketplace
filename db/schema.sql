@@ -40,7 +40,14 @@ CREATE TABLE users (
     created_at   timestamptz NOT NULL DEFAULT now(),
 
     -- Stored as the customer typed it, matched case-insensitively — see q3.
-    CONSTRAINT users_email_unique UNIQUE (email),
+    --
+    -- There is deliberately no `UNIQUE (email)` here. It would be the wrong uniqueness:
+    -- it lets 'A@example.com' and 'a@example.com' both into the table, and then q3 —
+    -- which matches on lower(email) — has two rows for one person. The right constraint
+    -- is UNIQUE over lower(email), and Postgres can only express that as a unique index
+    -- rather than a table constraint, so it lives in db/indexes.sql next to the index q3
+    -- uses: they are the same index. `UNIQUE (email)` on top of it would be redundant —
+    -- if lower(email) is unique then email is too.
     CONSTRAINT users_email_shaped CHECK (position('@' IN email) > 1),
     CONSTRAINT users_display_name_not_blank CHECK (length(btrim(display_name)) > 0)
 );
@@ -102,7 +109,10 @@ CREATE TABLE order_items (
     CONSTRAINT order_items_quantity_positive CHECK (quantity > 0),
     CONSTRAINT order_items_unit_price_cents_nonnegative CHECK (unit_price_cents >= 0),
     -- One line per product per order: two lines for the same product is a bug, not a
-    -- bigger basket. Doubles as the index the order_id FOREIGN KEY wants anyway.
+    -- bigger basket. It also gives the order_id FOREIGN KEY the index it wants, because
+    -- order_id leads. The product_id FOREIGN KEY gets nothing from it — a composite index
+    -- is no use to a lookup on its second column — so product_id has an index of its own
+    -- in db/indexes.sql.
     CONSTRAINT order_items_one_line_per_product UNIQUE (order_id, product_id)
 );
 
