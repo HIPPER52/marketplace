@@ -6,11 +6,18 @@
     "scripts": {
         "setup:secrets": "mkdir -p secrets && printf 'local_dev_password' > secrets/db_password",
         "gen:types": "openapi-typescript openapi/openapi.yaml -o src/generated/api.ts",
-        "build": "npm run gen:types && tsc",
+        "build": "npm run gen:types && rm -rf dist && tsc",
         "start": "npm run build && node dist/main.js",
         "start:dev": "nest start --watch",
         "typecheck": "npm run gen:types && tsc --noEmit",
         "check:env": "tsx scripts/check-env-example.ts",
+        "migrate": "bash scripts/with-secrets.sh dev typeorm migration:run -d dist/database/data-source.js",
+        "migrate:show": "bash scripts/with-secrets.sh dev typeorm migration:show -d dist/database/data-source.js",
+        "migrate:revert": "bash scripts/with-secrets.sh dev typeorm migration:revert -d dist/database/data-source.js",
+        "migrate:generate": "bash scripts/with-secrets.sh dev typeorm migration:generate -d dist/database/data-source.js",
+        "seed": "bash scripts/with-secrets.sh dev node dist/database/cli/seed.js",
+        "demo:nplus1": "bash scripts/with-secrets.sh dev node dist/database/cli/demo-nplus1.js",
+        "report": "bash scripts/with-secrets.sh dev node dist/database/cli/report.js",
         "lint": "biome check .",
         "lint:fix": "biome check --write .",
         "format": "prettier --write \"**/*.{yaml,yml,md}\"",
@@ -32,6 +39,7 @@
         "pg": "^8.23.0",
         "reflect-metadata": "^0.2.2",
         "rxjs": "^7.8.2",
+        "typeorm": "0.3.31",
         "zod": "^4.5.4"
     },
     "devDependencies": {

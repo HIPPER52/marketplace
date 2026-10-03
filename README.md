@@ -8,7 +8,8 @@ thin layer behind a validator that enforces it.
 | ---------- | ------------------------------------------------------------------------------- |
 | HW-09      | the OpenAPI contract and runtime validation at the boundary                     |
 | HW-11      | NestJS, a validated environment schema, and password rotation without a restart |
-| **HW-12**  | **the data layer: schema, seed, indexes, and EXPLAIN evidence** — below         |
+| HW-12      | the data layer: schema, seed, indexes, and EXPLAIN evidence                     |
+| **HW-13**  | **TypeORM over that schema: entities, relations, migrations, N+1** — below      |
 
 ---
 
@@ -55,7 +56,7 @@ psql -Atc "SELECT 1"        # 1
 | [`db/queries/q2.sql`](db/queries/q2.sql)     | admin queue: `pending` orders from the last 30 days                     |
 | [`db/queries/q3.sql`](db/queries/q3.sql)     | find a customer by e-mail, case-insensitively                           |
 | [`db/queries/q4.sql`](db/queries/q4.sql)     | full-text search over the catalogue                                     |
-| [`db/indexes.sql`](db/indexes.sql)           | the four indexes that cure them, and nothing else                       |
+| [`db/indexes.sql`](db/indexes.sql)           | four indexes for those queries, one for a foreign key, nothing else     |
 | [`db/OPTIMIZATIONS.md`](db/OPTIMIZATIONS.md) | four `EXPLAIN` pairs, the index audit, and `## Морфологія (morphology)` |
 
 ## Reproduce every number in the report
@@ -99,10 +100,19 @@ psql -Atc "SELECT count(*) FROM information_schema.table_constraints
 psql -Atc "SELECT count(*) FROM orders;"                                       # 200000
 psql -Atc "SELECT count(*) FROM products;"                                     # 120000
 
-# no index was created "just in case" — this must be empty
+# no index was created "just in case" — this must be empty.
+# Run it after the four EXPLAINs AND after one foreign-key check: idx_order_items_product_id
+# is read by the RI trigger, which no SELECT in db/queries/ fires.
+psql -c "BEGIN; DELETE FROM products WHERE id = md5('product:777')::uuid; ROLLBACK;"
 psql -Atc "SELECT indexrelname FROM pg_stat_user_indexes
            WHERE schemaname='public' AND idx_scan = 0
              AND indexrelid NOT IN (SELECT conindid FROM pg_constraint WHERE conindid <> 0);"
+
+# e-mail uniqueness is case-insensitive — this must fail on the second INSERT
+psql -c "BEGIN;
+         INSERT INTO users (email, display_name) VALUES ('A@example.com', 'upper');
+         INSERT INTO users (email, display_name) VALUES ('a@example.com', 'lower');
+         ROLLBACK;"
 
 # a partial or expression index exists (2: idx_orders_pending_created_at, idx_users_email_lower)
 psql -Atc "SELECT count(*) FROM pg_indexes WHERE schemaname='public'
@@ -125,8 +135,12 @@ grep -c 'Execution Time' db/OPTIMIZATIONS.md                                   #
 | ----- | ------------------------------- | ------------------- | -------------- | ----- | ---- |
 | q1    | `idx_orders_user_id_created_at` | composite B-tree    | 2 121          | 26    | ×82  |
 | q2    | `idx_orders_pending_created_at` | partial B-tree      | 2 121          | 52    | ×41  |
-| q3    | `idx_users_email_lower`         | expression B-tree   | 280            | 4     | ×70  |
-| q4    | `idx_products_search_vector`    | GIN over `tsvector` | 23 902         | 854   | ×28  |
+| q3    | `idx_users_email_lower`         | unique expression   | 280            | 4     | ×70  |
+| q4    | `idx_products_search_vector`    | GIN over `tsvector` | 23 905         | 867   | ×28  |
+
+A fifth index, `idx_order_items_product_id`, serves no query in `db/queries/` — it is what
+the `order_items.product_id` foreign key check reads. Without it, deleting one product
+sequentially scans all 400 001 line items (4 554 buffers); with it, 15.
 
 Full plans, the index audit, the price of the stored `tsvector` column and the
 `## Морфологія (morphology)` section are in [`db/OPTIMIZATIONS.md`](db/OPTIMIZATIONS.md).
@@ -137,6 +151,200 @@ exact decimal arithmetic, never binary floating point — taken one step further
 count cannot drift in scale. `real`, `double precision` and the `money` type are
 deliberately absent; the reasoning is written out at the top of
 [`db/schema.sql`](db/schema.sql).
+
+---
+
+# ORM — HW-13
+
+The HW-12 schema, now owned by code: entities, relations with a deliberate `onDelete` on
+every foreign key, and migrations instead of `synchronize`.
+
+## Grading
+
+A grader has no access to the secret store. These three lines replace it — the dev
+credentials of the local stand, which live in [`docker-compose.yml`](docker-compose.yml)
+and [`init.sql`](init.sql) on purpose and are not a secret:
+
+```bash
+docker compose up -d --wait db
+export DB_HOST=127.0.0.1 DB_PORT=25432 DB_USER=marketplace_app DB_PASSWORD=local_dev_password DB_NAME=marketplace
+export SKIP_VAULT=1   # no access to the store: the values are already in the environment
+```
+
+Then everything below runs on a fresh clone with no edits to any file:
+
+```bash
+npm ci                 # the `prepare` hook builds: generates types, then tsc
+npx tsc --noEmit       # clean
+
+npm run build
+npm run migrate        # creates the schema from src/migrations/
+npm run migrate:show   # [X] InitialSchema…
+npm run seed && npm run seed
+npm run demo:nplus1
+npm run report
+```
+
+Port **25432**, not 5432: the stand must not collide with a Postgres already running on
+the machine. `DB_USER` is the application role, not the superuser — [`init.sql`](init.sql)
+creates it and grants it `CREATE` on schema `public`, because Postgres 15 took away the
+implicit grant and without it the very first migration statement fails.
+
+## Where the credentials come from
+
+`src/database/data-source.ts` reads five variables and nothing else: no host, no password,
+no path to an env file. Filling them in is the job of
+[`scripts/with-secrets.sh`](scripts/with-secrets.sh), and every npm script that reaches
+the database goes through it:
+
+```json
+"migrate": "bash scripts/with-secrets.sh dev typeorm migration:run -d dist/database/data-source.js",
+"seed":    "bash scripts/with-secrets.sh dev node dist/database/cli/seed.js"
+```
+
+The store is the one HW-11 built: `DATABASE_URL` carries host, port, role and database but
+deliberately no password, and the password lives in the file named by `DB_PASSWORD_FILE`.
+The wrapper turns that into the flat `DB_*` block — and `SKIP_VAULT=1` makes it step aside
+entirely, which is the line above that lets a grader in.
+
+The service and these tools therefore take different shapes out of one store, on purpose.
+A migration run lives for two seconds and has no connection to rotate; the HTTP service
+runs for weeks and re-reads the password file on every new connection, which is what makes
+[`rotate.sh`](rotate.sh) work without a restart.
+
+## Migrations, not synchronize
+
+`synchronize: true` appears nowhere. It compares entities to the live schema and issues
+whatever DDL closes the gap — and a column renamed in an entity is, to that comparison,
+one column deleted and another added. The deletion takes the data with it, silently.
+
+The schema is created by [`src/migrations/`](src/migrations/), generated with
+`npm run migrate:generate` and then read. Two statements in it are hand-written and marked
+`HAND-WRITTEN`, because decorators cannot express them: the unique index over
+`lower(email)` and the GIN index over `search_vector`. Both entities declare those indexes
+with `synchronize: false`, so the next `migration:generate` neither re-creates nor drops
+them.
+
+`down()` is not a stub:
+
+```bash
+npm run migrate         # [X] InitialSchema…
+npm run migrate:revert  # only `migrations` and `typeorm_metadata` are left
+npm run migrate:show    # [ ] InitialSchema…
+npm run migrate         # the schema is back
+```
+
+## onDelete, one decision per foreign key
+
+| Relation                   | Strategy   | Why                                                                     |
+| -------------------------- | ---------- | ----------------------------------------------------------------------- |
+| `order_items` → `orders`   | `CASCADE`  | a line item without its order means nothing; it follows the parent      |
+| `order_items` → `products` | `RESTRICT` | a product that has been sold is history, and history is not deletable   |
+| `orders` → `users`         | `RESTRICT` | deleting a person must not delete the record that they bought something |
+
+`cascade: true` on `Order.items` is a different thing with a confusingly similar name: it
+is about **saving** — `save(order)` writes its items in the same call. `onDelete` is about
+deleting, and it lives in the database schema, so it holds for a `DELETE` typed into psql
+that never passes through this code.
+
+`order_items` is an explicit entity rather than `@ManyToMany`, because the relationship
+carries data of its own — how many, and at what price. A bare join table has nowhere to
+put either.
+
+## N+1: measured, not asserted
+
+```bash
+npm run demo:nplus1
+SHOW_SQL=1 npm run demo:nplus1   # every statement, not just the count
+```
+
+The graph is `order → items → product`: two levels, eight orders, seventeen line items.
+
+| Strategy                            | 4 orders | 8 orders | What it does                                                |
+| ----------------------------------- | -------- | -------- | ----------------------------------------------------------- |
+| naive — `find()` in a loop          | **12**   | **26**   | 1 + one per order + one per line item                       |
+| `relations: { items: { product } }` | **1**    | **1**    | one `LEFT JOIN`                                             |
+| the same, with `take`               | 2        | 2        | a page of parent ids cannot be a `LIMIT` on a joined result |
+| `leftJoinAndSelect` with `take`     | 2        | 2        | the same statement, with room for a `WHERE` on the relation |
+| `relationLoadStrategy: 'query'`     | 5        | 5        | 1 + 2 × 2 levels; no row multiplication from the join       |
+
+The number that matters is not 1 or 5 — it is that only the first row moves when the page
+doubles. Nothing in the naive version looks wrong: there is no `query` call in it, only
+`find`. The cost is invisible in the code and visible only in the SQL log, which is why
+the script counts that log instead of trusting the code.
+
+Pagination explains the 2. Asking for a page of orders _and_ their items cannot be one
+statement with a `LIMIT` — the join multiplies rows, so a limit of four would cut line
+items off mid-order. TypeORM selects the page of order ids first, then joins against it.
+
+## Repository or QueryBuilder
+
+`find()` returns a graph of objects: rows of one table and the rows they relate to, typed
+as entities. The boundary is reached when the answer is no longer such a graph — and that
+is a question about shape, not about difficulty.
+
+[`src/database/cli/report.ts`](src/database/cli/report.ts) is past it. One line of its
+output is not a product and not an order item; it is three aggregates over a join, grouped
+by product. There is no entity to hydrate, so it is `createQueryBuilder()` with
+`.groupBy()` and `getRawMany<RevenueRow>()`, and the row interface is declared next to the
+query rather than imported from an entity.
+
+```bash
+npm run report
+```
+
+```
+  product                          orders  units    revenue, UAH
+  -------------------------------  ------  -----  --------------
+  Бездротові навушники Рось M9712       2      2       13 800,00
+  Класичні годинники Збруч M1888        1      1       12 400,00
+  Шкіряні кросівки Дніпро M1042         2      3        7 800,00
+```
+
+Aggregates arrive as strings — `SUM()` over a `bigint` need not fit in a double, and the
+driver will not narrow it silently. The entity columns convert (see
+[`src/common/utils/money.util.ts`](src/common/utils/money.util.ts)); raw rows do not.
+
+## Seed
+
+```bash
+npm run seed && npm run seed
+```
+
+6 users, 10 products, 8 orders, 17 line items — the same rows every run, and the second
+run changes none of the counts. Idempotency is one `ON CONFLICT DO NOTHING` per table over
+a key the data itself determines: `md5` of a slug for products and orders, the e-mail for
+users, the `(order, product)` pair for line items.
+
+```bash
+# after two runs
+psql -Atc "SELECT count(*) FROM users;"        # 6
+psql -Atc "SELECT count(*) FROM products;"     # 10
+psql -Atc "SELECT count(*) FROM orders;"       # 8
+psql -Atc "SELECT count(*) FROM order_items;"  # 17
+```
+
+This is not [`db/seed.sql`](db/seed.sql) from HW-12 — that one pours 320 000 rows so that
+`EXPLAIN` has something to say, and it is not idempotent at all. Two tools, two jobs.
+
+## Where things are
+
+| Path                                                                    | What                                                 |
+| ----------------------------------------------------------------------- | ---------------------------------------------------- |
+| `src/users/entities/`, `src/products/entities/`, `src/orders/entities/` | the four entities, each in its own module            |
+| [`src/database/data-source.ts`](src/database/data-source.ts)            | `DataSource` with `synchronize: false`               |
+| [`src/migrations/`](src/migrations/)                                    | the generated migration, with two statements by hand |
+| [`src/database/cli/`](src/database/cli/)                                | `seed.ts`, `demo-nplus1.ts`, `report.ts`             |
+| [`scripts/with-secrets.sh`](scripts/with-secrets.sh)                    | the store, and the `SKIP_VAULT=1` way past it        |
+
+Entities live inside their modules rather than in one `src/entities/` folder, which is the
+rule the rest of this repository already follows — see
+[`CLAUDE.md`](CLAUDE.md), "Repository layout".
+
+The HW-12 files in [`db/`](db/) are unchanged and still reproduce the `EXPLAIN` report.
+They and `src/migrations/` describe the same four tables, so applying both to one database
+is applying the schema twice — pick a path. The migration is the one the application
+follows; `db/schema.sql` stays as the artefact its report was measured against.
 
 ---
 

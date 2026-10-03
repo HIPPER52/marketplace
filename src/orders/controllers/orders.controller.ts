@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { Body, Controller, Get, Headers, HttpCode, Param, Post, Query, Res } from '@nestjs/common';
 import type { Response } from 'express';
+import { Currency } from '../../common/constants/currency.constant';
 import { ProblemError, ProblemType } from '../../common/errors/problem.error';
 import { findOrder, findProduct, listOrders, saveOrder } from '../../common/store/catalog.store';
 import type { CreateOrderRequest, Order, OrderItem } from '../../common/types/api.types';
 import { paginate, readLimit } from '../../common/utils/pagination.util';
+import { OrderStatus } from '../constants/order-status.constant';
 import { IdempotencyRegistry } from '../services/idempotency.service';
 
 function unprocessable(detail: string): ProblemError {
@@ -74,7 +76,7 @@ export class OrdersController {
 }
 
 function buildOrder(body: CreateOrderRequest): Order {
-    const currency = body.currency ?? 'UAH';
+    const currency = body.currency ?? Currency.UAH;
     const items: OrderItem[] = [];
 
     for (const line of body.items) {
@@ -106,7 +108,7 @@ function buildOrder(body: CreateOrderRequest): Order {
 
     return {
         id: randomUUID(),
-        status: 'pending',
+        status: OrderStatus.Pending,
         items,
         total_cents: items.reduce((sum, item) => sum + item.subtotal_cents, 0),
         currency,
