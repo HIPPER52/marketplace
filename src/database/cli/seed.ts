@@ -124,6 +124,16 @@ interface UserSeed {
     displayName: string;
 }
 
+/**
+ * Deliberately far more than anyone here can spend.
+ *
+ * `npm run demo:race` has to be limited by one thing only — stock. If a buyer could run
+ * out of money mid-run, the number of successful checkouts would depend on which calls the
+ * scheduler happened to interleave, and "exactly 10 succeeded" would stop being a statement
+ * about correctness.
+ */
+const STARTING_BALANCE_CENTS = 100_000_000;
+
 const USERS: UserSeed[] = [
     { email: 'Oksana.Bondarenko@example.com', displayName: 'Оксана Бондаренко' },
     { email: 'Andrii.Shevchenko@example.com', displayName: 'Андрій Шевченко' },
@@ -229,7 +239,21 @@ async function seed(): Promise<void> {
             .orIgnore()
             .execute();
 
-        await ds.createQueryBuilder().insert().into(User).values(USERS).orIgnore().execute();
+        await ds
+            .createQueryBuilder()
+            .insert()
+            .into(User)
+            .values(USERS.map((u) => ({ ...u, balanceCents: STARTING_BALANCE_CENTS })))
+            .orIgnore()
+            .execute();
+
+        // ON CONFLICT DO NOTHING never updates, which is what makes this file idempotent —
+        // and what would leave every customer seeded before BalanceAndJobQueue sitting at a
+        // balance of 0 forever. A top-up that only ever raises is still idempotent: run it
+        // twice and the second run changes nothing.
+        await ds.query('UPDATE users SET balance_cents = $1 WHERE balance_cents < $1', [
+            STARTING_BALANCE_CENTS,
+        ]);
 
         // Identity primary keys are assigned by the database, so the only way back to a
         // customer is the key the seed data owns: the e-mail.

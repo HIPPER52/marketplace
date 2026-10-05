@@ -61,6 +61,12 @@ interface Measurement {
     strategy: string;
     queries: number;
     note: string;
+    /**
+     * Whether this strategy is held to CONSTANT_BUDGET. The naive one is not — blowing the
+     * budget is what it is here to demonstrate. Everything else is a fix, and a fix that
+     * stops being constant is a regression this script has to fail on.
+     */
+    budgeted: boolean;
 }
 
 async function main(): Promise<void> {
@@ -83,6 +89,8 @@ async function main(): Promise<void> {
             throw new Error('No orders in the database. Run `npm run seed` first.');
         }
 
+        const runs: { take: number; measured: Measurement[] }[] = [];
+
         for (const take of [Math.ceil(total / 2), total]) {
             console.log(`\n═══ a page of ${take} orders (of ${total}) ═══`);
             const measured: Measurement[] = [];
@@ -91,6 +99,7 @@ async function main(): Promise<void> {
                 strategy: string,
                 note: string,
                 run: () => Promise<unknown>,
+                budgeted = true,
             ): Promise<void> => {
                 if (showSql) {
                     console.log(`\n  ${strategy}`);
@@ -98,7 +107,7 @@ async function main(): Promise<void> {
 
                 logger.reset();
                 await run();
-                measured.push({ strategy, queries: logger.count, note });
+                measured.push({ strategy, queries: logger.count, note, budgeted });
             };
 
             await measure(
@@ -122,6 +131,7 @@ async function main(): Promise<void> {
                         }
                     }
                 },
+                false,
             );
 
             await measure(
@@ -168,22 +178,75 @@ async function main(): Promise<void> {
             );
 
             report(measured);
+            runs.push({ take, measured });
+        }
+
+        const failures = verdict(runs);
+
+        if (failures.length > 0) {
+            console.error('\nFAIL — a fixed strategy is no longer constant:\n');
+            for (const failure of failures) {
+                console.error(`  ${failure}`);
+            }
+            process.exitCode = 1;
+            return;
         }
 
         console.log(
-            '\nThe naive count tracks the data; the other three do not move when the page\n' +
-                'doubles. That invariance is the property worth checking — not the number.',
+            '\nOK — the naive count tracks the data; every fix stayed inside the budget of\n' +
+                `${CONSTANT_BUDGET} and did not move when the page doubled. That invariance is the\n` +
+                'property worth checking, not the number itself.',
         );
     } finally {
         await ds.destroy();
     }
 }
 
+/**
+ * Two regressions this script exists to catch, and the reason it sets an exit code rather
+ * than printing a warning nobody reads: a fix that exceeds 1 + 2 x levels, and a fix whose
+ * cost moves when the page size does. The second is the real N+1 tell — a count that is
+ * merely large is slow, a count that grows is broken.
+ */
+function verdict(runs: { take: number; measured: Measurement[] }[]): string[] {
+    const failures: string[] = [];
+
+    for (const { take, measured } of runs) {
+        for (const m of measured.filter((candidate) => candidate.budgeted)) {
+            if (m.queries > CONSTANT_BUDGET) {
+                failures.push(
+                    `${m.strategy}: ${m.queries} queries at a page of ${take}, budget is ${CONSTANT_BUDGET}`,
+                );
+            }
+        }
+    }
+
+    const [first, ...rest] = runs;
+
+    if (first !== undefined) {
+        for (const baseline of first.measured.filter((m) => m.budgeted)) {
+            for (const run of rest) {
+                const later = run.measured.find((m) => m.strategy === baseline.strategy);
+
+                if (later !== undefined && later.queries !== baseline.queries) {
+                    failures.push(
+                        `${baseline.strategy}: ${baseline.queries} queries at a page of ${first.take}, ` +
+                            `${later.queries} at ${run.take} — it scales with the data`,
+                    );
+                }
+            }
+        }
+    }
+
+    return failures;
+}
+
 function report(measured: Measurement[]): void {
     const width = Math.max(...measured.map((m) => m.strategy.length));
 
     for (const m of measured) {
-        const flag = m.queries > CONSTANT_BUDGET ? ' <-- N+1' : '        ';
+        const overBudget = m.queries > CONSTANT_BUDGET;
+        const flag = overBudget ? (m.budgeted ? ' <-- FAIL' : ' <-- N+1') : '         ';
         console.log(
             `  ${m.strategy.padEnd(width)}  ${String(m.queries).padStart(3)} queries${flag}  ${m.note}`,
         );
