@@ -4,7 +4,7 @@
     "description": "Marketplace API - course project",
     "main": "dist/main.js",
     "scripts": {
-        "setup:secrets": "mkdir -p secrets && printf 'local_dev_password' > secrets/db_password",
+        "setup:secrets": "bash scripts/setup-secrets.sh",
         "gen:types": "openapi-typescript openapi/openapi.yaml -o src/generated/api.ts",
         "build": "npm run gen:types && rm -rf dist && tsc",
         "start": "npm run build && node dist/main.js",
@@ -17,6 +17,9 @@
         "migrate:generate": "bash scripts/with-secrets.sh dev typeorm migration:generate -d dist/database/data-source.js",
         "seed": "bash scripts/with-secrets.sh dev node dist/database/cli/seed.js",
         "demo:nplus1": "bash scripts/with-secrets.sh dev node dist/database/cli/demo-nplus1.js",
+        "demo:race": "bash scripts/with-secrets.sh dev node dist/database/cli/demo-race.js",
+        "demo:workers": "bash scripts/with-secrets.sh dev node dist/database/cli/demo-workers.js",
+        "demo:retry": "bash scripts/with-secrets.sh dev node dist/database/cli/demo-retry.js",
         "report": "bash scripts/with-secrets.sh dev node dist/database/cli/report.js",
         "lint": "biome check .",
         "lint:fix": "biome check --write .",

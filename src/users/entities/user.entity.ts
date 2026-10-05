@@ -1,4 +1,5 @@
 import { Check, Column, Entity, Index, OneToMany, PrimaryGeneratedColumn } from 'typeorm';
+import { bigintCents } from '../../common/utils/money.util';
 import { Order } from '../../orders/entities/order.entity';
 
 /**
@@ -10,6 +11,7 @@ import { Order } from '../../orders/entities/order.entity';
 @Entity('users')
 @Check('users_email_shaped', `position('@' IN email) > 1`)
 @Check('users_display_name_not_blank', 'length(btrim(display_name)) > 0')
+@Check('users_balance_cents_nonnegative', 'balance_cents >= 0')
 // Uniqueness is over lower(email), not over email: 'A@x.com' and 'a@x.com' are one
 // account. Postgres has no UNIQUE constraint over an expression, only a unique index, and
 // TypeORM's decorators cannot express one — so the migration creates it by hand and
@@ -28,6 +30,17 @@ export class User {
 
     @Column({ name: 'display_name', type: 'text' })
     displayName!: string;
+
+    /**
+     * What the customer can spend, in integer minor units like every other amount here.
+     *
+     * The CHECK on the table is the floor under checkout: if the atomic UPDATE that debits
+     * this ever gets its predicate wrong, Postgres answers 23514 rather than quietly
+     * letting the balance go negative. Correctness does not rest on the application being
+     * careful.
+     */
+    @Column({ name: 'balance_cents', type: 'bigint', default: 0, transformer: bigintCents })
+    balanceCents!: number;
 
     @Column({ name: 'created_at', type: 'timestamptz', default: () => 'now()' })
     createdAt!: Date;

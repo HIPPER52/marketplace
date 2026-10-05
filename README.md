@@ -4,12 +4,13 @@ Contract-first API for a small marketplace. The OpenAPI document in
 [`openapi/openapi.yaml`](openapi/openapi.yaml) is the source of truth; the service is a
 thin layer behind a validator that enforces it.
 
-| Assignment | What it added                                                                   |
-| ---------- | ------------------------------------------------------------------------------- |
-| HW-09      | the OpenAPI contract and runtime validation at the boundary                     |
-| HW-11      | NestJS, a validated environment schema, and password rotation without a restart |
-| HW-12      | the data layer: schema, seed, indexes, and EXPLAIN evidence                     |
-| **HW-13**  | **TypeORM over that schema: entities, relations, migrations, N+1** — below      |
+| Assignment | What it added                                                                         |
+| ---------- | ------------------------------------------------------------------------------------- |
+| HW-09      | the OpenAPI contract and runtime validation at the boundary                           |
+| HW-11      | NestJS, a validated environment schema, and password rotation without a restart       |
+| HW-12      | the data layer: schema, seed, indexes, and EXPLAIN evidence                           |
+| HW-13      | TypeORM over that schema: entities, relations, migrations, N+1                        |
+| **HW-14**  | **concurrency: a transactional checkout, a SKIP LOCKED worker pool, retries** — below |
 
 ---
 
@@ -181,9 +182,17 @@ npm run build
 npm run migrate        # creates the schema from src/migrations/
 npm run migrate:show   # [X] InitialSchema…
 npm run seed && npm run seed
-npm run demo:nplus1
-npm run report
+
+npm run demo:nplus1    # HW-13: query counts before and after the N+1 fix
+npm run report         # HW-13: revenue by product, through QueryBuilder
+
+npm run demo:race      # HW-14: 50 concurrent checkouts against 10 units of stock
+npm run demo:workers   # HW-14: 4 workers draining one queue through SKIP LOCKED
+npm run demo:retry     # HW-14: a serialization failure, caught and replayed
 ```
+
+Each of the five demos checks its own invariant and exits non-zero when it breaks, so
+there is nothing to read carefully — a green exit code is the result.
 
 Port **25432**, not 5432: the stand must not collide with a Postgres already running on
 the machine. `DB_USER` is the application role, not the superuser — [`init.sql`](init.sql)
@@ -338,13 +347,164 @@ This is not [`db/seed.sql`](db/seed.sql) from HW-12 — that one pours 320 000 r
 | [`scripts/with-secrets.sh`](scripts/with-secrets.sh)                    | the store, and the `SKIP_VAULT=1` way past it        |
 
 Entities live inside their modules rather than in one `src/entities/` folder, which is the
-rule the rest of this repository already follows — see
-[`CLAUDE.md`](CLAUDE.md), "Repository layout".
+rule the rest of this repository already follows: every file sits in a folder named after
+its kind, and the module that owns a concept owns its types. A central bucket has no owner,
+nobody dares delete from it, and it stops a feature folder from being self-contained.
 
 The HW-12 files in [`db/`](db/) are unchanged and still reproduce the `EXPLAIN` report.
 They and `src/migrations/` describe the same four tables, so applying both to one database
 is applying the schema twice — pick a path. The migration is the one the application
 follows; `db/schema.sql` stays as the artefact its report was measured against.
+
+---
+
+# Concurrency — HW-14
+
+Placing an order is one transaction: take the stock, take the money, write the order and
+its line items, queue the receipt. Fifty callers at once, ten units of stock, and nobody
+gets a unit that does not exist.
+
+## Конкурентність (concurrency)
+
+Numbers below are one run on this machine, from an empty volume through `migrate`, `seed`
+and the three demos. Reproduce them with the commands in [Grading](#grading).
+
+### `npm run demo:race` — fifty at once, ten units
+
+| What                     | Value |
+| ------------------------ | ----- |
+| attempts                 | 50    |
+| successful               | 10    |
+| rejected, out of stock   | 40    |
+| final stock              | 0     |
+| rows with negative stock | 0     |
+| orders created           | 10    |
+| jobs queued              | 10    |
+| elapsed                  | 77 ms |
+
+No queue and no mutex in the application: `Promise.all` fires all fifty and the database
+decides. Ten orders, ten receipts queued, and the other forty callers are told _why_ —
+`out-of-stock`, as data, not as an exception they would have to parse.
+
+Fifty concurrent calls arrive at a pool of ten connections, so forty of them wait their
+turn in the pool. That is why 77 ms rather than fifty round trips' worth: the limit is the
+pool, and it changes nothing about the outcome.
+
+### `npm run demo:workers` — four workers, one queue
+
+| What            | Value                                 |
+| --------------- | ------------------------------------- |
+| jobs            | 12, 100 ms of work each               |
+| workers         | 4                                     |
+| distribution    | w1=3 w2=3 w3=3 w4=3                   |
+| processed twice | 0                                     |
+| never processed | 0                                     |
+| elapsed         | 354 ms against 1200 ms for one worker |
+
+An even split and a 3.4× speed-up. Without `SKIP LOCKED` the same four workers would queue
+behind the same head of the queue and finish in about the time one worker takes — the
+lock would make them polite rather than parallel.
+
+### `npm run demo:retry` — one serialization failure, replayed
+
+| What           | Value                            |
+| -------------- | -------------------------------- |
+| isolation      | `REPEATABLE READ`                |
+| retries caught | 1 — `40001` on B's attempt 1     |
+| balance before | 99 892 000 cents                 |
+| balance after  | 99 894 000 cents                 |
+| expected       | 99 894 000 cents (+5 000 −3 000) |
+
+Two transactions read the same balance, think, and write back a number they computed from
+what they read. Under `READ COMMITTED` that is the lost update from the lecture — the
+second write wins silently and fifty hryvnia disappear. Under `REPEATABLE READ` Postgres
+refuses the second write, the wrapper replays the whole transaction, and the arithmetic
+comes out right.
+
+## Atomic UPDATE, not SELECT … FOR UPDATE
+
+Both close the race; the difference is where the decision is made.
+
+```sql
+UPDATE products SET in_stock = in_stock - $2
+ WHERE id = $1 AND in_stock >= $2
+ RETURNING price_cents, currency
+```
+
+That one statement is the check and the write together, so the window between reading a
+number and acting on it does not exist — not a narrow window, none at all. A concurrent
+checkout blocks on the row lock, and when it resumes `READ COMMITTED` re-evaluates the
+`WHERE` against the version that just committed. Zero rows back means "not any more",
+decided by the database on current data rather than by this process on a stale read.
+
+`SELECT … FOR UPDATE` would work too, and reads more obviously — lock, think, write. It
+costs a round trip, holds the lock across it, and invites the next person to put
+application logic between the two statements. That gap is exactly the shape that lost the
+50 грн in the lecture.
+
+What the atomic form gives up: zero rows is one answer to two different questions. "No
+such product" and "not enough of it" are told apart by a second query — but only on the
+failure path, where an extra read costs nothing.
+
+**And if that predicate were ever wrong**, `products.in_stock` carries
+`CHECK (in_stock >= 0)` and `users.balance_cents` carries `CHECK (balance_cents >= 0)`.
+Postgres would answer `23514` and roll the transaction back. The invariant is held by the
+schema; the query is only how it is held without waiting.
+
+Line items are sorted by product id and products are always touched before the buyer, so
+two checkouts take their locks in the same order and cannot form a cycle. Preventing a
+deadlock is cheaper than recovering from one — and the retry wrapper is still there,
+because "cheaper" is not "impossible".
+
+## Why the retry catches exactly two codes
+
+`src/database/utils/with-retry.util.ts` retries `40001` and `40P01`, and nothing else.
+
+| Code    | What happened                                                                  | Why it is retryable                                                |
+| ------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------ |
+| `40001` | serialization_failure — a snapshot went stale against a concurrent writer      | the transaction was **not** applied and its inputs are still valid |
+| `40P01` | deadlock_detected — two transactions waited on each other, Postgres killed one | same: nothing was committed, and the cycle is unlikely to repeat   |
+
+Both are the database saying "nothing is wrong, do it again". Everything else is not.
+`23514` means the data broke a business rule and will break it identically on the next
+attempt — retrying turns a clear rejection into a slow one. `55P03` means the caller used
+`NOWAIT` to say explicitly that it would not wait, so waiting five more times is the one
+thing it must not do. A retry list that grows past these two stops being a retry list and
+becomes a way to hide errors.
+
+The retry replays the **whole** transaction, reads included. Replaying only the write
+would reuse a value read under a snapshot the database has already rejected — a lost
+update wearing a retry's clothes.
+
+## The queue is a table, on purpose
+
+The receipt job is inserted in the same transaction as the order. A message broker cannot
+join that transaction, so "the order committed but the broker call failed" is a state that
+only a queue table can rule out. That is the transactional outbox pattern, and in #19 this
+table becomes one in front of RabbitMQ.
+
+Workers claim rows with `FOR UPDATE SKIP LOCKED` and hold the lock for the whole
+transaction, which is what makes a crashed worker harmless: the lock dies with its
+connection and the job returns to the queue, never having been marked done. The claim is
+backed by a partial index — `idx_jobs_new ON jobs (id) WHERE status = 'new'` — because a
+queue is mostly history, and indexing the done rows would be paying for what nobody
+queries. The same reasoning as `idx_orders_pending_created_at` in HW-12.
+
+## Where things are
+
+| Path                                                                                 | What                                                   |
+| ------------------------------------------------------------------------------------ | ------------------------------------------------------ |
+| [`src/orders/services/checkout.service.ts`](src/orders/services/checkout.service.ts) | the one transaction                                    |
+| [`src/jobs/`](src/jobs/)                                                             | the queue: entity, statuses, the worker                |
+| [`src/database/utils/with-retry.util.ts`](src/database/utils/with-retry.util.ts)     | `40001` / `40P01`, backoff, nothing else               |
+| [`src/database/cli/`](src/database/cli/)                                             | `demo-race.ts`, `demo-workers.ts`, `demo-retry.ts`     |
+| [`src/migrations/`](src/migrations/)                                                 | `BalanceAndJobQueue` — the balance and the queue table |
+
+The HTTP layer is deliberately untouched. `POST /orders` in
+[`openapi/openapi.yaml`](openapi/openapi.yaml) declares `{ items, currency }` and
+`security: []` — there is no buyer in the contract, and checkout has to know whose balance
+to debit. Wiring the endpoint is a contract change, not a transaction change, and it waits
+for the assignment that introduces authentication.
 
 ---
 
