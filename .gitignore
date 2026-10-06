@@ -148,3 +148,5 @@ vite.config.ts.timestamp-*
 spec.json
 
 src/generated/
+
+/secrets/
