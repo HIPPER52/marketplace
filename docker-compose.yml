@@ -6,12 +6,32 @@ services:
       dockerfile: Dockerfile
     environment:
       NODE_ENV: production
-      DATABASE_URL: postgres://marketplace_app@db:5432/marketplace
+      # Through the pooler, never straight at Postgres.
+      DATABASE_URL: postgres://marketplace_app@pgbouncer:6432/marketplace
       DB_PASSWORD_FILE: /run/secrets/db_password
     volumes:
       - ./secrets/db_password:/run/secrets/db_password:ro
     ports:
       - "3000:3000"
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    environment:
+      # The image writes its own config from env unless one is mounted; ours is mounted.
+      DB_HOST: db
+    volumes:
+      - ./pgbouncer/pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./pgbouncer/userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    healthcheck:
+      # Asking the admin console whether it is alive — no psql in this image, so a TCP
+      # probe through pg_isready is not available either.
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 6432 || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
     depends_on:
       db:
         condition: service_healthy

@@ -150,3 +150,5 @@ spec.json
 src/generated/
 
 /secrets/
+
+backups/
