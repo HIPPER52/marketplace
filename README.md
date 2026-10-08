@@ -4,13 +4,14 @@ Contract-first API for a small marketplace. The OpenAPI document in
 [`openapi/openapi.yaml`](openapi/openapi.yaml) is the source of truth; the service is a
 thin layer behind a validator that enforces it.
 
-| Assignment | What it added                                                                         |
-| ---------- | ------------------------------------------------------------------------------------- |
-| HW-09      | the OpenAPI contract and runtime validation at the boundary                           |
-| HW-11      | NestJS, a validated environment schema, and password rotation without a restart       |
-| HW-12      | the data layer: schema, seed, indexes, and EXPLAIN evidence                           |
-| HW-13      | TypeORM over that schema: entities, relations, migrations, N+1                        |
-| **HW-14**  | **concurrency: a transactional checkout, a SKIP LOCKED worker pool, retries** — below |
+| Assignment | What it added                                                                           |
+| ---------- | --------------------------------------------------------------------------------------- |
+| HW-09      | the OpenAPI contract and runtime validation at the boundary                             |
+| HW-11      | NestJS, a validated environment schema, and password rotation without a restart         |
+| HW-12      | the data layer: schema, seed, indexes, and EXPLAIN evidence                             |
+| HW-13      | TypeORM over that schema: entities, relations, migrations, N+1                          |
+| HW-14      | concurrency: a transactional checkout, a SKIP LOCKED worker pool, retries               |
+| **HW-15**  | **operations: PgBouncer, a nightly backup, and a restore drill that proves it** — below |
 
 ---
 
@@ -162,15 +163,26 @@ every foreign key, and migrations instead of `synchronize`.
 
 ## Grading
 
-A grader has no access to the secret store. These three lines replace it — the dev
+A grader has no access to the secret store. These four lines replace it — the dev
 credentials of the local stand, which live in [`docker-compose.yml`](docker-compose.yml)
 and [`init.sql`](init.sql) on purpose and are not a secret:
 
 ```bash
-docker compose up -d --wait db
-export DB_HOST=127.0.0.1 DB_PORT=25432 DB_USER=marketplace_app DB_PASSWORD=local_dev_password DB_NAME=marketplace
+docker compose up -d --wait db pgbouncer
+export DATABASE_URL=postgres://marketplace_app:local_dev_password@127.0.0.1:26432/marketplace
+export DB_HOST=127.0.0.1 DB_PORT=26432 DB_USER=marketplace_app DB_PASSWORD=local_dev_password DB_NAME=marketplace
 export SKIP_VAULT=1   # no access to the store: the values are already in the environment
 ```
+
+Port **26432 is PgBouncer**, not Postgres — everything goes through the pooler. Two
+variable shapes because two kinds of client read them: `DATABASE_URL` is a libpq URI and is
+what `scripts/backup.sh` and `scripts/restore-drill.sh` hand to `pg_dump` and `psql`, while
+the `DB_*` block is the validated contract `src/database/data-source.ts` reads. One store
+fills both — see [Where the credentials come from](#where-the-credentials-come-from).
+
+`--wait db pgbouncer` names the two services rather than raising everything: the `app`
+service bind-mounts `secrets/db_password`, which a fresh clone does not have. Nothing below
+needs the HTTP service.
 
 Then everything below runs on a fresh clone with no edits to any file:
 
@@ -189,6 +201,9 @@ npm run report         # HW-13: revenue by product, through QueryBuilder
 npm run demo:race      # HW-14: 50 concurrent checkouts against 10 units of stock
 npm run demo:workers   # HW-14: 4 workers draining one queue through SKIP LOCKED
 npm run demo:retry     # HW-14: a serialization failure, caught and replayed
+
+bash scripts/with-secrets.sh dev bash scripts/backup.sh        # HW-15: prints the archive path
+bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh # HW-15: prints MATCH
 ```
 
 Each of the five demos checks its own invariant and exits non-zero when it breaks, so
@@ -380,15 +395,16 @@ and the three demos. Reproduce them with the commands in [Grading](#grading).
 | rows with negative stock | 0     |
 | orders created           | 10    |
 | jobs queued              | 10    |
-| elapsed                  | 77 ms |
+| elapsed                  | 75 ms |
 
 No queue and no mutex in the application: `Promise.all` fires all fifty and the database
 decides. Ten orders, ten receipts queued, and the other forty callers are told _why_ —
 `out-of-stock`, as data, not as an exception they would have to parse.
 
-Fifty concurrent calls arrive at a pool of ten connections, so forty of them wait their
-turn in the pool. That is why 77 ms rather than fifty round trips' worth: the limit is the
-pool, and it changes nothing about the outcome.
+Fifty concurrent calls arrive at a pool of ten connections — and since HW-15 that pool is
+PgBouncer rather than the driver's. Forty of them wait their turn. That is why 75 ms rather
+than fifty round trips' worth: the limit is the pool, and it changes nothing about the
+outcome.
 
 ### `npm run demo:workers` — four workers, one queue
 
@@ -399,9 +415,9 @@ pool, and it changes nothing about the outcome.
 | distribution    | w1=3 w2=3 w3=3 w4=3                   |
 | processed twice | 0                                     |
 | never processed | 0                                     |
-| elapsed         | 354 ms against 1200 ms for one worker |
+| elapsed         | 376 ms against 1200 ms for one worker |
 
-An even split and a 3.4× speed-up. Without `SKIP LOCKED` the same four workers would queue
+An even split and a 3.2× speed-up. Without `SKIP LOCKED` the same four workers would queue
 behind the same head of the queue and finish in about the time one worker takes — the
 lock would make them polite rather than parallel.
 
@@ -505,6 +521,135 @@ The HTTP layer is deliberately untouched. `POST /orders` in
 `security: []` — there is no buyer in the contract, and checkout has to know whose balance
 to debit. Wiring the endpoint is a contract change, not a transaction change, and it waits
 for the assignment that introduces authentication.
+
+---
+
+# Data layer ops — HW-15
+
+Two things a database needs before anyone should call it production: a pooler in front of
+it, and a backup somebody has actually restored.
+
+## The three commands
+
+```bash
+docker compose up -d --wait db pgbouncer                        # Postgres + PgBouncer on 26432
+bash scripts/with-secrets.sh dev bash scripts/backup.sh         # -> backups/marketplace-<date>.dump
+bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh  # -> MATCH
+```
+
+Nothing in `src/` or in the npm scripts knows a host or a password: the wrapper from HW-11
+fills them in, and `SKIP_VAULT=1` steps aside for a grader. See
+[Grading](#grading).
+
+## PgBouncer, and why `pool_mode = transaction`
+
+The application connects to **PgBouncer on 26432**, never to Postgres directly.
+[`pgbouncer/pgbouncer.ini`](pgbouncer/pgbouncer.ini) holds the config; the published port is
+in [`docker-compose.override.yml`](docker-compose.override.yml).
+
+A Postgres connection is an operating-system process with its own memory, so a few hundred
+of them is not a number Postgres is glad to hear. The pool inside the application already
+reuses connections _within one process_; a pooler does the same thing across every process,
+pod, migration run and CLI script at once. `max_client_conn = 200` in front of
+`default_pool_size = 10` is the whole trade: client connections are cheap, server
+connections are the resource being protected.
+
+**Transaction mode** is what makes that ratio possible — a server connection is held only
+for the length of a transaction and then handed to whoever is next. And that is exactly
+what it breaks. Anything whose lifetime is the _session_ rather than the transaction stops
+being reliable, because the next statement may land on a different server connection:
+
+1. **Session state.** `SET`, `LISTEN`/`NOTIFY`, `WITH HOLD` cursors, temporary tables. A
+   `SET statement_timeout` issued outside a transaction applies to whichever backend
+   happened to serve it, and the next query may not be on that backend.
+2. **Session-level advisory locks.** `pg_advisory_lock()` would be taken on one server
+   connection and released on another — or never released at all. The transaction-scoped
+   variant, `pg_advisory_xact_lock()`, is fine, which is a sharp illustration of where the
+   line falls.
+3. **Server-side prepared statements.** A driver that names its prepared statements
+   prepares on one connection and executes on another, and the failure looks random.
+   PgBouncer 1.21+ tracks them per client and replays them — `max_prepared_statements = 200`
+   in the config is that insurance.
+
+Everything this project does is transaction-scoped: the checkout, the `SKIP LOCKED` claim
+and the retry wrapper all open a transaction and finish it. Measured, not assumed — all
+five demos and both migration commands run through the pooler unchanged:
+
+```bash
+npm run migrate && npm run seed
+npm run demo:nplus1 && npm run report
+npm run demo:race && npm run demo:workers && npm run demo:retry   # all exit 0
+```
+
+The admin console is open on the same port:
+
+```bash
+psql -h 127.0.0.1 -p 26432 -U marketplace_app -d pgbouncer -c "SHOW POOLS"
+```
+
+```
+  database   |      user       | cl_active | sv_idle |  pool_mode
+-------------+-----------------+-----------+---------+-------------
+ marketplace | marketplace_app |         0 |      10 | transaction
+```
+
+`admin_users` is the application role here because this is a single-tenant local stand. In
+production it is a separate role — the console can `PAUSE` and `KILL`.
+
+## Backup
+
+[`scripts/backup.sh`](scripts/backup.sh) writes a compressed, selectively restorable `-Fc`
+archive to `backups/`, named with the date it was taken, and prints the path.
+
+`-Fc` rather than plain SQL because `pg_restore` can read its table of contents, filter it
+and restore one table out of it; a `.sql` file can do none of those. The script reads that
+table of contents back before it reports success — an archive nobody has opened is a hope,
+not a backup.
+
+`pg_dump` runs **inside the `db` container, straight at Postgres**, deliberately skipping
+the pooler. Two reasons: a dump is maintenance, and maintenance belongs on a session that
+nobody will take away mid-snapshot; and it means this repository does not require anyone to
+have a version-matched `pg_dump` installed. The role and database still come from
+`DATABASE_URL` — it is the route that is chosen, not the identity.
+
+`backups/` is git-ignored. Dumps are data.
+
+[`backup.cron`](backup.cron) is the schedule: 03:17 nightly, through the same wrapper,
+because cron has no profile, no `.env` and no access to anything it is not handed.
+
+## Restore drill
+
+[`scripts/restore-drill.sh`](scripts/restore-drill.sh) takes the newest archive, starts a
+`postgres:17-alpine` container that has never seen the data, restores into it, compares
+control totals against the live database, prints **MATCH**, and removes the container.
+
+The totals are `count(*)` **and** a sum per table. A count alone would pass if every amount
+were zeroed; a sum alone would pass if rows were swapped.
+
+Restoring into a volume that already holds the data is the easy way to write a drill that
+proves nothing — and the usual source of `duplicate key` errors that look like a corrupt
+dump. This one creates and destroys its own container, so the second run is as honest as
+the first.
+
+Measured on 320 000 rows: a 35 MB archive, **7 s** to restore, **9 s** end to end.
+[`RESTORE-DRILL.md`](RESTORE-DRILL.md) has the full protocol with **RTO** and **RPO** —
+including why the honest RTO is about thirty minutes while the database takes nine seconds,
+and why the RPO of a nightly schedule is 24 hours no matter how many replicas exist.
+
+A replica would not change that number at all. Replication copies the mistake as faithfully
+as the data: `DROP TABLE users` reaches the standby in milliseconds. Replicas protect
+against a node dying, backups against a person, and they are not substitutes.
+
+## Where things are
+
+| Path                                                   | What                                                                   |
+| ------------------------------------------------------ | ---------------------------------------------------------------------- |
+| [`pgbouncer/pgbouncer.ini`](pgbouncer/pgbouncer.ini)   | the pooler's config, `pool_mode = transaction`                         |
+| `pgbouncer/userlist.txt`                               | generated from `init.sql` by `npm run setup:secrets`, never hand-typed |
+| [`scripts/backup.sh`](scripts/backup.sh)               | `-Fc` dump, dated, verified                                            |
+| [`scripts/restore-drill.sh`](scripts/restore-drill.sh) | restore into a throwaway cluster, compare, `MATCH`                     |
+| [`backup.cron`](backup.cron)                           | 03:17 nightly                                                          |
+| [`RESTORE-DRILL.md`](RESTORE-DRILL.md)                 | the protocol: date, size, time, RTO, RPO                               |
 
 ---
 

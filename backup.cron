@@ -1,0 +1,17 @@
+# Nightly backup of the marketplace database.
+#
+# Install with:  crontab backup.cron
+# (or drop it into /etc/cron.d/ with a user field added as the sixth column).
+#
+# 03:17, not 03:00. Every scheduler on the planet fires on the hour, and a backup that
+# competes with everyone else's log rotation for the same disk takes longer than it needs
+# to. A prime-ish minute nobody else picked is free throughput.
+#
+# The command goes through scripts/with-secrets.sh, exactly like every other command in
+# this repository that reaches the database: cron has no shell profile, no .env and no
+# access to anything the wrapper does not hand it.
+#
+# PATH matters here — cron's is nearly empty, and the script shells out to docker.
+PATH=/usr/local/bin:/usr/bin:/bin
+
+17 3 * * * cd /srv/marketplace && bash scripts/with-secrets.sh dev bash scripts/backup.sh >> /var/log/marketplace-backup.log 2>&1

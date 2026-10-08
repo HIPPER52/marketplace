@@ -90,4 +90,12 @@ if [ -z "${DB_PASSWORD:-}" ]; then
     export DB_PASSWORD
 fi
 
+# libpq's own channel for the same secret.
+#
+# scripts/backup.sh and scripts/restore-drill.sh hand DATABASE_URL straight to pg_dump,
+# pg_restore and psql, which accept it as a connection URI. Ours carries no password by
+# design, so libpq takes it from here instead. A grader running with SKIP_VAULT=1 never
+# reaches this line: their DATABASE_URL has the password inline, and libpq prefers it.
+export PGPASSWORD="$DB_PASSWORD"
+
 exec "$@"

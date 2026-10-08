@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# Creates secrets/db_password for the local stand.
+# Creates the local stand's credential files: secrets/db_password and
+# pgbouncer/userlist.txt.
 #
 #   npm run setup:secrets
 #
@@ -19,6 +20,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INIT_SQL="$ROOT/init.sql"
 SECRET_FILE="$ROOT/secrets/db_password"
+USERLIST_FILE="$ROOT/pgbouncer/userlist.txt"
 
 if [ ! -f "$INIT_SQL" ]; then
     echo "setup-secrets.sh: no init.sql at ${INIT_SQL#"$ROOT/"}." >&2
@@ -40,5 +42,19 @@ umask 077
 printf '%s' "$password" > "$SECRET_FILE"
 chmod 600 "$SECRET_FILE"
 
-echo "Wrote ${SECRET_FILE#"$ROOT/"} from init.sql (role marketplace_app)."
-echo "Rotate it with ./rotate.sh — after which init.sql no longer matches, by design."
+role="$(grep -oE "CREATE ROLE[[:space:]]+[A-Za-z0-9_]+" "$INIT_SQL" | head -n 1 | awk '{print $3}' || true)"
+role="${role:-marketplace_app}"
+
+# PgBouncer needs the same password in its own file, and a third hand-typed copy of a
+# credential is a third thing to forget. Derived from init.sql like the one above, so the
+# two cannot drift: change the role's password there and re-run this script.
+#
+# Committed to the repository on purpose — a fresh clone has to be able to `docker compose
+# up` without running anything first, and this is the local stand's password, which already
+# sits in plain sight in init.sql and docker-compose.yml.
+mkdir -p "$(dirname "$USERLIST_FILE")"
+printf '"%s" "%s"\n' "$role" "$password" > "$USERLIST_FILE"
+chmod 644 "$USERLIST_FILE"
+
+echo "Wrote ${SECRET_FILE#"$ROOT/"} and ${USERLIST_FILE#"$ROOT/"} from init.sql (role ${role})."
+echo "Rotate the first with ./rotate.sh — after which init.sql no longer matches, by design."

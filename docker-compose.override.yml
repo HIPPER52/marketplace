@@ -6,7 +6,7 @@ services:
       target: dev
     environment:
       NODE_ENV: development
-      DATABASE_URL: postgres://marketplace_app@db:5432/marketplace
+      DATABASE_URL: postgres://marketplace_app@pgbouncer:6432/marketplace
       DB_PASSWORD_FILE: /run/secrets/db_password
     volumes:
       - ./src:/app/src
@@ -16,9 +16,17 @@ services:
     ports:
       - "3000:3000"
     depends_on:
-      db:
+      pgbouncer:
         condition: service_healthy
+
+  pgbouncer:
+    ports:
+      # What everything outside Docker connects to: .env.example, the npm scripts, the
+      # backup and the restore drill.
+      - "26432:6432"
 
   db:
     ports:
+      # Still published, but only so that `psql -f db/schema.sql` from HW-12 and the
+      # restore drill can reach Postgres itself. Application traffic goes through 26432.
       - "25432:5432"
