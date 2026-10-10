@@ -1,11 +1,7 @@
 import 'reflect-metadata';
 import { join } from 'node:path';
 import { DataSource, type DataSourceOptions } from 'typeorm';
-import { Job } from '../jobs/entities/job.entity';
-import { Order } from '../orders/entities/order.entity';
-import { OrderItem } from '../orders/entities/order-item.entity';
-import { Product } from '../products/entities/product.entity';
-import { User } from '../users/entities/user.entity';
+import { ENTITIES } from './constants/entities.constant';
 import { readDatasourceEnv } from './schemas/datasource-env.schema';
 
 const env = readDatasourceEnv(process.env);
@@ -42,7 +38,7 @@ export const dataSourceOptions: DataSourceOptions = {
     synchronize: false,
     migrationsRun: false,
 
-    entities: [User, Product, Order, OrderItem, Job],
+    entities: ENTITIES,
     // __dirname is dist/database at runtime, so this is dist/migrations/*.js — compiled
     // migrations, which is also what the TypeORM CLI is pointed at.
     migrations: [join(__dirname, '..', 'migrations', '*.js')],

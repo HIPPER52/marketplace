@@ -1,37 +1,36 @@
-import { randomUUID } from 'node:crypto';
 import { Body, Controller, Get, Headers, HttpCode, Param, Post, Query, Res } from '@nestjs/common';
 import type { Response } from 'express';
-import { Currency } from '../../common/constants/currency.constant';
 import { ProblemError, ProblemType } from '../../common/errors/problem.error';
-import { findOrder, findProduct, listOrders, saveOrder } from '../../common/store/catalog.store';
-import type { CreateOrderRequest, Order, OrderItem } from '../../common/types/api.types';
-import { paginate, readLimit } from '../../common/utils/pagination.util';
-import { OrderStatus } from '../constants/order-status.constant';
+import type { CreateOrderRequest, Order } from '../../common/types/api.types';
+import { pageOf, readCursor, readLimit } from '../../common/utils/pagination.util';
+import { DEMO_BUYER_ID } from '../../users/constants/demo-buyer.constant';
+import { OrdersRepository } from '../repositories/orders.repository';
+import { CheckoutService } from '../services/checkout.service';
 import { IdempotencyRegistry } from '../services/idempotency.service';
-
-function unprocessable(detail: string): ProblemError {
-    return new ProblemError({
-        status: 422,
-        type: ProblemType.unprocessable,
-        title: 'Unprocessable entity',
-        detail,
-    });
-}
+import type { CheckoutResult } from '../types/checkout.types';
+import { toApiOrder } from '../utils/order.mapper';
 
 @Controller()
 export class OrdersController {
-    constructor(private readonly idempotency: IdempotencyRegistry) {}
+    constructor(
+        private readonly idempotency: IdempotencyRegistry,
+        private readonly orders: OrdersRepository,
+        private readonly checkout: CheckoutService,
+    ) {}
 
     @Get('orders')
-    list(@Query('limit') limit?: string, @Query('cursor') cursor?: string) {
-        return paginate(listOrders(), readLimit(limit), cursor);
+    async list(@Query('limit') limit?: string, @Query('cursor') cursor?: string) {
+        const offset = readCursor(cursor);
+        const { rows, total } = await this.orders.page(readLimit(limit), offset);
+
+        return pageOf(rows.map(toApiOrder), offset, total);
     }
 
     @Get('orders/:orderId')
-    get(@Param('orderId') orderId: string) {
-        const order = findOrder(orderId);
+    async get(@Param('orderId') orderId: string) {
+        const order = await this.orders.findById(orderId);
 
-        if (order === undefined) {
+        if (order === null) {
             throw new ProblemError({
                 status: 404,
                 type: ProblemType.notFound,
@@ -40,16 +39,16 @@ export class OrdersController {
             });
         }
 
-        return order;
+        return toApiOrder(order);
     }
 
     @Post('orders')
     @HttpCode(201)
-    create(
+    async create(
         @Headers('idempotency-key') key: string,
         @Body() body: CreateOrderRequest,
         @Res({ passthrough: true }) res: Response,
-    ): Order {
+    ): Promise<Order> {
         const requestHash = this.idempotency.fingerprint(body);
         const previous = this.idempotency.lookup(key, requestHash);
 
@@ -67,51 +66,59 @@ export class OrdersController {
             return previous.order;
         }
 
-        const order = buildOrder(body);
-        saveOrder(order);
-        this.idempotency.remember(key, requestHash, order);
+        // One transaction moves the stock, the money, the order and its receipt job. The
+        // ways it can refuse are data, not exceptions — see types/checkout.types.ts.
+        const result = await this.checkout.checkout({
+            userId: DEMO_BUYER_ID,
+            lines: body.items.map((line) => ({
+                productId: line.product_id,
+                quantity: line.quantity,
+            })),
+            currency: body.currency,
+        });
 
-        return order;
+        if (result.outcome !== 'created') {
+            throw unprocessable(explain(result));
+        }
+
+        const order = await this.orders.findById(result.orderId);
+
+        if (order === null) {
+            throw new ProblemError({
+                status: 500,
+                type: ProblemType.internal,
+                title: 'Internal server error',
+                detail: `Order ${result.orderId} was committed but could not be read back.`,
+            });
+        }
+
+        const created = toApiOrder(order);
+        this.idempotency.remember(key, requestHash, created);
+
+        return created;
     }
 }
 
-function buildOrder(body: CreateOrderRequest): Order {
-    const currency = body.currency ?? Currency.UAH;
-    const items: OrderItem[] = [];
+function unprocessable(detail: string): ProblemError {
+    return new ProblemError({
+        status: 422,
+        type: ProblemType.unprocessable,
+        title: 'Unprocessable entity',
+        detail,
+    });
+}
 
-    for (const line of body.items) {
-        const product = findProduct(line.product_id);
-
-        if (product === undefined) {
-            throw unprocessable(`No product with id ${line.product_id}.`);
-        }
-
-        if (product.currency !== currency) {
-            throw unprocessable(
-                `Product ${product.id} is priced in ${product.currency}, but the order is in ${currency}.`,
-            );
-        }
-
-        if (product.in_stock < line.quantity) {
-            throw unprocessable(
-                `Product ${product.id} has ${product.in_stock} units in stock, ${line.quantity} requested.`,
-            );
-        }
-
-        items.push({
-            product_id: product.id,
-            quantity: line.quantity,
-            unit_price_cents: product.price_cents,
-            subtotal_cents: product.price_cents * line.quantity,
-        });
+/** Every refusal checkout can return, in the words the customer gets. */
+function explain(result: Exclude<CheckoutResult, { outcome: 'created' }>): string {
+    switch (result.outcome) {
+        case 'unknown-product':
+            // Also the answer when the product exists but is priced in another currency:
+            // an order cannot mix currencies, so from this order's point of view there is
+            // no such product to buy.
+            return `No product with id ${result.productId} available in this currency.`;
+        case 'out-of-stock':
+            return `Product ${result.productId} has ${result.available} units in stock, ${result.requested} requested.`;
+        case 'insufficient-funds':
+            return `The order costs ${result.requiredCents} cents and the account holds ${result.availableCents}.`;
     }
-
-    return {
-        id: randomUUID(),
-        status: OrderStatus.Pending,
-        items,
-        total_cents: items.reduce((sum, item) => sum + item.subtotal_cents, 0),
-        currency,
-        created_at: new Date().toISOString(),
-    };
 }

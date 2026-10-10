@@ -6,6 +6,7 @@ import {
     JoinColumn,
     ManyToOne,
     PrimaryGeneratedColumn,
+    RelationId,
     Unique,
 } from 'typeorm';
 import { bigintCents } from '../../common/utils/money.util';
@@ -51,6 +52,16 @@ export class OrderItem {
     )
     @JoinColumn({ name: 'product_id' })
     product!: Product;
+
+    /**
+     * The join column, read-only, for the one caller that needs the id and not the row:
+     * components/schemas/OrderItem carries `product_id` and nothing else about the
+     * product. @RelationId fills it when the item is loaded and declares no column of its
+     * own, so the schema differ has nothing to say about it — declaring a second
+     * @Column over product_id would collide with the relation on every insert.
+     */
+    @RelationId((item: OrderItem) => item.product)
+    productId!: string;
 
     @Column({ name: 'quantity', type: 'int' })
     quantity!: number;

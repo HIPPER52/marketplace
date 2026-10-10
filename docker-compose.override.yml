@@ -1,5 +1,8 @@
 services:
   app:
+    # Same reason as in docker-compose.yml: `docker compose up -d --wait` must not need a
+    # secret a fresh clone does not have. `docker compose --profile app up -d` runs it.
+    profiles: ["app"]
     build:
       context: ./
       dockerfile: Dockerfile

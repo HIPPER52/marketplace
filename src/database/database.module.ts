@@ -1,18 +1,19 @@
 import { Global, Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { PG_POOL } from './constants/database.constants';
-import { createPool, DatabaseService } from './services/database.service';
+import { DATA_SOURCE } from './constants/database.constants';
+import { createDataSource } from './services/data-source.factory';
+import { DatabaseService } from './services/database.service';
 
 @Global()
 @Module({
     providers: [
         {
-            provide: PG_POOL,
+            provide: DATA_SOURCE,
             inject: [ConfigService],
-            useFactory: createPool,
+            useFactory: createDataSource,
         },
         DatabaseService,
     ],
-    exports: [DatabaseService],
+    exports: [DATA_SOURCE, DatabaseService],
 })
 export class DatabaseModule {}

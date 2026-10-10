@@ -1,0 +1,112 @@
+name: tests and contract
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  tests:
+    name: integration + e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck, lint, spec
+        run: npm run check
+
+      # Nothing to start: @testcontainers/postgresql raises its own Postgres from inside
+      # the tests, on a port it picks, and ryuk removes it even if the suite dies.
+      - name: Integration suite
+        run: npm run test:integration
+
+      - name: End to end
+        run: npm run test:e2e
+
+  contract:
+    name: publish -> verify -> can-i-deploy
+    runs-on: ubuntu-latest
+    env:
+      # The address of this workflow's own broker, not a secret — it is a loopback port on
+      # the runner. The token is, which is why it comes from GitHub secrets and is empty
+      # against a local broker that asks for none.
+      PACT_BROKER_URL: http://127.0.0.1:29292
+      PACT_BROKER_TOKEN: ${{ secrets.PACT_BROKER_TOKEN }}
+      PACT_VERSION: "1.0.0"
+      CONSUMER: marketplace-web
+      PROVIDER: marketplace-api
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Raise the broker
+        run: docker compose up -d --wait pact-broker
+
+      - name: Consumer test writes the contract
+        run: npm run test:contract
+
+      - name: Publish the contract
+        run: |
+          status=$(curl -s -o /tmp/publish.json -w '%{http_code}' \
+            -X PUT "$PACT_BROKER_URL/pacts/provider/$PROVIDER/consumer/$CONSUMER/version/$PACT_VERSION" \
+            -H 'Content-Type: application/json' \
+            --data-binary "@pacts/$CONSUMER-$PROVIDER.json")
+          echo "HTTP $status"
+          cat /tmp/publish.json
+          test "$status" = "200" -o "$status" = "201"
+
+      # Proves the gate is a gate. Before anything has verified this pact the honest
+      # answer is "unknown", and a step that only ever ran after verification could not
+      # tell a working gate from one that always says yes.
+      - name: The gate refuses before verification
+        run: |
+          curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=$CONSUMER&version=$PACT_VERSION&to=prod" \
+            -o /tmp/before.json
+          node -e '
+            const summary = require("/tmp/before.json").summary;
+            console.log(JSON.stringify(summary));
+            if (summary.deployable === true) {
+              console.error("The gate said yes before anything verified the contract.");
+              process.exit(1);
+            }
+          '
+
+      - name: Provider verification, published back to the broker
+        run: npm run verify:provider
+
+      # to=prod asks "is there a verified contract against the provider version that is in
+      # prod right now". Until some provider version carries the tag, there is nothing to
+      # compare against and the answer stays unknown — so this step is not optional.
+      - name: Tag this provider version as prod
+        run: |
+          curl -sf -o /dev/null \
+            -X PUT "$PACT_BROKER_URL/pacticipants/$PROVIDER/versions/$PACT_VERSION/tags/prod" \
+            -H 'Content-Type: application/json'
+
+      - name: can-i-deploy
+        run: |
+          curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=$CONSUMER&version=$PACT_VERSION&to=prod" \
+            -o /tmp/after.json
+          node -e '
+            const summary = require("/tmp/after.json").summary;
+            console.log(JSON.stringify(summary));
+            if (summary.deployable !== true) {
+              console.error(summary.reason);
+              process.exit(1);
+            }
+          '

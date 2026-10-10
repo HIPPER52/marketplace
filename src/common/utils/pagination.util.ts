@@ -21,14 +21,22 @@ function decodeCursor(cursor: string): number {
     return Number(match[1]);
 }
 
-export function paginate<T>(all: readonly T[], limit: number, cursor?: string): Page<T> {
-    const offset = cursor === undefined ? 0 : decodeCursor(cursor);
-    const items = all.slice(offset, offset + limit);
+/** The cursor is opaque to clients; inside, it is the offset the next page starts at. */
+export function readCursor(cursor?: string): number {
+    return cursor === undefined ? 0 : decodeCursor(cursor);
+}
+
+/**
+ * Wraps a page the database has already sliced. `total` is what decides whether there is
+ * a next cursor — asking for one row more than the page size would answer the same
+ * question, but the count is what `findAndCount` already returns.
+ */
+export function pageOf<T>(items: T[], offset: number, total: number): Page<T> {
     const consumed = offset + items.length;
 
     return {
         items,
-        next_cursor: consumed < all.length ? encodeCursor(consumed) : null,
+        next_cursor: consumed < total ? encodeCursor(consumed) : null,
     };
 }
 
