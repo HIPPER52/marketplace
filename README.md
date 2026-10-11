@@ -4,14 +4,15 @@ Contract-first API for a small marketplace. The OpenAPI document in
 [`openapi/openapi.yaml`](openapi/openapi.yaml) is the source of truth; the service is a
 thin layer behind a validator that enforces it.
 
-| Assignment | What it added                                                                           |
-| ---------- | --------------------------------------------------------------------------------------- |
-| HW-09      | the OpenAPI contract and runtime validation at the boundary                             |
-| HW-11      | NestJS, a validated environment schema, and password rotation without a restart         |
-| HW-12      | the data layer: schema, seed, indexes, and EXPLAIN evidence                             |
-| HW-13      | TypeORM over that schema: entities, relations, migrations, N+1                          |
-| HW-14      | concurrency: a transactional checkout, a SKIP LOCKED worker pool, retries               |
-| **HW-15**  | **operations: PgBouncer, a nightly backup, and a restore drill that proves it** — below |
+| Assignment | What it added                                                                              |
+| ---------- | ------------------------------------------------------------------------------------------ |
+| HW-09      | the OpenAPI contract and runtime validation at the boundary                                |
+| HW-11      | NestJS, a validated environment schema, and password rotation without a restart            |
+| HW-12      | the data layer: schema, seed, indexes, and EXPLAIN evidence                                |
+| HW-13      | TypeORM over that schema: entities, relations, migrations, N+1                             |
+| HW-14      | concurrency: a transactional checkout, a SKIP LOCKED worker pool, retries                  |
+| HW-15      | operations: PgBouncer, a nightly backup, and a restore drill that proves it                |
+| **HW-16**  | **integration, E2E and contract tests — and the HTTP layer wired to the database** — below |
 
 ---
 
@@ -168,7 +169,7 @@ credentials of the local stand, which live in [`docker-compose.yml`](docker-comp
 and [`init.sql`](init.sql) on purpose and are not a secret:
 
 ```bash
-docker compose up -d --wait db pgbouncer
+docker compose up -d --wait
 export DATABASE_URL=postgres://marketplace_app:local_dev_password@127.0.0.1:26432/marketplace
 export DB_HOST=127.0.0.1 DB_PORT=26432 DB_USER=marketplace_app DB_PASSWORD=local_dev_password DB_NAME=marketplace
 export SKIP_VAULT=1   # no access to the store: the values are already in the environment
@@ -180,9 +181,17 @@ what `scripts/backup.sh` and `scripts/restore-drill.sh` hand to `pg_dump` and `p
 the `DB_*` block is the validated contract `src/database/data-source.ts` reads. One store
 fills both — see [Where the credentials come from](#where-the-credentials-come-from).
 
-`--wait db pgbouncer` names the two services rather than raising everything: the `app`
-service bind-mounts `secrets/db_password`, which a fresh clone does not have. Nothing below
-needs the HTTP service.
+That bare command raises Postgres, the pooler and the Pact broker, and stops there: the
+`app` service sits behind the `app` profile precisely because it bind-mounts
+`secrets/db_password`, which a fresh clone does not have — Docker would create a
+root-owned _directory_ in its place. Nothing below needs the HTTP service.
+
+To run the service as well, two things have to happen first, in this order:
+
+```bash
+npm ci && npm run setup:secrets      # writes secrets/db_password from init.sql
+docker compose --profile app up -d --wait
+```
 
 Then everything below runs on a fresh clone with no edits to any file:
 
@@ -653,6 +662,256 @@ against a node dying, backups against a person, and they are not substitutes.
 
 ---
 
+# Testing — HW-16
+
+A green test is not a true test. This section is the ladder from the cheapest answer to
+the most trustworthy one, and what each rung costs.
+
+| Command                    | Who answers                                       | Cost               |
+| -------------------------- | ------------------------------------------------- | ------------------ |
+| `npm run test:integration` | a real Postgres, raised from inside the tests     | ~1.3 s a container |
+| `npm run test:e2e`         | the whole Nest application over HTTP              | + a boot           |
+| `npm run test:contract`    | a mock server standing in for this service        | milliseconds       |
+| `npm run verify:provider`  | the real service, against the consumer's contract | + a boot           |
+
+All four need Docker running and nothing else. No database has to be up first: every
+suite starts its own `postgres:17-alpine` through `@testcontainers/postgresql`, on a port
+the library picks, and ryuk removes the container even when a run is killed.
+
+**`postgres:17-alpine`, not 16.** It is the version in `docker-compose.yml` and the
+version the restore drill restores into. Testing against another major is the mock's lie
+wearing a different hat — everything passes, against a database nobody deploys.
+
+## Isolation: TRUNCATE between tests, and why not a transaction
+
+Each test starts from an empty database: `TRUNCATE … RESTART IDENTITY CASCADE` in
+`beforeEach`, one container per file in `beforeAll`.
+
+The lecture's cheaper option — wrap each test in `BEGIN … ROLLBACK` — cannot work here,
+and the reason is in this repository rather than in taste. `CheckoutService` opens its
+**own** transaction and commits it, then replays the whole thing on `40001`; a test that
+wrapped it in an outer transaction would be testing a transaction that never ends, and
+the retry wrapper's entire subject could not occur inside one. TRUNCATE costs single-digit
+milliseconds on tables this size, works for code that commits and code that does not, and
+leaves nothing behind — which is exactly what makes the second run identical to the first:
+
+```bash
+npm run test:integration && npm run test:integration   # both green, no cleanup between
+```
+
+## Builders, not a wall of fixtures
+
+`test/testkit/builders.ts` gives `aUser()`, `aProduct()` and `anOrder()`: valid defaults,
+a counter so `user-1@example.com` and `user-2@…` never collide with the unique index over
+`lower(email)`, and a `with*()` chain for the one field a test is actually about.
+
+```ts
+const product = await aProduct().withPrice(260_000).withStock(10).insertVia(manager);
+```
+
+The test then reads as its own specification. `withStock(10)` says this test is about
+stock; the title, the description and the currency are the builder's business.
+
+## What the integration suite catches that a mock cannot
+
+Nine tests across two repositories, and three of them exist because a mock would answer
+whatever the author believed:
+
+- **`price_cents` is a number.** It is `bigint` in Postgres, which the driver hands over
+  as the string `'260000'`. Only the transformer makes it `260000`, and only a real
+  database proves the transformer ran.
+- **The constraints are real.** A second line item for the same product in one order is
+  `23505` against `order_items_one_line_per_product`; a line item naming a product that
+  does not exist is `23503`; a negative price is `23514`. None of the three is expressible
+  in application code, and all three are the schema's promises.
+- **The JOIN returns what the API serves.** `findById` loads an order and its line items
+  through `relationLoadStrategy: 'query'` — two statements for any page size, which is the
+  HW-13 result turned into a test rather than a measurement.
+
+## E2E: nothing substituted
+
+`test/e2e/orders.e2e.test.ts` builds the application through
+`Test.createTestingModule({ imports: [AppModule] })` and then calls `configureApp()` — the
+same function `src/main.ts` calls. No provider is overridden. The OpenAPI validator runs
+on every request **and** every response, `DATABASE_URL` comes from the container, and the
+order that comes back was written by the transaction that moved the stock:
+
+```
+✓ POST /orders places an order and GET /orders/{id} reads it back
+✓ the same Idempotency-Key replays the first order instead of placing a second
+✓ GET /orders/{id} answers 404 as a problem document
+✓ POST /orders without Idempotency-Key is refused by the contract, not by an if
+```
+
+The last one is worth a sentence: there is no `if` in any handler checking for that
+header. The spec says it is required, the validator reads the spec, and the 400 comes with
+the validator's own detail.
+
+`configureApp()` exists for this suite. The four steps it performs are order-dependent and
+two of them were found the hard way — see `src/common/utils/configure-app.util.ts`. An E2E
+suite that assembled them itself would drift from `main.ts`, and the day it did, the tests
+would describe an application nobody deploys.
+
+## The contract
+
+E2E lives in one repository and can only ever prove that this code agrees with itself. The
+contract is the rung above: `test/contract/consumer.test.ts` is written from the point of
+view of a storefront that does not exist here, against a mock server, and what it leaves
+in `pacts/` is what the real service is then held to.
+
+```bash
+npm run test:contract      # writes pacts/marketplace-web-marketplace-api.json
+npm run verify:provider    # the real service answers every interaction in it
+```
+
+Two interactions, both on `GET /products/{productId}` from the HW-09 spec: the product
+that exists, and the one that does not, answered in RFC 7807 as the API conventions
+promise. The matchers are `integer()` and `string()` rather than literals — a contract
+pinned to values breaks whenever somebody edits a seed, and a contract that breaks for no
+reason is one people learn to ignore.
+
+`provider states` are satisfied by writing rows. `given('product … exists')` runs an
+`INSERT … ON CONFLICT DO UPDATE` against the testcontainer, which is the only way that
+sentence can mean anything; a state handler that primed an in-memory store would be
+verifying the mock again, one layer up.
+
+**`pacts/` is committed.** It is generated, but it is also the artefact the provider is
+held to, and a reviewer should see it change in a diff when the expectations change.
+`npm run test:contract` regenerates it; CI does too, and publishes that copy.
+
+## The broker and the gate
+
+```bash
+docker compose up -d --wait        # db, pgbouncer, pact-broker — all healthy
+open http://127.0.0.1:29292        # the broker's own UI
+```
+
+`docker compose up -d --wait` raises the **data layer and the broker** and stops there.
+The `app` service sits behind a profile, because it bind-mounts `secrets/db_password`,
+which is git-ignored and does not exist in a fresh clone. The service itself is
+`docker compose --profile app up -d`.
+
+### Both answers, in order
+
+The point of a gate is that it says no. This sequence shows it saying both things about
+the same contract — the step numbers matter, and step 4 cannot be skipped.
+
+```bash
+export PACT_BROKER_URL=http://127.0.0.1:29292
+
+# 1 — publish the contract the consumer test wrote
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -X PUT "$PACT_BROKER_URL/pacts/provider/marketplace-api/consumer/marketplace-web/version/1.0.0" \
+  -H 'Content-Type: application/json' \
+  --data-binary @pacts/marketplace-web-marketplace-api.json
+# 201
+
+# 2 — ask before anything has verified it
+curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=marketplace-web&version=1.0.0&to=prod"
+```
+
+```json
+{
+    "summary": {
+        "deployable": null,
+        "reason": "There is no verified pact between version 1.0.0 of marketplace-web and the latest version of marketplace-api with tag prod (no such version exists)",
+        "success": 0,
+        "failed": 0,
+        "unknown": 1
+    }
+}
+```
+
+```bash
+# 3 — the real service answers the contract, and the result goes back to the broker
+PACT_BROKER_URL=$PACT_BROKER_URL npm run verify:provider   # exit 0
+
+# 4 — say which provider version is in prod. Without this the answer stays unknown
+#     forever: `to=prod` asks about the version that is there, and there is none.
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -X PUT "$PACT_BROKER_URL/pacticipants/marketplace-api/versions/1.0.0/tags/prod" \
+  -H 'Content-Type: application/json'
+# 201
+
+# 5 — the same question as step 2
+curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=marketplace-web&version=1.0.0&to=prod"
+```
+
+```json
+{
+    "summary": {
+        "deployable": true,
+        "reason": "All required verification results are published and successful",
+        "success": 1,
+        "failed": 0,
+        "unknown": 0
+    }
+}
+```
+
+`unknown` before the tag and `true` after it is the proof that this is a gate rather than
+a step that is always green. `.github/workflows/contract.yml` runs exactly this sequence,
+including the step that fails the job if the broker says yes too early.
+
+### Where the broker's address and token come from
+
+`PACT_BROKER_URL` and `PACT_BROKER_TOKEN` are read from `process.env` and from nowhere
+else — there is no default broker in the code, so `npm run verify:provider` with neither
+set verifies against the local `pacts/` file and needs nothing running but Docker.
+
+There are two legal ways to supply them, and both are used here:
+
+| Form                                                       | For                                                                |
+| ---------------------------------------------------------- | ------------------------------------------------------------------ |
+| `bash scripts/with-secrets.sh dev npm run verify:provider` | the normal path — the HW-11 store, same wrapper as everything else |
+| `PACT_BROKER_URL=… npm run verify:provider`                | CI, and anyone who has the values already                          |
+
+The wrapper exports every `KEY=value` it finds in `.env`, so adding `PACT_BROKER_URL`
+there is all it takes; under `SKIP_VAULT=1` it steps aside and runs the identical command.
+In GitHub Actions the token is `${{ secrets.PACT_BROKER_TOKEN }}` and the URL is a
+loopback port on the runner — an address, not a secret.
+
+One wrinkle is worth knowing about, because it only appears on the wrapped form: the
+wrapper exports `LOG_LEVEL=log` along with everything else in `.env`, and
+`@pact-foundation/pact-core` builds a pino logger out of that variable the moment it is
+imported. pino has no level called `log`. `test/testkit/jest-setup.ts` takes the variable
+away before any test module loads — the service gets it back from `.env` when the
+application module boots, well after pact's logger exists.
+
+They are deliberately **not** in `.env.example`. That file is checked against the zod
+schema in `src/config/schemas/env.schema.ts` by `npm run check:env`, and these two are
+tooling variables that nothing in `src/` reads; adding them would mean claiming the
+service has a contract it does not have.
+
+## What this assignment changed outside `test/`
+
+The HTTP layer used to answer from an array in memory while the data layer from HW-13 to
+HW-15 ran beside it. That is no longer possible to test honestly: a provider state seats a
+row in Postgres and the service has to be the thing that finds it. So the five operations
+in the spec now read and write through TypeORM — `ProductsRepository`, `OrdersRepository`
+and, for `POST /orders`, the transactional `CheckoutService` from HW-14.
+
+`POST /orders` debits one deterministic account, created by its own migration and named by
+`DEMO_BUYER_ID`. There is no authentication in this project yet and the contract describes
+no customer resource; inventing a header or a `buyer_id` field would put a second source of
+truth next to `openapi.yaml`. When authentication lands, that constant is the single place
+that stops being right.
+
+## Where things are
+
+| Path                                                               | What                                                       |
+| ------------------------------------------------------------------ | ---------------------------------------------------------- |
+| [`jest.config.js`](jest.config.js)                                 | `reporters: ['default']`, `maxWorkers: 1`, and why         |
+| [`test/testkit/pg-container.ts`](test/testkit/pg-container.ts)     | one call, one real Postgres, every migration applied       |
+| [`test/testkit/builders.ts`](test/testkit/builders.ts)             | `aUser()`, `aProduct()`, `anOrder()`                       |
+| [`test/integration/`](test/integration/)                           | two repositories, nine tests, three of them constraints    |
+| [`test/e2e/`](test/e2e/)                                           | the whole app through supertest                            |
+| [`test/contract/`](test/contract/)                                 | the consumer test and the provider verification            |
+| `pacts/`                                                           | the contract itself — generated, and committed             |
+| [`.github/workflows/contract.yml`](.github/workflows/contract.yml) | publish → verify → can-i-deploy, with the refusal in front |
+
+---
+
 # The contract — HW-09
 
 `express-openapi-validator` checks every request **and every response** against the spec,
@@ -843,14 +1102,16 @@ grep -cE '^(DATABASE_URL|DB_URL)=' .env.example     # 1
 ```bash
 cp .env.example .env          # the variable contract, filled in
 npm run setup:secrets         # creates secrets/db_password with the value init.sql expects
-docker compose up -d          # service + Postgres, dev mode with hot-reload
+docker compose --profile app up -d   # service + Postgres, dev mode with hot-reload
 curl -s localhost:3000/health
 ```
 
 Both of those files are git-ignored, so a fresh clone has neither — and the first run of
 the _service_ needs both. `secrets/db_password` especially: Docker silently creates a
 _directory_ when a bind-mount source is missing, and the service then fails reading it.
-Raising only the database (the two lines at the top of this file) needs neither.
+That is why the `app` service sits behind the `app` profile: plain
+`docker compose up -d --wait` raises the database, the pooler and the Pact broker, needs
+no secret, and is the one line everything else in this file begins with.
 
 Postgres is published on host port **25432**, not 5432, so this stack cannot collide with
 a Postgres already running on the machine — or with the lecture's own stack.
@@ -924,13 +1185,21 @@ docker history --no-trunc myapp | grep -i password  # empty
 # Development
 
 ```bash
-npm run dev           # tsx watch
+npm run start:dev     # nest start --watch
 npm run typecheck     # generate types from the spec, then tsc --noEmit
 npm run lint          # Biome - TypeScript, JavaScript, JSON
 npm run format        # Prettier - YAML and Markdown
 npm run check         # all of the above plus the spec lint
 ```
 
-The stack also runs in Docker: `docker compose up -d` starts the service with hot-reload
-alongside Postgres 17; `docker compose -f docker-compose.yml up -d --build` is the
-production path.
+```bash
+npm run test:integration   # repositories against a real Postgres
+npm run test:e2e           # the whole app through supertest
+npm run test:contract      # the consumer test; writes pacts/
+npm run verify:provider    # the real service against that contract
+```
+
+The stack also runs in Docker: `docker compose up -d --wait` raises the data layer and the
+Pact broker, `docker compose --profile app up -d` adds the service with hot-reload
+alongside Postgres 17, and `docker compose -f docker-compose.yml --profile app up -d --build`
+is the production path.

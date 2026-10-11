@@ -13,7 +13,8 @@
             "!**/dist",
             "!**/spec.json",
             "!**/package-lock.json",
-            "!src/generated"
+            "!src/generated",
+            "!pacts"
         ]
     },
     "formatter": {
