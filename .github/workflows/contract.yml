@@ -31,6 +31,15 @@ jobs:
       - name: End to end
         run: npm run test:e2e
 
+      # The suites run from source and never touch the Dockerfile, so a broken image
+      # build reaches a reviewer unnoticed — which is exactly how a `COPY tsconfig.json`
+      # that no longer matched `tsc -p tsconfig.build.json` got committed once. Building
+      # both runnable stages is the cheapest thing that would have caught it.
+      - name: Both image stages build
+        run: |
+          docker compose --profile app build app
+          docker compose -f docker-compose.yml --profile app build app
+
   contract:
     name: publish -> verify -> can-i-deploy
     runs-on: ubuntu-latest

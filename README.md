@@ -169,7 +169,7 @@ credentials of the local stand, which live in [`docker-compose.yml`](docker-comp
 and [`init.sql`](init.sql) on purpose and are not a secret:
 
 ```bash
-docker compose up -d --wait db pgbouncer
+docker compose up -d --wait
 export DATABASE_URL=postgres://marketplace_app:local_dev_password@127.0.0.1:26432/marketplace
 export DB_HOST=127.0.0.1 DB_PORT=26432 DB_USER=marketplace_app DB_PASSWORD=local_dev_password DB_NAME=marketplace
 export SKIP_VAULT=1   # no access to the store: the values are already in the environment
@@ -181,9 +181,17 @@ what `scripts/backup.sh` and `scripts/restore-drill.sh` hand to `pg_dump` and `p
 the `DB_*` block is the validated contract `src/database/data-source.ts` reads. One store
 fills both — see [Where the credentials come from](#where-the-credentials-come-from).
 
-`--wait db pgbouncer` names the two services rather than raising everything: the `app`
-service bind-mounts `secrets/db_password`, which a fresh clone does not have. Nothing below
-needs the HTTP service.
+That bare command raises Postgres, the pooler and the Pact broker, and stops there: the
+`app` service sits behind the `app` profile precisely because it bind-mounts
+`secrets/db_password`, which a fresh clone does not have — Docker would create a
+root-owned _directory_ in its place. Nothing below needs the HTTP service.
+
+To run the service as well, two things have to happen first, in this order:
+
+```bash
+npm ci && npm run setup:secrets      # writes secrets/db_password from init.sql
+docker compose --profile app up -d --wait
+```
 
 Then everything below runs on a fresh clone with no edits to any file:
 

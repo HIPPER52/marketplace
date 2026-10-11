@@ -23,7 +23,19 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BACKUP_DIR="${BACKUP_DIR:-$ROOT/backups}"
 DB_SERVICE="${DB_SERVICE:-db}"
-DRILL_CONTAINER="${DRILL_CONTAINER:-marketplace-restore-drill}"
+# A name unique to this checkout, for a reason the fixed name got wrong: the cleanup
+# below deliberately removes a namesake before starting, to clear the leftover of an
+# interrupted run. With one name for every clone on the machine, that cleanup reaches
+# into somebody else's drill and kills it mid-restore — and a drill that can be killed
+# from outside is a drill whose MATCH means nothing.
+#
+# The discriminator is the checkout path, so it is stable across runs of this clone and
+# different for any other. COMPOSE_PROJECT_NAME wins when it is set, because that is what
+# already distinguishes two stands on one machine.
+DRILL_PROJECT="$(printf '%s' "${COMPOSE_PROJECT_NAME:-$(basename "$ROOT")}" |
+    tr -c '[:alnum:]_.-' '-')"
+DRILL_CHECKOUT_ID="$(printf '%s' "$ROOT" | cksum | cut -d' ' -f1)"
+DRILL_CONTAINER="${DRILL_CONTAINER:-${DRILL_PROJECT}-restore-drill-${DRILL_CHECKOUT_ID}}"
 DRILL_IMAGE="${DRILL_IMAGE:-postgres:17-alpine}"
 DRILL_PASSWORD="drill_only_never_leaves_this_script"
 WAIT_SECONDS=60
@@ -91,7 +103,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Any leftover from an interrupted run would make this drill a lie.
+# Any leftover from an interrupted run of THIS checkout would make this drill a lie. The
+# name is this checkout's alone, so nothing else on the machine is in reach.
 cleanup
 
 started_at="$(date +%s)"
