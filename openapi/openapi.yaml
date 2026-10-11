@@ -212,6 +212,88 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+    patch:
+      tags: [Orders]
+      operationId: updateOrderStatus
+      summary: Move an order to a new status
+      description: >-
+        Advances an order through its lifecycle. The change is pushed to everyone
+        currently watching this order: subscribers of
+        `GET /orders/{orderId}/events` and members of the WebSocket room
+        `orders:{orderId}`.
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          description: Identifier of the order.
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateOrderStatusRequest"
+      responses:
+        "200":
+          description: The order, with its new status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+
+  /orders/{orderId}/events:
+    get:
+      tags: [Orders]
+      operationId: streamOrderEvents
+      summary: Stream this order's status changes
+      description: >-
+        A Server-Sent Events stream: one `id:` / `event:` / `data:` block per status
+        change, for this order only. The response never completes on its own.
+
+        Every event carries an `id:` that increases within the order. A client that
+        reconnects with `Last-Event-ID` receives everything numbered above it before the
+        live stream resumes, so a dropped connection costs no events. The buffer lives in
+        the process, so it does not survive a restart.
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          description: Identifier of the order.
+          schema:
+            type: string
+            format: uuid
+        - name: Last-Event-ID
+          in: header
+          required: false
+          description: >-
+            Id of the last event this client already has. Events numbered above it are
+            replayed before the stream continues. Set automatically by `EventSource` on
+            reconnect.
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        "200":
+          description: An open event stream. One block per status change.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                example: |
+                  id: 4
+                  event: order.status
+                  data: {"order_id":"3fa85f64-5717-4562-b3fc-2c963f66afa6","status":"shipped","id":4}
+        "404":
+          $ref: "#/components/responses/NotFound"
+
 components:
   responses:
     BadRequest:
@@ -302,6 +384,19 @@ components:
             Opaque token pointing at the next page, or `null` when this is the last
             page. Pass it back unchanged in the `cursor` query parameter.
 
+    OrderStatus:
+      type: string
+      description: Where an order is in its lifecycle.
+      enum: [pending, paid, shipped, cancelled]
+
+    UpdateOrderStatusRequest:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          $ref: "#/components/schemas/OrderStatus"
+
     Order:
       type: object
       required: [id, status, items, total_cents, currency, created_at]
@@ -310,8 +405,7 @@ components:
           type: string
           format: uuid
         status:
-          type: string
-          enum: [pending, paid, shipped, cancelled]
+          $ref: "#/components/schemas/OrderStatus"
         items:
           type: array
           minItems: 1

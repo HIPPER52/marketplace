@@ -1,13 +1,32 @@
-import { Body, Controller, Get, Headers, HttpCode, Param, Post, Query, Res } from '@nestjs/common';
+import {
+    Body,
+    Controller,
+    Get,
+    Headers,
+    HttpCode,
+    Param,
+    Patch,
+    Post,
+    Query,
+    Res,
+} from '@nestjs/common';
 import type { Response } from 'express';
 import { ProblemError, ProblemType } from '../../common/errors/problem.error';
-import type { CreateOrderRequest, Order } from '../../common/types/api.types';
+import type {
+    CreateOrderRequest,
+    Order,
+    UpdateOrderStatusRequest,
+} from '../../common/types/api.types';
 import { pageOf, readCursor, readLimit } from '../../common/utils/pagination.util';
 import { DEMO_BUYER_ID } from '../../users/constants/demo-buyer.constant';
+import { ORDER_STATUS_EVENT } from '../constants/realtime.constant';
 import { OrdersRepository } from '../repositories/orders.repository';
 import { CheckoutService } from '../services/checkout.service';
 import { IdempotencyRegistry } from '../services/idempotency.service';
+import { OrderEventsService } from '../services/order-events.service';
+import { OrderStatusService } from '../services/order-status.service';
 import type { CheckoutResult } from '../types/checkout.types';
+import { type OrderEvent, toPayload } from '../types/order-event.types';
 import { toApiOrder } from '../utils/order.mapper';
 
 @Controller()
@@ -16,6 +35,8 @@ export class OrdersController {
         private readonly idempotency: IdempotencyRegistry,
         private readonly orders: OrdersRepository,
         private readonly checkout: CheckoutService,
+        private readonly status: OrderStatusService,
+        private readonly orderEvents: OrderEventsService,
     ) {}
 
     @Get('orders')
@@ -97,6 +118,87 @@ export class OrdersController {
 
         return created;
     }
+
+    @Patch('orders/:orderId')
+    async updateStatus(
+        @Param('orderId') orderId: string,
+        @Body() body: UpdateOrderStatusRequest,
+    ): Promise<Order> {
+        // The service writes the status and announces it. This route does neither
+        // directly — see services/order-status.service.ts for why the emit lives there.
+        return toApiOrder(await this.status.changeStatus(orderId, body.status));
+    }
+
+    /**
+     * The same stream of changes, over plain HTTP.
+     *
+     * Written against `@Res()` rather than Nest's `@Sse()` because this endpoint has two
+     * requirements that decorator does not cover: the order has to be looked up *before*
+     * any byte is written, so that an unknown id is an honest 404 rather than an empty
+     * stream with a 200 on it; and `retry:` has to lead the body, which is how the
+     * server sets the client's reconnect pace instead of leaving it at the browser
+     * default of several seconds.
+     */
+    @Get('orders/:orderId/events')
+    async events(
+        @Param('orderId') orderId: string,
+        @Res() res: Response,
+        @Headers('last-event-id') lastEventId?: string,
+    ): Promise<void> {
+        const order = await this.orders.findById(orderId);
+
+        if (order === null) {
+            throw new ProblemError({
+                status: 404,
+                type: ProblemType.notFound,
+                title: 'Resource not found',
+                detail: `No order with id ${orderId}.`,
+            });
+        }
+
+        res.writeHead(200, {
+            'content-type': 'text/event-stream',
+            // no-transform as well as no-cache: a compressing proxy that buffers to find
+            // something to compress turns a live stream into a long silence.
+            'cache-control': 'no-cache, no-transform',
+            connection: 'keep-alive',
+            'x-accel-buffering': 'no',
+        });
+
+        const write = (event: OrderEvent): void => {
+            res.write(
+                `id: ${event.id}\n` +
+                    `event: ${ORDER_STATUS_EVENT}\n` +
+                    `data: ${JSON.stringify(toPayload(event))}\n\n`,
+            );
+        };
+
+        res.write('retry: 1000\n\n');
+
+        // Everything this client missed while it was away, before the live feed starts.
+        for (const missed of this.orderEvents.since(orderId, readLastEventId(lastEventId))) {
+            write(missed);
+        }
+
+        const subscription = this.orderEvents.forOrder(orderId).subscribe(write);
+
+        // A stream with nothing to say looks exactly like a dead connection to anything
+        // between here and the client.
+        const keepAlive = setInterval(() => res.write(': keep-alive\n\n'), 15_000);
+
+        res.on('close', () => {
+            clearInterval(keepAlive);
+            subscription.unsubscribe();
+            res.end();
+        });
+    }
+}
+
+/** `Last-Event-ID` is a client's claim; anything that is not a number means "from the start". */
+function readLastEventId(raw: string | undefined): number {
+    const parsed = Number(raw);
+
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
 }
 
 function unprocessable(detail: string): ProblemError {

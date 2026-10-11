@@ -4,15 +4,16 @@ Contract-first API for a small marketplace. The OpenAPI document in
 [`openapi/openapi.yaml`](openapi/openapi.yaml) is the source of truth; the service is a
 thin layer behind a validator that enforces it.
 
-| Assignment | What it added                                                                              |
-| ---------- | ------------------------------------------------------------------------------------------ |
-| HW-09      | the OpenAPI contract and runtime validation at the boundary                                |
-| HW-11      | NestJS, a validated environment schema, and password rotation without a restart            |
-| HW-12      | the data layer: schema, seed, indexes, and EXPLAIN evidence                                |
-| HW-13      | TypeORM over that schema: entities, relations, migrations, N+1                             |
-| HW-14      | concurrency: a transactional checkout, a SKIP LOCKED worker pool, retries                  |
-| HW-15      | operations: PgBouncer, a nightly backup, and a restore drill that proves it                |
-| **HW-16**  | **integration, E2E and contract tests — and the HTTP layer wired to the database** — below |
+| Assignment | What it added                                                                   |
+| ---------- | ------------------------------------------------------------------------------- |
+| HW-09      | the OpenAPI contract and runtime validation at the boundary                     |
+| HW-11      | NestJS, a validated environment schema, and password rotation without a restart |
+| HW-12      | the data layer: schema, seed, indexes, and EXPLAIN evidence                     |
+| HW-13      | TypeORM over that schema: entities, relations, migrations, N+1                  |
+| HW-14      | concurrency: a transactional checkout, a SKIP LOCKED worker pool, retries       |
+| HW-15      | operations: PgBouncer, a nightly backup, and a restore drill that proves it     |
+| HW-16      | integration, E2E and contract tests; the HTTP layer wired to the database       |
+| **HW-18**  | **realtime: a WebSocket room per order, the same stream over SSE** — below      |
 
 ---
 
@@ -180,6 +181,14 @@ variable shapes because two kinds of client read them: `DATABASE_URL` is a libpq
 what `scripts/backup.sh` and `scripts/restore-drill.sh` hand to `pg_dump` and `psql`, while
 the `DB_*` block is the validated contract `src/database/data-source.ts` reads. One store
 fills both — see [Where the credentials come from](#where-the-credentials-come-from).
+
+**Those exports are for the command-line tools, not for the HTTP service.** The URL above
+carries a password inline, which is exactly what the service's own environment schema
+refuses — the password belongs in the file named by `DB_PASSWORD_FILE` so that it can be
+rotated under a running process. A real environment variable beats the `.env` file, so
+`npm start` in the same shell exits with
+`DATABASE_URL: must not carry a password`. Start the service from a shell that has not
+exported it, or `unset DATABASE_URL` first.
 
 That bare command raises Postgres, the pooler and the Pact broker, and stops there: the
 `app` service sits behind the `app` profile precisely because it bind-mounts
@@ -909,6 +918,161 @@ that stops being right.
 | [`test/contract/`](test/contract/)                                 | the consumer test and the provider verification            |
 | `pacts/`                                                           | the contract itself — generated, and committed             |
 | [`.github/workflows/contract.yml`](.github/workflows/contract.yml) | publish → verify → can-i-deploy, with the refusal in front |
+
+---
+
+# Realtime — HW-18
+
+A status change used to be something the buyer discovered by pressing F5. It now reaches
+them while they are looking at the page, over either of two transports that carry the
+same events from the same bus.
+
+## The commands
+
+The application has to be running — see
+[Running the service](#running-the-service), and note the warning in
+[Grading](#grading) if this shell has already exported `DATABASE_URL`. Then:
+
+```bash
+curl -sN http://localhost:3000/orders/<id>/events          # watch one order over SSE
+curl -X PATCH http://localhost:3000/orders/<id> \
+     -H 'content-type: application/json' -d '{"status":"shipped"}'
+
+node scripts/realtime-demo.mjs               # the proof: two rooms, one event
+node scripts/realtime-demo.mjs --same-room   # the control run — see below
+```
+
+## WebSocket: a room per order, and who is allowed in
+
+The gateway is Nest's, on the socket.io platform, attached to the same HTTP server the
+API answers on. A client connects, sends `join` with an order id, and gets an
+acknowledgement saying whether it is in:
+
+```js
+const socket = io("http://localhost:3000", { auth: { userId: "1" } });
+socket.emit("join", { orderId }, (ack) => console.log(ack));
+socket.on("order.status", (event) => console.log(event));
+```
+
+The room is `orders:<id>` and the socket enters it **only after the gateway has confirmed
+the order belongs to the person asking**. `server.emit` would tell every connected client
+when anybody's order shipped; `server.to(room).emit` tells the one order's watchers, and
+the membership of that room is decided server-side.
+
+Three refusals, all answered in the `join` acknowledgement rather than by silence:
+
+```
+anonymous       {"ok":false,"error":"unauthenticated", ...}
+someone else    {"ok":false,"error":"forbidden","detail":"Order … does not belong to user 999."}
+the real owner  {"ok":true,"room":"orders:…"}
+```
+
+**Where the identity comes from is a placeholder, and is written to be replaced.** There
+is no authentication in this project yet — the contract describes no customer resource
+and carries no credentials — so the claim arrives in the socket.io handshake and is
+checked against the order's owner. When #24 lands, the only line that changes is the one
+that derives the id: a verified token instead of a claim. Every refusal above keeps
+working untouched.
+
+**Socket.IO does not start on a WebSocket.** Engine.IO opens with HTTP long-polling and
+upgrades afterwards, so the first request is `GET /socket.io/?EIO=4&transport=polling`.
+That path is not in `openapi.yaml`, so the validator answered it `404`, the upgrade never
+happened, and the symptom was a client that silently never connected. `/socket.io` is now
+in `ignorePaths` beside `/health` and `/readiness`.
+
+## SSE: the same events over plain HTTP
+
+`GET /orders/{id}/events` is in the contract like every other operation — a `200` whose
+content is `text/event-stream`. It is written against the raw response rather than Nest's
+`@Sse()` decorator for two reasons: the order is looked up **before** a byte is written,
+so an unknown id is an honest `404` instead of an empty stream carrying a `200`; and
+`retry:` leads the body, which is how the server sets the client's reconnect pace instead
+of leaving it at the browser default of several seconds.
+
+```
+retry: 1000
+
+id: 1
+event: order.status
+data: {"id":1,"order_id":"92619690-…","status":"paid","at":"2026-10-11T15:45:16.900Z"}
+```
+
+`id:` counts **within one order**, from 1 — not across all of them. The number is what a
+reconnecting client sends back in `Last-Event-ID`, and it has to mean something for this
+order alone; a global counter would give each client a sequence full of gaps it could not
+tell apart from lost events.
+
+```bash
+# after four changes to this order
+curl -sN --max-time 2 -H 'Last-Event-ID: 3' http://localhost:3000/orders/<id>/events | grep '^id:' | head -1
+# id: 4   — the one it missed, and no duplicates of the three it had
+```
+
+The buffer behind that promise is in the process: a hundred events per order, a thousand
+orders, least-recently-written evicted first. **It does not survive a restart and it is
+not shared between instances** — a client that reconnects to a fresh process gets the live
+stream and nothing older. That is the honest limit of an in-memory bus, and #19 is where
+it becomes a queue that does survive.
+
+## Isolation, proved twice
+
+One script, two runs. The flag changes one value — which room the second client joins —
+and the expectation checked against it:
+
+```bash
+node scripts/realtime-demo.mjs;             echo "exit=$?"
+# A_RECEIVED=1
+# B_RECEIVED=0
+# exit=0
+
+node scripts/realtime-demo.mjs --same-room; echo "exit=$?"
+# A_RECEIVED=1
+# B_RECEIVED=1
+# exit=0
+```
+
+The control run is not a bonus feature. A script that simply printed `B_RECEIVED=0` would
+pass the first check and look like working isolation; it fails the second one. Only the
+pair proves the script is measuring rather than asserting.
+
+## Trade-offs: WebSocket vs SSE
+
+| Criterion                | WebSocket (socket.io)                                           | SSE (`text/event-stream`)                                       |
+| ------------------------ | --------------------------------------------------------------- | --------------------------------------------------------------- |
+| Direction                | full duplex — the client talks back on the same connection      | server to client only; the client answers with an ordinary POST |
+| Reconnect and recovery   | socket.io reconnects; replaying what was missed is your code    | `EventSource` reconnects and resends `Last-Event-ID` for free   |
+| Infrastructure           | `Upgrade` must survive every proxy; sticky sessions on 2+ nodes | ordinary HTTP — anything that proxies a response proxies this   |
+| Cost per event           | a frame, from two bytes of header                               | a few text lines, plus a keep-alive comment on an idle stream   |
+| Addressing one recipient | rooms, server-side, built in                                    | one stream per subscriber; the URL already names the resource   |
+| Browser API              | a library, and its own protocol on top                          | `new EventSource(url)` — no dependency                          |
+
+**For order notifications I would keep SSE in production.** The channel is one-directional
+— the buyer is told, they never answer down the same pipe — and that is precisely the case
+where the standard hands you reconnection and gap-free replay for nothing, over transport
+that every proxy and load balancer in the path already understands. The WebSocket is here
+because the moment the client starts talking back — a support chat, a live cart shared
+between two devices — SSE would need a second channel for the upstream half, and then two
+transports are carrying one conversation.
+
+## Two instances, and what breaks
+
+Nothing above needs a Redis adapter today, because there is one process. **With two
+instances behind a load balancer a room stops working: `orders:42` is an in-memory label
+on one instance's sockets, so an event published on instance A never reaches the client
+that happens to be connected to instance B** — the cure is `@socket.io/redis-adapter`,
+which forwards emits between instances over Pub/Sub (and sticky sessions on the balancer,
+because the Engine.IO handshake is more than one request). The same split hits SSE harder:
+its buffer would have to leave the process entirely. That is #23's subject.
+
+## Where things are
+
+| Path                                                                                         | What                                                                     |
+| -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| [`src/orders/gateways/orders.gateway.ts`](src/orders/gateways/orders.gateway.ts)             | `join`, the ownership check, the fan-out into rooms                      |
+| [`src/orders/services/order-events.service.ts`](src/orders/services/order-events.service.ts) | the bus: a Subject plus the replay buffer, shared by both transports     |
+| [`src/orders/services/order-status.service.ts`](src/orders/services/order-status.service.ts) | writes the status and announces it — the emit lives here, not in a route |
+| [`src/orders/controllers/orders.controller.ts`](src/orders/controllers/orders.controller.ts) | `PATCH /orders/{id}` and the SSE stream                                  |
+| [`scripts/realtime-demo.mjs`](scripts/realtime-demo.mjs)                                     | the isolation proof and its control run                                  |
 
 ---
 

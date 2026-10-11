@@ -7,6 +7,7 @@ import {
     ManyToOne,
     OneToMany,
     PrimaryGeneratedColumn,
+    RelationId,
 } from 'typeorm';
 import { CURRENCIES, Currency } from '../../common/constants/currency.constant';
 import { bigintCents } from '../../common/utils/money.util';
@@ -50,6 +51,14 @@ export class Order {
     )
     @JoinColumn({ name: 'user_id' })
     user!: User;
+
+    /**
+     * The owner's id without loading the owner. The realtime gateway answers one
+     * question — "is this order yours?" — and joining the users table to answer it would
+     * be a row fetched to look at one column.
+     */
+    @RelationId((order: Order) => order.user)
+    userId!: string;
 
     @Column({ name: 'status', type: 'text', default: OrderStatus.Pending })
     status!: OrderStatus;
