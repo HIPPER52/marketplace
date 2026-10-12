@@ -49,7 +49,11 @@ jobs:
       # against a local broker that asks for none.
       PACT_BROKER_URL: http://127.0.0.1:29292
       PACT_BROKER_TOKEN: ${{ secrets.PACT_BROKER_TOKEN }}
-      PACT_VERSION: "1.0.0"
+      # The commit, not a constant. A fixed version on a broker that outlives the run
+      # means the prod tag from last time is still there, so can-i-deploy answers "yes"
+      # before anything has verified today's contract — and the gate, which exists to say
+      # no, has nothing left to say it about.
+      PACT_VERSION: ${{ github.sha }}
       CONSUMER: marketplace-web
       PROVIDER: marketplace-api
     steps:
@@ -79,18 +83,24 @@ jobs:
           cat /tmp/publish.json
           test "$status" = "200" -o "$status" = "201"
 
-      # Proves the gate is a gate. Before anything has verified this pact the honest
-      # answer is "unknown", and a step that only ever ran after verification could not
-      # tell a working gate from one that always says yes.
+      # Proves the gate is a gate, and asks about the right participant to do it.
+      #
+      # The question is "may this provider build go to prod", not "may the consumer go".
+      # Asking about the consumer looks equivalent and is not: the broker attaches a
+      # verification result to the *content* of a pact, so an unchanged contract
+      # republished under a new consumer version is already verified and the answer comes
+      # back "yes" before this build has done anything. Measured against a broker that
+      # outlived a previous run — consumer: deployable=true, provider: deployable=false,
+      # "No pacts or verifications have been published for version <sha>".
       - name: The gate refuses before verification
         run: |
-          curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=$CONSUMER&version=$PACT_VERSION&to=prod" \
+          curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=$PROVIDER&version=$PACT_VERSION&to=prod" \
             -o /tmp/before.json
           node -e '
             const summary = require("/tmp/before.json").summary;
             console.log(JSON.stringify(summary));
             if (summary.deployable === true) {
-              console.error("The gate said yes before anything verified the contract.");
+              console.error("The gate said yes before this build verified anything.");
               process.exit(1);
             }
           '
@@ -109,7 +119,7 @@ jobs:
 
       - name: can-i-deploy
         run: |
-          curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=$CONSUMER&version=$PACT_VERSION&to=prod" \
+          curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=$PROVIDER&version=$PACT_VERSION&to=prod" \
             -o /tmp/after.json
           node -e '
             const summary = require("/tmp/after.json").summary;

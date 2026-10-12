@@ -19,9 +19,10 @@ import type {
 } from '../../common/types/api.types';
 import { pageOf, readCursor, readLimit } from '../../common/utils/pagination.util';
 import { DEMO_BUYER_ID } from '../../users/constants/demo-buyer.constant';
-import { ORDER_STATUS_EVENT } from '../constants/realtime.constant';
+import { ORDER_STATUS_EVENT, USER_ID_HEADER } from '../constants/realtime.constant';
 import { OrdersRepository } from '../repositories/orders.repository';
 import { CheckoutService } from '../services/checkout.service';
+import { ClaimedIdentityService } from '../services/claimed-identity.service';
 import { IdempotencyRegistry } from '../services/idempotency.service';
 import { OrderEventsService } from '../services/order-events.service';
 import { OrderStatusService } from '../services/order-status.service';
@@ -37,6 +38,7 @@ export class OrdersController {
         private readonly checkout: CheckoutService,
         private readonly status: OrderStatusService,
         private readonly orderEvents: OrderEventsService,
+        private readonly identity: ClaimedIdentityService,
     ) {}
 
     @Get('orders')
@@ -143,8 +145,34 @@ export class OrdersController {
     async events(
         @Param('orderId') orderId: string,
         @Res() res: Response,
+        @Headers(USER_ID_HEADER) userId?: string,
         @Headers('last-event-id') lastEventId?: string,
     ): Promise<void> {
+        // The same rule the gateway enforces on `join`. An order's events are its
+        // buyer's: a stream that answered anyone would make the WebSocket check
+        // decorative, since the identical events are one curl away.
+        //
+        // openapi.yaml marks the header required with minLength 1, so the validator
+        // answers 400 before this runs and the branch is unreachable over HTTP. It
+        // answers with the same status for the same reason, so that the day the route
+        // stops being validated — one line in `ignorePaths` — the stream does not quietly
+        // become public.
+        const claimant = this.identity.resolve(userId);
+
+        if (claimant === null) {
+            // Two different refusals wearing one status. Missing header: unreachable,
+            // because openapi.yaml marks it required and the validator answers 400 first
+            // — kept so that the day this route stops being validated the stream does not
+            // quietly become public. Claims not accepted here: reachable, and the reason
+            // the detail says so out loud.
+            throw new ProblemError({
+                status: this.identity.accepted ? 400 : 403,
+                type: this.identity.accepted ? ProblemType.validation : ProblemType.forbidden,
+                title: this.identity.accepted ? 'Request validation failed' : 'Forbidden',
+                detail: this.identity.refusal(),
+            });
+        }
+
         const order = await this.orders.findById(orderId);
 
         if (order === null) {
@@ -153,6 +181,15 @@ export class OrdersController {
                 type: ProblemType.notFound,
                 title: 'Resource not found',
                 detail: `No order with id ${orderId}.`,
+            });
+        }
+
+        if (order.userId !== claimant) {
+            throw new ProblemError({
+                status: 403,
+                type: ProblemType.forbidden,
+                title: 'Forbidden',
+                detail: `Order ${orderId} does not belong to user ${claimant}.`,
             });
         }
 
@@ -176,7 +213,7 @@ export class OrdersController {
         res.write('retry: 1000\n\n');
 
         // Everything this client missed while it was away, before the live feed starts.
-        for (const missed of this.orderEvents.since(orderId, readLastEventId(lastEventId))) {
+        for (const missed of replayFor(this.orderEvents, orderId, lastEventId)) {
             write(missed);
         }
 
@@ -194,11 +231,30 @@ export class OrdersController {
     }
 }
 
-/** `Last-Event-ID` is a client's claim; anything that is not a number means "from the start". */
-function readLastEventId(raw: string | undefined): number {
-    const parsed = Number(raw);
+/**
+ * What to replay, from a header the client controls.
+ *
+ * No header at all means a client that has never been here: it gets the whole buffer.
+ * A header that is present but unreadable means the opposite — this client has seen
+ * *something* and we cannot tell what, so replaying everything would hand it duplicates
+ * it has no way to recognise. It gets the live stream and nothing else.
+ *
+ * Over HTTP the second case cannot arrive: openapi.yaml declares `Last-Event-ID` as an
+ * integer no smaller than zero, so the validator answers 400 first. This is what the
+ * code does if that ever stops being true.
+ */
+function replayFor(
+    events: OrderEventsService,
+    orderId: string,
+    rawLastEventId: string | undefined,
+): OrderEvent[] {
+    if (rawLastEventId === undefined) {
+        return events.since(orderId, 0);
+    }
 
-    return Number.isInteger(parsed) && parsed > 0 ? parsed : 0;
+    const parsed = Number(rawLastEventId);
+
+    return Number.isInteger(parsed) && parsed >= 0 ? events.since(orderId, parsed) : [];
 }
 
 function unprocessable(detail: string): ProblemError {

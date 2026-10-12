@@ -270,6 +270,17 @@ paths:
           schema:
             type: string
             format: uuid
+        - name: X-User-Id
+          in: header
+          required: true
+          description: >-
+            Who is asking. An order's event stream is private to its buyer, and this
+            header is how the caller says who they are — the same claim the WebSocket
+            gateway takes from its handshake. It is a placeholder until authentication
+            exists: a signed token replaces it, and the checks behind it do not change.
+          schema:
+            type: string
+            minLength: 1
         - name: Last-Event-ID
           in: header
           required: false
@@ -291,6 +302,8 @@ paths:
                   id: 4
                   event: order.status
                   data: {"order_id":"3fa85f64-5717-4562-b3fc-2c963f66afa6","status":"shipped","id":4}
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
 
@@ -298,6 +311,13 @@ components:
   responses:
     BadRequest:
       description: The request does not satisfy this contract.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+    Forbidden:
+      description: The caller said who they are, and it is not whose this is.
       content:
         application/problem+json:
           schema:

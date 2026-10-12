@@ -11,6 +11,7 @@ import type { Subscription } from 'rxjs';
 import type { Server, Socket } from 'socket.io';
 import { JOIN_EVENT, ORDER_STATUS_EVENT, roomOf } from '../constants/realtime.constant';
 import { OrdersRepository } from '../repositories/orders.repository';
+import { ClaimedIdentityService } from '../services/claimed-identity.service';
 import { OrderEventsService } from '../services/order-events.service';
 import { toPayload } from '../types/order-event.types';
 
@@ -32,9 +33,10 @@ import { toPayload } from '../types/order-event.types';
  * handshake, `io(url, { auth: { userId } })`, and is checked against the order's owner.
  * A socket with no `userId` is refused, and so is one naming somebody else's order.
  *
- * This is a placeholder and is written to be replaced: when #24 lands, the only thing
- * that changes is how `userIdOf` derives the id — a verified token instead of a claim —
- * and every refusal below keeps working unchanged.
+ * The claim is only accepted where it can do no harm — see
+ * services/claimed-identity.service.ts, which refuses every caller outside development
+ * and test rather than pretending an unsigned claim is a check. When #24 lands, that one
+ * service starts verifying a token and every refusal below keeps working unchanged.
  */
 
 /** The answer a client receives in its `join` acknowledgement. */
@@ -65,6 +67,7 @@ export class OrdersGateway implements OnGatewayInit, OnModuleDestroy {
     constructor(
         private readonly events: OrderEventsService,
         private readonly orders: OrdersRepository,
+        private readonly identity: ClaimedIdentityService,
     ) {}
 
     /**
@@ -86,14 +89,10 @@ export class OrdersGateway implements OnGatewayInit, OnModuleDestroy {
         @ConnectedSocket() socket: Socket,
         @MessageBody() body: JoinRequest,
     ): Promise<JoinAck> {
-        const userId = userIdOf(socket);
+        const userId = this.identity.resolve(socket.handshake.auth?.userId);
 
         if (userId === null) {
-            return {
-                ok: false,
-                error: 'unauthenticated',
-                detail: 'Connect with io(url, { auth: { userId } }) — an anonymous socket joins nothing.',
-            };
+            return { ok: false, error: 'unauthenticated', detail: this.identity.refusal() };
         }
 
         const orderId = typeof body?.orderId === 'string' ? body.orderId : null;
@@ -121,22 +120,4 @@ export class OrdersGateway implements OnGatewayInit, OnModuleDestroy {
 
         return { ok: true, room: roomOf(orderId) };
     }
-}
-
-/**
- * The claimed identity, or null. A number is accepted because users.id is a bigint and a
- * JSON client will send it unquoted more often than not.
- */
-function userIdOf(socket: Socket): string | null {
-    const claimed: unknown = socket.handshake.auth?.userId;
-
-    if (typeof claimed === 'string' && claimed.trim() !== '') {
-        return claimed.trim();
-    }
-
-    if (typeof claimed === 'number' && Number.isInteger(claimed)) {
-        return String(claimed);
-    }
-
-    return null;
 }

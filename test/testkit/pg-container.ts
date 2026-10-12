@@ -103,8 +103,34 @@ export async function startPg(label = ''): Promise<PgHandle> {
  * identical.
  */
 export async function truncateAll(dataSource: DataSource): Promise<void> {
+    // Asked of the catalogue rather than typed out. A hand-written list is correct until
+    // the next migration adds a table, and then it is quietly wrong: the new table is
+    // never cleaned, and the first test that depends on it being empty fails somewhere
+    // else entirely.
+    //
+    // Two tables are excluded, and their names come from the DataSource rather than from
+    // this file — hardcoding them would reintroduce the same mistake one level down.
+    // Both are TypeORM's bookkeeping about this container: which migrations have run, and
+    // the metadata it keeps for views and generated columns. Neither is data a test wrote.
+    const bookkeeping = [
+        dataSource.options.migrationsTableName ?? 'migrations',
+        dataSource.options.metadataTableName ?? 'typeorm_metadata',
+    ];
+
+    const tables = await dataSource.query<{ name: string }[]>(
+        `SELECT quote_ident(tablename) AS name
+           FROM pg_tables
+          WHERE schemaname = 'public'
+            AND tablename <> ALL($1::text[])`,
+        [bookkeeping],
+    );
+
+    if (tables.length === 0) {
+        return;
+    }
+
     await dataSource.query(
-        'TRUNCATE TABLE "jobs", "order_items", "orders", "products", "users" RESTART IDENTITY CASCADE',
+        `TRUNCATE TABLE ${tables.map((table) => table.name).join(', ')} RESTART IDENTITY CASCADE`,
     );
 }
 

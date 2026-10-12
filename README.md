@@ -807,16 +807,21 @@ the same contract — the step numbers matter, and step 4 cannot be skipped.
 
 ```bash
 export PACT_BROKER_URL=http://127.0.0.1:29292
+# A version per commit, not a constant. The broker outlives the run: with a fixed version
+# the prod tag from last time is still there, can-i-deploy answers "yes" before anything
+# has verified today's contract, and the gate has nothing left to refuse. CI passes
+# github.sha for the same reason.
+export PACT_VERSION="$(git rev-parse --short HEAD)"
 
 # 1 — publish the contract the consumer test wrote
 curl -s -o /dev/null -w '%{http_code}\n' \
-  -X PUT "$PACT_BROKER_URL/pacts/provider/marketplace-api/consumer/marketplace-web/version/1.0.0" \
+  -X PUT "$PACT_BROKER_URL/pacts/provider/marketplace-api/consumer/marketplace-web/version/$PACT_VERSION" \
   -H 'Content-Type: application/json' \
   --data-binary @pacts/marketplace-web-marketplace-api.json
 # 201
 
 # 2 — ask before anything has verified it
-curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=marketplace-web&version=1.0.0&to=prod"
+curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=marketplace-web&version=$PACT_VERSION&to=prod"
 ```
 
 ```json
@@ -833,17 +838,17 @@ curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=marketplace-web&version=1.0.0
 
 ```bash
 # 3 — the real service answers the contract, and the result goes back to the broker
-PACT_BROKER_URL=$PACT_BROKER_URL npm run verify:provider   # exit 0
+npm run verify:provider   # exit 0; it reads PACT_BROKER_URL and PACT_VERSION
 
 # 4 — say which provider version is in prod. Without this the answer stays unknown
 #     forever: `to=prod` asks about the version that is there, and there is none.
 curl -s -o /dev/null -w '%{http_code}\n' \
-  -X PUT "$PACT_BROKER_URL/pacticipants/marketplace-api/versions/1.0.0/tags/prod" \
+  -X PUT "$PACT_BROKER_URL/pacticipants/marketplace-api/versions/$PACT_VERSION/tags/prod" \
   -H 'Content-Type: application/json'
 # 201
 
 # 5 — the same question as step 2
-curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=marketplace-web&version=1.0.0&to=prod"
+curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=marketplace-web&version=$PACT_VERSION&to=prod"
 ```
 
 ```json
@@ -859,8 +864,33 @@ curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=marketplace-web&version=1.0.0
 ```
 
 `unknown` before the tag and `true` after it is the proof that this is a gate rather than
-a step that is always green. `.github/workflows/contract.yml` runs exactly this sequence,
-including the step that fails the job if the broker says yes too early.
+a step that is always green.
+
+**That pair holds on a broker with no history of this contract** — `docker compose up -d`
+after `docker volume rm marketplace_pactbrokerdata`, which is what CI gets from a fresh
+runner every time. Run it twice against the same broker and step 2 answers `true`, for a
+reason worth knowing: **the broker attaches a verification result to the _content_ of a
+pact, not to the consumer version that published it.** Republishing an unchanged contract
+under a new version inherits the old verification, so bumping the version alone does not
+re-open the gate.
+
+The question that stays honest is the one about the build being shipped:
+
+```bash
+curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=marketplace-api&version=$PACT_VERSION&to=prod"
+```
+
+Measured against a broker that already carried a prod-tagged version from an earlier run:
+
+```
+consumer <sha> -> prod : deployable=true    All required verification results are published
+provider <sha> -> prod : deployable=false   No pacts or verifications have been published
+                                            for version <sha> of marketplace-api
+```
+
+So `.github/workflows/contract.yml` asks about the **provider version it has just built**,
+before and after verification, and fails the job if the answer is `true` too early. That is
+`false` → `true`, and no amount of broker history can make it green by accident.
 
 ### Where the broker's address and token come from
 
@@ -934,13 +964,17 @@ The application has to be running — see
 [Grading](#grading) if this shell has already exported `DATABASE_URL`. Then:
 
 ```bash
-curl -sN http://localhost:3000/orders/<id>/events          # watch one order over SSE
+curl -sN -H 'X-User-Id: 1' http://localhost:3000/orders/<id>/events   # watch one order
 curl -X PATCH http://localhost:3000/orders/<id> \
      -H 'content-type: application/json' -d '{"status":"shipped"}'
 
 node scripts/realtime-demo.mjs               # the proof: two rooms, one event
 node scripts/realtime-demo.mjs --same-room   # the control run — see below
 ```
+
+`X-User-Id` is not decoration: an order's events belong to its buyer, and the stream
+enforces that the same way the WebSocket `join` does. See
+[one rule, two transports](#one-rule-two-transports).
 
 ## WebSocket: a room per order, and who is allowed in
 
@@ -967,12 +1001,26 @@ someone else    {"ok":false,"error":"forbidden","detail":"Order … does not bel
 the real owner  {"ok":true,"room":"orders:…"}
 ```
 
-**Where the identity comes from is a placeholder, and is written to be replaced.** There
-is no authentication in this project yet — the contract describes no customer resource
-and carries no credentials — so the claim arrives in the socket.io handshake and is
-checked against the order's owner. When #24 lands, the only line that changes is the one
-that derives the id: a verified token instead of a claim. Every refusal above keeps
-working untouched.
+**Where the identity comes from is a placeholder, and the placeholder does not ship.**
+There is no authentication in this project yet — the contract describes no customer
+resource and carries no credentials — so the identity is a _claim_: `auth: { userId }` in
+the handshake, `X-User-Id` over HTTP. A claim is exactly as strong as the client's
+honesty, which is to say not at all; anyone can type somebody else's id.
+
+That is harmless while it cannot reach anyone, so it is not allowed to:
+
+```
+NODE_ENV=development   SSE as owner -> 200,  demo -> A_RECEIVED=1 B_RECEIVED=0
+NODE_ENV=production     SSE as owner -> 403,  join -> {"ok":false,"error":"unauthenticated"}
+```
+
+Outside development and test **no claim is accepted and both transports refuse
+everyone**, with a warning at boot saying why. Realtime notifications are simply not
+available until there is a way to prove who is asking. A feature that is missing is an
+honest state; one that looks like it enforces ownership and does not is a lie told to
+whoever reads the code next. [`ClaimedIdentityService`](src/orders/services/claimed-identity.service.ts)
+is the single place #24 changes — it starts verifying a token, and every refusal above
+keeps working untouched.
 
 **Socket.IO does not start on a WebSocket.** Engine.IO opens with HTTP long-polling and
 upgrades afterwards, so the first request is `GET /socket.io/?EIO=4&transport=polling`.
@@ -1004,15 +1052,40 @@ tell apart from lost events.
 
 ```bash
 # after four changes to this order
-curl -sN --max-time 2 -H 'Last-Event-ID: 3' http://localhost:3000/orders/<id>/events | grep '^id:' | head -1
+curl -sN --max-time 2 -H 'X-User-Id: 1' -H 'Last-Event-ID: 3' \
+     http://localhost:3000/orders/<id>/events | grep '^id:' | head -1
 # id: 4   — the one it missed, and no duplicates of the three it had
 ```
+
+A `Last-Event-ID` that is not a whole number never reaches the handler: the contract
+declares it `integer` with `minimum: 0`, so `Last-Event-ID: abc` is
+`400 request/headers/last-event-id must be integer`. Behind that, the code treats an
+unreadable value as "live only" rather than "from the start" — a client that has seen
+_something_ we cannot identify is better served a gap it will notice than duplicates it
+cannot.
 
 The buffer behind that promise is in the process: a hundred events per order, a thousand
 orders, least-recently-written evicted first. **It does not survive a restart and it is
 not shared between instances** — a client that reconnects to a fresh process gets the live
 stream and nothing older. That is the honest limit of an in-memory bus, and #19 is where
 it becomes a queue that does survive.
+
+## One rule, two transports
+
+An order's events are its buyer's, over either transport, and the two checks are the same
+check:
+
+| Asking                         | WebSocket `join`                         | `GET /orders/{id}/events`                  |
+| ------------------------------ | ---------------------------------------- | ------------------------------------------ |
+| without saying who you are     | `{"ok":false,"error":"unauthenticated"}` | `400` — the header is required by the spec |
+| as somebody else               | `{"ok":false,"error":"forbidden"}`       | `403 application/problem+json`             |
+| for an order that is not there | `{"ok":false,"error":"not-found"}`       | `404 application/problem+json`             |
+| as the buyer                   | `{"ok":true,"room":"orders:…"}`          | `200 text/event-stream`                    |
+
+The identity itself is the placeholder described above — a claim in the handshake, a
+header over HTTP. What matters is that neither transport is the easy way around the other:
+a stream that answered anyone would make the gateway's check decorative, because the same
+events are one `curl` away.
 
 ## Isolation, proved twice
 

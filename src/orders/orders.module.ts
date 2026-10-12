@@ -4,6 +4,7 @@ import { OrdersController } from './controllers/orders.controller';
 import { OrdersGateway } from './gateways/orders.gateway';
 import { OrdersRepository } from './repositories/orders.repository';
 import { CheckoutService } from './services/checkout.service';
+import { ClaimedIdentityService } from './services/claimed-identity.service';
 import { IdempotencyRegistry } from './services/idempotency.service';
 import { OrderEventsService } from './services/order-events.service';
 import { OrderStatusService } from './services/order-status.service';
@@ -13,6 +14,7 @@ import { OrderStatusService } from './services/order-status.service';
     providers: [
         IdempotencyRegistry,
         OrdersRepository,
+        ClaimedIdentityService,
         OrderEventsService,
         OrderStatusService,
         OrdersGateway,
