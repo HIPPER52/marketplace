@@ -4,15 +4,16 @@ Contract-first API for a small marketplace. The OpenAPI document in
 [`openapi/openapi.yaml`](openapi/openapi.yaml) is the source of truth; the service is a
 thin layer behind a validator that enforces it.
 
-| Assignment | What it added                                                                              |
-| ---------- | ------------------------------------------------------------------------------------------ |
-| HW-09      | the OpenAPI contract and runtime validation at the boundary                                |
-| HW-11      | NestJS, a validated environment schema, and password rotation without a restart            |
-| HW-12      | the data layer: schema, seed, indexes, and EXPLAIN evidence                                |
-| HW-13      | TypeORM over that schema: entities, relations, migrations, N+1                             |
-| HW-14      | concurrency: a transactional checkout, a SKIP LOCKED worker pool, retries                  |
-| HW-15      | operations: PgBouncer, a nightly backup, and a restore drill that proves it                |
-| **HW-16**  | **integration, E2E and contract tests — and the HTTP layer wired to the database** — below |
+| Assignment | What it added                                                                   |
+| ---------- | ------------------------------------------------------------------------------- |
+| HW-09      | the OpenAPI contract and runtime validation at the boundary                     |
+| HW-11      | NestJS, a validated environment schema, and password rotation without a restart |
+| HW-12      | the data layer: schema, seed, indexes, and EXPLAIN evidence                     |
+| HW-13      | TypeORM over that schema: entities, relations, migrations, N+1                  |
+| HW-14      | concurrency: a transactional checkout, a SKIP LOCKED worker pool, retries       |
+| HW-15      | operations: PgBouncer, a nightly backup, and a restore drill that proves it     |
+| HW-16      | integration, E2E and contract tests; the HTTP layer wired to the database       |
+| **HW-18**  | **realtime: a WebSocket room per order, the same stream over SSE** — below      |
 
 ---
 
@@ -180,6 +181,14 @@ variable shapes because two kinds of client read them: `DATABASE_URL` is a libpq
 what `scripts/backup.sh` and `scripts/restore-drill.sh` hand to `pg_dump` and `psql`, while
 the `DB_*` block is the validated contract `src/database/data-source.ts` reads. One store
 fills both — see [Where the credentials come from](#where-the-credentials-come-from).
+
+**Those exports are for the command-line tools, not for the HTTP service.** The URL above
+carries a password inline, which is exactly what the service's own environment schema
+refuses — the password belongs in the file named by `DB_PASSWORD_FILE` so that it can be
+rotated under a running process. A real environment variable beats the `.env` file, so
+`npm start` in the same shell exits with
+`DATABASE_URL: must not carry a password`. Start the service from a shell that has not
+exported it, or `unset DATABASE_URL` first.
 
 That bare command raises Postgres, the pooler and the Pact broker, and stops there: the
 `app` service sits behind the `app` profile precisely because it bind-mounts
@@ -798,16 +807,21 @@ the same contract — the step numbers matter, and step 4 cannot be skipped.
 
 ```bash
 export PACT_BROKER_URL=http://127.0.0.1:29292
+# A version per commit, not a constant. The broker outlives the run: with a fixed version
+# the prod tag from last time is still there, can-i-deploy answers "yes" before anything
+# has verified today's contract, and the gate has nothing left to refuse. CI passes
+# github.sha for the same reason.
+export PACT_VERSION="$(git rev-parse --short HEAD)"
 
 # 1 — publish the contract the consumer test wrote
 curl -s -o /dev/null -w '%{http_code}\n' \
-  -X PUT "$PACT_BROKER_URL/pacts/provider/marketplace-api/consumer/marketplace-web/version/1.0.0" \
+  -X PUT "$PACT_BROKER_URL/pacts/provider/marketplace-api/consumer/marketplace-web/version/$PACT_VERSION" \
   -H 'Content-Type: application/json' \
   --data-binary @pacts/marketplace-web-marketplace-api.json
 # 201
 
 # 2 — ask before anything has verified it
-curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=marketplace-web&version=1.0.0&to=prod"
+curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=marketplace-web&version=$PACT_VERSION&to=prod"
 ```
 
 ```json
@@ -824,17 +838,17 @@ curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=marketplace-web&version=1.0.0
 
 ```bash
 # 3 — the real service answers the contract, and the result goes back to the broker
-PACT_BROKER_URL=$PACT_BROKER_URL npm run verify:provider   # exit 0
+npm run verify:provider   # exit 0; it reads PACT_BROKER_URL and PACT_VERSION
 
 # 4 — say which provider version is in prod. Without this the answer stays unknown
 #     forever: `to=prod` asks about the version that is there, and there is none.
 curl -s -o /dev/null -w '%{http_code}\n' \
-  -X PUT "$PACT_BROKER_URL/pacticipants/marketplace-api/versions/1.0.0/tags/prod" \
+  -X PUT "$PACT_BROKER_URL/pacticipants/marketplace-api/versions/$PACT_VERSION/tags/prod" \
   -H 'Content-Type: application/json'
 # 201
 
 # 5 — the same question as step 2
-curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=marketplace-web&version=1.0.0&to=prod"
+curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=marketplace-web&version=$PACT_VERSION&to=prod"
 ```
 
 ```json
@@ -850,8 +864,33 @@ curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=marketplace-web&version=1.0.0
 ```
 
 `unknown` before the tag and `true` after it is the proof that this is a gate rather than
-a step that is always green. `.github/workflows/contract.yml` runs exactly this sequence,
-including the step that fails the job if the broker says yes too early.
+a step that is always green.
+
+**That pair holds on a broker with no history of this contract** — `docker compose up -d`
+after `docker volume rm marketplace_pactbrokerdata`, which is what CI gets from a fresh
+runner every time. Run it twice against the same broker and step 2 answers `true`, for a
+reason worth knowing: **the broker attaches a verification result to the _content_ of a
+pact, not to the consumer version that published it.** Republishing an unchanged contract
+under a new version inherits the old verification, so bumping the version alone does not
+re-open the gate.
+
+The question that stays honest is the one about the build being shipped:
+
+```bash
+curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=marketplace-api&version=$PACT_VERSION&to=prod"
+```
+
+Measured against a broker that already carried a prod-tagged version from an earlier run:
+
+```
+consumer <sha> -> prod : deployable=true    All required verification results are published
+provider <sha> -> prod : deployable=false   No pacts or verifications have been published
+                                            for version <sha> of marketplace-api
+```
+
+So `.github/workflows/contract.yml` asks about the **provider version it has just built**,
+before and after verification, and fails the job if the answer is `true` too early. That is
+`false` → `true`, and no amount of broker history can make it green by accident.
 
 ### Where the broker's address and token come from
 
@@ -909,6 +948,204 @@ that stops being right.
 | [`test/contract/`](test/contract/)                                 | the consumer test and the provider verification            |
 | `pacts/`                                                           | the contract itself — generated, and committed             |
 | [`.github/workflows/contract.yml`](.github/workflows/contract.yml) | publish → verify → can-i-deploy, with the refusal in front |
+
+---
+
+# Realtime — HW-18
+
+A status change used to be something the buyer discovered by pressing F5. It now reaches
+them while they are looking at the page, over either of two transports that carry the
+same events from the same bus.
+
+## The commands
+
+The application has to be running — see
+[Running the service](#running-the-service), and note the warning in
+[Grading](#grading) if this shell has already exported `DATABASE_URL`. Then:
+
+```bash
+curl -sN -H 'X-User-Id: 1' http://localhost:3000/orders/<id>/events   # watch one order
+curl -X PATCH http://localhost:3000/orders/<id> \
+     -H 'content-type: application/json' -d '{"status":"shipped"}'
+
+node scripts/realtime-demo.mjs               # the proof: two rooms, one event
+node scripts/realtime-demo.mjs --same-room   # the control run — see below
+```
+
+`X-User-Id` is not decoration: an order's events belong to its buyer, and the stream
+enforces that the same way the WebSocket `join` does. See
+[one rule, two transports](#one-rule-two-transports).
+
+## WebSocket: a room per order, and who is allowed in
+
+The gateway is Nest's, on the socket.io platform, attached to the same HTTP server the
+API answers on. A client connects, sends `join` with an order id, and gets an
+acknowledgement saying whether it is in:
+
+```js
+const socket = io("http://localhost:3000", { auth: { userId: "1" } });
+socket.emit("join", { orderId }, (ack) => console.log(ack));
+socket.on("order.status", (event) => console.log(event));
+```
+
+The room is `orders:<id>` and the socket enters it **only after the gateway has confirmed
+the order belongs to the person asking**. `server.emit` would tell every connected client
+when anybody's order shipped; `server.to(room).emit` tells the one order's watchers, and
+the membership of that room is decided server-side.
+
+Three refusals, all answered in the `join` acknowledgement rather than by silence:
+
+```
+anonymous       {"ok":false,"error":"unauthenticated", ...}
+someone else    {"ok":false,"error":"forbidden","detail":"Order … does not belong to user 999."}
+the real owner  {"ok":true,"room":"orders:…"}
+```
+
+**Where the identity comes from is a placeholder, and the placeholder does not ship.**
+There is no authentication in this project yet — the contract describes no customer
+resource and carries no credentials — so the identity is a _claim_: `auth: { userId }` in
+the handshake, `X-User-Id` over HTTP. A claim is exactly as strong as the client's
+honesty, which is to say not at all; anyone can type somebody else's id.
+
+That is harmless while it cannot reach anyone, so it is not allowed to:
+
+```
+NODE_ENV=development   SSE as owner -> 200,  demo -> A_RECEIVED=1 B_RECEIVED=0
+NODE_ENV=production     SSE as owner -> 403,  join -> {"ok":false,"error":"unauthenticated"}
+```
+
+Outside development and test **no claim is accepted and both transports refuse
+everyone**, with a warning at boot saying why. Realtime notifications are simply not
+available until there is a way to prove who is asking. A feature that is missing is an
+honest state; one that looks like it enforces ownership and does not is a lie told to
+whoever reads the code next. [`ClaimedIdentityService`](src/orders/services/claimed-identity.service.ts)
+is the single place #24 changes — it starts verifying a token, and every refusal above
+keeps working untouched.
+
+**Socket.IO does not start on a WebSocket.** Engine.IO opens with HTTP long-polling and
+upgrades afterwards, so the first request is `GET /socket.io/?EIO=4&transport=polling`.
+That path is not in `openapi.yaml`, so the validator answered it `404`, the upgrade never
+happened, and the symptom was a client that silently never connected. `/socket.io` is now
+in `ignorePaths` beside `/health` and `/readiness`.
+
+## SSE: the same events over plain HTTP
+
+`GET /orders/{id}/events` is in the contract like every other operation — a `200` whose
+content is `text/event-stream`. It is written against the raw response rather than Nest's
+`@Sse()` decorator for two reasons: the order is looked up **before** a byte is written,
+so an unknown id is an honest `404` instead of an empty stream carrying a `200`; and
+`retry:` leads the body, which is how the server sets the client's reconnect pace instead
+of leaving it at the browser default of several seconds.
+
+```
+retry: 1000
+
+id: 1
+event: order.status
+data: {"id":1,"order_id":"92619690-…","status":"paid","at":"2026-10-11T15:45:16.900Z"}
+```
+
+`id:` counts **within one order**, from 1 — not across all of them. The number is what a
+reconnecting client sends back in `Last-Event-ID`, and it has to mean something for this
+order alone; a global counter would give each client a sequence full of gaps it could not
+tell apart from lost events.
+
+```bash
+# after four changes to this order
+curl -sN --max-time 2 -H 'X-User-Id: 1' -H 'Last-Event-ID: 3' \
+     http://localhost:3000/orders/<id>/events | grep '^id:' | head -1
+# id: 4   — the one it missed, and no duplicates of the three it had
+```
+
+A `Last-Event-ID` that is not a whole number never reaches the handler: the contract
+declares it `integer` with `minimum: 0`, so `Last-Event-ID: abc` is
+`400 request/headers/last-event-id must be integer`. Behind that, the code treats an
+unreadable value as "live only" rather than "from the start" — a client that has seen
+_something_ we cannot identify is better served a gap it will notice than duplicates it
+cannot.
+
+The buffer behind that promise is in the process: a hundred events per order, a thousand
+orders, least-recently-written evicted first. **It does not survive a restart and it is
+not shared between instances** — a client that reconnects to a fresh process gets the live
+stream and nothing older. That is the honest limit of an in-memory bus, and #19 is where
+it becomes a queue that does survive.
+
+## One rule, two transports
+
+An order's events are its buyer's, over either transport, and the two checks are the same
+check:
+
+| Asking                         | WebSocket `join`                         | `GET /orders/{id}/events`                  |
+| ------------------------------ | ---------------------------------------- | ------------------------------------------ |
+| without saying who you are     | `{"ok":false,"error":"unauthenticated"}` | `400` — the header is required by the spec |
+| as somebody else               | `{"ok":false,"error":"forbidden"}`       | `403 application/problem+json`             |
+| for an order that is not there | `{"ok":false,"error":"not-found"}`       | `404 application/problem+json`             |
+| as the buyer                   | `{"ok":true,"room":"orders:…"}`          | `200 text/event-stream`                    |
+
+The identity itself is the placeholder described above — a claim in the handshake, a
+header over HTTP. What matters is that neither transport is the easy way around the other:
+a stream that answered anyone would make the gateway's check decorative, because the same
+events are one `curl` away.
+
+## Isolation, proved twice
+
+One script, two runs. The flag changes one value — which room the second client joins —
+and the expectation checked against it:
+
+```bash
+node scripts/realtime-demo.mjs;             echo "exit=$?"
+# A_RECEIVED=1
+# B_RECEIVED=0
+# exit=0
+
+node scripts/realtime-demo.mjs --same-room; echo "exit=$?"
+# A_RECEIVED=1
+# B_RECEIVED=1
+# exit=0
+```
+
+The control run is not a bonus feature. A script that simply printed `B_RECEIVED=0` would
+pass the first check and look like working isolation; it fails the second one. Only the
+pair proves the script is measuring rather than asserting.
+
+## Trade-offs: WebSocket vs SSE
+
+| Criterion                | WebSocket (socket.io)                                           | SSE (`text/event-stream`)                                       |
+| ------------------------ | --------------------------------------------------------------- | --------------------------------------------------------------- |
+| Direction                | full duplex — the client talks back on the same connection      | server to client only; the client answers with an ordinary POST |
+| Reconnect and recovery   | socket.io reconnects; replaying what was missed is your code    | `EventSource` reconnects and resends `Last-Event-ID` for free   |
+| Infrastructure           | `Upgrade` must survive every proxy; sticky sessions on 2+ nodes | ordinary HTTP — anything that proxies a response proxies this   |
+| Cost per event           | a frame, from two bytes of header                               | a few text lines, plus a keep-alive comment on an idle stream   |
+| Addressing one recipient | rooms, server-side, built in                                    | one stream per subscriber; the URL already names the resource   |
+| Browser API              | a library, and its own protocol on top                          | `new EventSource(url)` — no dependency                          |
+
+**For order notifications I would keep SSE in production.** The channel is one-directional
+— the buyer is told, they never answer down the same pipe — and that is precisely the case
+where the standard hands you reconnection and gap-free replay for nothing, over transport
+that every proxy and load balancer in the path already understands. The WebSocket is here
+because the moment the client starts talking back — a support chat, a live cart shared
+between two devices — SSE would need a second channel for the upstream half, and then two
+transports are carrying one conversation.
+
+## Two instances, and what breaks
+
+Nothing above needs a Redis adapter today, because there is one process. **With two
+instances behind a load balancer a room stops working: `orders:42` is an in-memory label
+on one instance's sockets, so an event published on instance A never reaches the client
+that happens to be connected to instance B** — the cure is `@socket.io/redis-adapter`,
+which forwards emits between instances over Pub/Sub (and sticky sessions on the balancer,
+because the Engine.IO handshake is more than one request). The same split hits SSE harder:
+its buffer would have to leave the process entirely. That is #23's subject.
+
+## Where things are
+
+| Path                                                                                         | What                                                                     |
+| -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
+| [`src/orders/gateways/orders.gateway.ts`](src/orders/gateways/orders.gateway.ts)             | `join`, the ownership check, the fan-out into rooms                      |
+| [`src/orders/services/order-events.service.ts`](src/orders/services/order-events.service.ts) | the bus: a Subject plus the replay buffer, shared by both transports     |
+| [`src/orders/services/order-status.service.ts`](src/orders/services/order-status.service.ts) | writes the status and announces it — the emit lives here, not in a route |
+| [`src/orders/controllers/orders.controller.ts`](src/orders/controllers/orders.controller.ts) | `PATCH /orders/{id}` and the SSE stream                                  |
+| [`scripts/realtime-demo.mjs`](scripts/realtime-demo.mjs)                                     | the isolation proof and its control run                                  |
 
 ---
 

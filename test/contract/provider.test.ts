@@ -4,7 +4,7 @@ import { Test } from '@nestjs/testing';
 import { Verifier, type VerifierOptions } from '@pact-foundation/pact';
 import { Currency } from '../../src/common/constants/currency.constant';
 import { configureApp } from '../../src/common/utils/configure-app.util';
-import { type PgHandle, startPg, truncateAll } from '../testkit/pg-container';
+import { type PgHandle, seatDemoBuyer, startPg, truncateAll } from '../testkit/pg-container';
 import {
     KNOWN_PRODUCT_ID,
     MISSING_PRODUCT_ID,
@@ -63,6 +63,11 @@ afterAll(async () => {
 const stateHandlers = {
     [`product ${KNOWN_PRODUCT_ID} exists`]: async (): Promise<void> => {
         await truncateAll(pg.dataSource);
+        // TRUNCATE takes the demo buyer with everything else, and that row came from a
+        // migration rather than from a test. Nothing in today's contract places an order,
+        // but the first interaction that does would fail here with a foreign key error
+        // pointing at a user who no longer exists — a long way from the cause.
+        await seatDemoBuyer(pg.dataSource);
         await pg.dataSource.query(
             `INSERT INTO products (id, title, description, price_cents, currency, in_stock)
              VALUES ($1, $2, $3, $4, $5, $6)

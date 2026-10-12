@@ -1,15 +1,23 @@
 import { Module } from '@nestjs/common';
 import { DATA_SOURCE } from '../database/constants/database.constants';
 import { OrdersController } from './controllers/orders.controller';
+import { OrdersGateway } from './gateways/orders.gateway';
 import { OrdersRepository } from './repositories/orders.repository';
 import { CheckoutService } from './services/checkout.service';
+import { ClaimedIdentityService } from './services/claimed-identity.service';
 import { IdempotencyRegistry } from './services/idempotency.service';
+import { OrderEventsService } from './services/order-events.service';
+import { OrderStatusService } from './services/order-status.service';
 
 @Module({
     controllers: [OrdersController],
     providers: [
         IdempotencyRegistry,
         OrdersRepository,
+        ClaimedIdentityService,
+        OrderEventsService,
+        OrderStatusService,
+        OrdersGateway,
         {
             // CheckoutService predates the DI graph — the HW-14 demos construct it with a
             // DataSource by hand, and it stays constructible that way. A factory keeps it
@@ -20,6 +28,6 @@ import { IdempotencyRegistry } from './services/idempotency.service';
                 new CheckoutService(dataSource),
         },
     ],
-    exports: [OrdersRepository],
+    exports: [OrdersRepository, OrderEventsService],
 })
 export class OrdersModule {}

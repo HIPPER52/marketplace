@@ -38,7 +38,14 @@ export async function configureApp(app: INestApplication): Promise<void> {
             apiSpec: SPEC_PATH,
             validateRequests: true,
             validateResponses: true,
-            ignorePaths: /^\/(health|readiness)$/,
+            // /health and /readiness are operational and are not in the contract.
+            //
+            // /socket.io is the trap worth naming. Socket.IO does not open with a
+            // WebSocket: Engine.IO starts on HTTP long-polling and upgrades afterwards,
+            // so the very first request is GET /socket.io/?EIO=4&transport=polling. The
+            // validator finds no such path in the spec, answers 404, the upgrade never
+            // happens — and the symptom is a client that silently never connects.
+            ignorePaths: /^\/(health|readiness)$|^\/socket\.io(\/|$)/,
         }),
     );
 

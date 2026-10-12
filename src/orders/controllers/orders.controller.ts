@@ -1,13 +1,33 @@
-import { Body, Controller, Get, Headers, HttpCode, Param, Post, Query, Res } from '@nestjs/common';
+import {
+    Body,
+    Controller,
+    Get,
+    Headers,
+    HttpCode,
+    Param,
+    Patch,
+    Post,
+    Query,
+    Res,
+} from '@nestjs/common';
 import type { Response } from 'express';
 import { ProblemError, ProblemType } from '../../common/errors/problem.error';
-import type { CreateOrderRequest, Order } from '../../common/types/api.types';
+import type {
+    CreateOrderRequest,
+    Order,
+    UpdateOrderStatusRequest,
+} from '../../common/types/api.types';
 import { pageOf, readCursor, readLimit } from '../../common/utils/pagination.util';
 import { DEMO_BUYER_ID } from '../../users/constants/demo-buyer.constant';
+import { ORDER_STATUS_EVENT, USER_ID_HEADER } from '../constants/realtime.constant';
 import { OrdersRepository } from '../repositories/orders.repository';
 import { CheckoutService } from '../services/checkout.service';
+import { ClaimedIdentityService } from '../services/claimed-identity.service';
 import { IdempotencyRegistry } from '../services/idempotency.service';
+import { OrderEventsService } from '../services/order-events.service';
+import { OrderStatusService } from '../services/order-status.service';
 import type { CheckoutResult } from '../types/checkout.types';
+import { type OrderEvent, toPayload } from '../types/order-event.types';
 import { toApiOrder } from '../utils/order.mapper';
 
 @Controller()
@@ -16,6 +36,9 @@ export class OrdersController {
         private readonly idempotency: IdempotencyRegistry,
         private readonly orders: OrdersRepository,
         private readonly checkout: CheckoutService,
+        private readonly status: OrderStatusService,
+        private readonly orderEvents: OrderEventsService,
+        private readonly identity: ClaimedIdentityService,
     ) {}
 
     @Get('orders')
@@ -97,6 +120,141 @@ export class OrdersController {
 
         return created;
     }
+
+    @Patch('orders/:orderId')
+    async updateStatus(
+        @Param('orderId') orderId: string,
+        @Body() body: UpdateOrderStatusRequest,
+    ): Promise<Order> {
+        // The service writes the status and announces it. This route does neither
+        // directly — see services/order-status.service.ts for why the emit lives there.
+        return toApiOrder(await this.status.changeStatus(orderId, body.status));
+    }
+
+    /**
+     * The same stream of changes, over plain HTTP.
+     *
+     * Written against `@Res()` rather than Nest's `@Sse()` because this endpoint has two
+     * requirements that decorator does not cover: the order has to be looked up *before*
+     * any byte is written, so that an unknown id is an honest 404 rather than an empty
+     * stream with a 200 on it; and `retry:` has to lead the body, which is how the
+     * server sets the client's reconnect pace instead of leaving it at the browser
+     * default of several seconds.
+     */
+    @Get('orders/:orderId/events')
+    async events(
+        @Param('orderId') orderId: string,
+        @Res() res: Response,
+        @Headers(USER_ID_HEADER) userId?: string,
+        @Headers('last-event-id') lastEventId?: string,
+    ): Promise<void> {
+        // The same rule the gateway enforces on `join`. An order's events are its
+        // buyer's: a stream that answered anyone would make the WebSocket check
+        // decorative, since the identical events are one curl away.
+        //
+        // openapi.yaml marks the header required with minLength 1, so the validator
+        // answers 400 before this runs and the branch is unreachable over HTTP. It
+        // answers with the same status for the same reason, so that the day the route
+        // stops being validated — one line in `ignorePaths` — the stream does not quietly
+        // become public.
+        const claimant = this.identity.resolve(userId);
+
+        if (claimant === null) {
+            // Two different refusals wearing one status. Missing header: unreachable,
+            // because openapi.yaml marks it required and the validator answers 400 first
+            // — kept so that the day this route stops being validated the stream does not
+            // quietly become public. Claims not accepted here: reachable, and the reason
+            // the detail says so out loud.
+            throw new ProblemError({
+                status: this.identity.accepted ? 400 : 403,
+                type: this.identity.accepted ? ProblemType.validation : ProblemType.forbidden,
+                title: this.identity.accepted ? 'Request validation failed' : 'Forbidden',
+                detail: this.identity.refusal(),
+            });
+        }
+
+        const order = await this.orders.findById(orderId);
+
+        if (order === null) {
+            throw new ProblemError({
+                status: 404,
+                type: ProblemType.notFound,
+                title: 'Resource not found',
+                detail: `No order with id ${orderId}.`,
+            });
+        }
+
+        if (order.userId !== claimant) {
+            throw new ProblemError({
+                status: 403,
+                type: ProblemType.forbidden,
+                title: 'Forbidden',
+                detail: `Order ${orderId} does not belong to user ${claimant}.`,
+            });
+        }
+
+        res.writeHead(200, {
+            'content-type': 'text/event-stream',
+            // no-transform as well as no-cache: a compressing proxy that buffers to find
+            // something to compress turns a live stream into a long silence.
+            'cache-control': 'no-cache, no-transform',
+            connection: 'keep-alive',
+            'x-accel-buffering': 'no',
+        });
+
+        const write = (event: OrderEvent): void => {
+            res.write(
+                `id: ${event.id}\n` +
+                    `event: ${ORDER_STATUS_EVENT}\n` +
+                    `data: ${JSON.stringify(toPayload(event))}\n\n`,
+            );
+        };
+
+        res.write('retry: 1000\n\n');
+
+        // Everything this client missed while it was away, before the live feed starts.
+        for (const missed of replayFor(this.orderEvents, orderId, lastEventId)) {
+            write(missed);
+        }
+
+        const subscription = this.orderEvents.forOrder(orderId).subscribe(write);
+
+        // A stream with nothing to say looks exactly like a dead connection to anything
+        // between here and the client.
+        const keepAlive = setInterval(() => res.write(': keep-alive\n\n'), 15_000);
+
+        res.on('close', () => {
+            clearInterval(keepAlive);
+            subscription.unsubscribe();
+            res.end();
+        });
+    }
+}
+
+/**
+ * What to replay, from a header the client controls.
+ *
+ * No header at all means a client that has never been here: it gets the whole buffer.
+ * A header that is present but unreadable means the opposite — this client has seen
+ * *something* and we cannot tell what, so replaying everything would hand it duplicates
+ * it has no way to recognise. It gets the live stream and nothing else.
+ *
+ * Over HTTP the second case cannot arrive: openapi.yaml declares `Last-Event-ID` as an
+ * integer no smaller than zero, so the validator answers 400 first. This is what the
+ * code does if that ever stops being true.
+ */
+function replayFor(
+    events: OrderEventsService,
+    orderId: string,
+    rawLastEventId: string | undefined,
+): OrderEvent[] {
+    if (rawLastEventId === undefined) {
+        return events.since(orderId, 0);
+    }
+
+    const parsed = Number(rawLastEventId);
+
+    return Number.isInteger(parsed) && parsed >= 0 ? events.since(orderId, parsed) : [];
 }
 
 function unprocessable(detail: string): ProblemError {

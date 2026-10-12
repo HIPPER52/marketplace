@@ -4,6 +4,7 @@ const BASE = 'https://api.marketplace.local/problems';
 
 export const ProblemType = {
     validation: `${BASE}/validation-error`,
+    forbidden: `${BASE}/forbidden`,
     notFound: `${BASE}/not-found`,
     unprocessable: `${BASE}/unprocessable-entity`,
     idempotencyConflict: `${BASE}/idempotency-key-conflict`,
@@ -26,6 +27,7 @@ export class ProblemError extends Error {
 
 export const TITLE_BY_STATUS: Record<number, { title: string; type: string }> = {
     400: { title: 'Request validation failed', type: ProblemType.validation },
+    403: { title: 'Forbidden', type: ProblemType.forbidden },
     404: { title: 'Resource not found', type: ProblemType.notFound },
     422: { title: 'Unprocessable entity', type: ProblemType.unprocessable },
 };
