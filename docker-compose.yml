@@ -43,6 +43,48 @@ services:
       db:
         condition: service_healthy
 
+  # RabbitMQ: the broker that keeps an event until somebody is there to take it. #18's
+  # WebSocket delivered to whoever happened to be connected — no receiver, no delivery.
+  # This one stores the message first and worries about readers afterwards, which is the
+  # whole difference between a transport and a broker.
+  #
+  # 4.2 is the LTS series (commercial support to 30.06.2030) rather than the current 4.3,
+  # for the same reason every other version here is pinned: a stand should run what a
+  # deployment would run, and two extra years of patches is the entire argument. The
+  # -management tag costs a few megabytes and buys the UI on 25673 — which is where
+  # x-death gets read with eyes instead of inferred from a script.
+  rabbitmq:
+    image: rabbitmq:4.2-management-alpine
+    # RabbitMQ derives its Erlang node name from the hostname, and the node name is what
+    # the data directory is named after. Letting Docker generate one means every recreated
+    # container looks for a node that never existed and comes up empty.
+    hostname: marketplace-rabbit
+    environment:
+      # The dev stand's credentials, in plain sight on purpose — exactly like the Postgres
+      # role in init.sql. `guest` would not do: RabbitMQ refuses it from anything but
+      # loopback, and a connection through a published port arrives from the Docker gateway.
+      RABBITMQ_DEFAULT_USER: marketplace_app
+      RABBITMQ_DEFAULT_PASS: local_dev_password
+    ports:
+      # Host port 25672 for AMQP (5672 inside), following 25432 and 26432. Worth knowing:
+      # 25672 is also RabbitMQ's own Erlang distribution port *inside* the container, and
+      # that one is deliberately not published — nothing here clusters.
+      - "25672:5672"
+      # The management UI. 15672 cannot take the same prefix and stay a port number.
+      - "25673:15672"
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+    healthcheck:
+      # An open TCP port is not a running broker: between the socket accepting connections
+      # and the Erlang node accepting basic.publish there is a window a client meets as
+      # ECONNRESET. check_running asks the node itself, and that is the difference
+      # `up -d --wait` depends on.
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q check_running"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
   # The Pact Broker: where a contract lives once it is no longer only this repository's
   # business. The consumer publishes to it, provider verification reads from it and
   # publishes its result back, and can-i-deploy asks it the one question a deploy gate
@@ -109,3 +151,4 @@ services:
 volumes:
   pgdata:
   pactbrokerdata:
+  rabbitmqdata:

@@ -36,6 +36,20 @@ beforeAll(async () => {
     process.env.DATABASE_URL = pg.env.DATABASE_URL;
     process.env.DB_PASSWORD_FILE = pg.env.DB_PASSWORD_FILE;
 
+    // Pointed at an address nothing listens on, deliberately.
+    //
+    // @nestjs/config merges .env into what it validates, so deleting the variable from
+    // process.env would not remove it: a developer whose stand has a broker would have
+    // this suite publish real events into a live queue while CI published none — the same
+    // machine-dependent difference test/testkit/jest-setup.ts exists to remove.
+    //
+    // Nothing is substituted to achieve it. The broker reaches the application through the
+    // environment, the way the database does, and the address simply refuses connections.
+    // That also makes the suite prove the decision in MessagingModule rather than assume
+    // it: every order below is placed, and answered, while order.placed cannot be
+    // published at all.
+    process.env.BROKER_URL = 'amqp://unreachable:unreachable@127.0.0.1:1';
+
     const { AppModule } = await import('../../src/app.module');
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
 

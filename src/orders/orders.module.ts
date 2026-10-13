@@ -1,5 +1,7 @@
 import { Module } from '@nestjs/common';
 import { DATA_SOURCE } from '../database/constants/database.constants';
+import { ORDER_EVENT_PUBLISHER } from '../messaging/constants/messaging.constants';
+import { MessagingModule } from '../messaging/messaging.module';
 import { OrdersController } from './controllers/orders.controller';
 import { OrdersGateway } from './gateways/orders.gateway';
 import { OrdersRepository } from './repositories/orders.repository';
@@ -10,6 +12,7 @@ import { OrderEventsService } from './services/order-events.service';
 import { OrderStatusService } from './services/order-status.service';
 
 @Module({
+    imports: [MessagingModule],
     controllers: [OrdersController],
     providers: [
         IdempotencyRegistry,
@@ -23,9 +26,11 @@ import { OrderStatusService } from './services/order-status.service';
             // DataSource by hand, and it stays constructible that way. A factory keeps it
             // free of Nest decorators rather than making the demos import a module.
             provide: CheckoutService,
-            inject: [DATA_SOURCE],
-            useFactory: (dataSource: ConstructorParameters<typeof CheckoutService>[0]) =>
-                new CheckoutService(dataSource),
+            inject: [DATA_SOURCE, ORDER_EVENT_PUBLISHER],
+            useFactory: (
+                dataSource: ConstructorParameters<typeof CheckoutService>[0],
+                publisher: ConstructorParameters<typeof CheckoutService>[1],
+            ) => new CheckoutService(dataSource, publisher),
         },
     ],
     exports: [OrdersRepository, OrderEventsService],
