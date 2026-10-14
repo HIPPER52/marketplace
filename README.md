@@ -1208,7 +1208,11 @@ all carried out when one arrives. That is the sentence #18 could not say.
 
 `published` counts confirms, not intentions. The channel is a confirm channel and every
 publish is `mandatory: true` with a listener on `basic.return`, so the number only moves
-after the broker has both taken the message and routed it. Without that pair a publish is
+after the broker has both taken the message and routed it. Each publish awaits **its own**
+confirm, through the callback form of `publish`, rather than `waitForConfirms()` — that
+method resolves only when every publish outstanding on the channel has been answered, and
+the channel is shared by every concurrent checkout, so one slow confirm would hold up
+orders that have nothing to do with it. Without that pair a publish is
 a write to a socket — and worse, **an unroutable message is discarded while the publisher
 is told everything is fine**: the broker's responsibility for a message no binding matched
 is precisely to throw it away, and it issues a positive confirm having done so. There is
@@ -1254,6 +1258,22 @@ rather than guessed from a log.
 RabbitMQ has exactly four reasons for dead-lettering: `rejected`, `expired` (message TTL),
 `maxlen` and `delivery_limit`. There is no fifth, and **queue TTL is not one of them** — a
 queue that expires disappears taking its contents with it and dead-letters nothing.
+
+Reading `x-death` has one trap worth naming. **`x-death[0]` is the most recent death, not
+the first.** RabbitMQ keeps one entry per `{queue, reason}` pair and moves the one it just
+touched to the front, so indexing by position is right exactly while a message has died
+only once — and starts describing a different hop the moment it dies again, with nothing in
+the output looking wrong. Measured on a scratch topology, one message rejected out of two
+queues in turn:
+
+```
+x-first-death-queue = xd.a
+x-death             = [{"q":"xd.b",…},{"q":"xd.a",…}]
+```
+
+`x-first-death-queue` and `x-first-death-reason` are the headers that genuinely mean "the
+first one" and never move; the counter that belongs beside them is found by looking up the
+entry they name, which is what `demo:dlq` does.
 
 The handler makes no attempt to tell a transient failure from a permanent one. It cannot: a
 foreign key violation and a dropped connection both arrive as a rejected promise. The
@@ -1387,6 +1407,20 @@ The order of declaration is load-bearing: exchange, then the dead-letter queue, 
 work queue that points at it, then the binding. Publishing before the binding exists is the
 silent discard described above.
 
+**Who empties the queue in a deployment:** `npm run start:worker`, its own process. The
+three demos each raise a consumer for the length of one run, and the API process
+deliberately does not subscribe — two subscribers on one queue would make a demo's numbers
+depend on which process won the race, and a consumer wedged on a slow handler must not be
+able to stop `/health` from answering. A consumer and an HTTP service scale on different
+numbers and fail in different ways, so they are different processes.
+
+It stops the way a container orchestrator expects. On `SIGTERM` the subscription is
+cancelled first, so no new delivery arrives, and only then does it wait for the deliveries
+already in hand; anything still unacknowledged goes back to the queue, because an ack is
+"stop sending me this" and a process on its way out is in no position to say it. That is
+the exact opposite of what `demo:duplicate` does on purpose — both end with the message
+back in the queue, and only one of them leaves the work half-done.
+
 Quorum queues, not classic: classic queues stopped replicating in 4.0, and
 `x-delivery-limit` — the thing that bounds a poison message — is a quorum feature. Classic
 mirroring (`ha-mode`) is not an alternative; it was removed in the same release. The broker
@@ -1408,6 +1442,7 @@ there rather than in a declaration.
 | [`src/messaging/services/order-placed-consumer.service.ts`](src/messaging/services/order-placed-consumer.service.ts) | prefetch, manual ack after the effect, `reject` never `nack` |
 | [`src/orders/entities/order-receipt.entity.ts`](src/orders/entities/order-receipt.entity.ts)                         | the natural key that makes a duplicate free                  |
 | [`src/orders/services/checkout.service.ts`](src/orders/services/checkout.service.ts)                                 | where `order.placed` leaves the business operation           |
+| [`src/messaging/cli/worker.ts`](src/messaging/cli/worker.ts)                                                         | the process that drains the queue in a deployment            |
 | [`src/messaging/cli/`](src/messaging/cli/)                                                                           | the three demos, and the consumer that dies on purpose       |
 
 ---
@@ -1709,10 +1744,14 @@ npm run verify:provider    # the real service against that contract
 ```
 
 ```bash
+npm run start:worker       # drains shop.order-placed; SIGTERM finishes what it holds
 npm run demo:publish       # RabbitMQ: 5 orders -> 5 events -> 5 effects
 npm run demo:dlq           # a poison message and the contour it leaves by
 npm run demo:duplicate     # one event, two deliveries, one effect
 ```
+
+The demos raise consumers of their own, so a worker left running alongside one will take
+messages the demo is counting. Stop it first.
 
 The stack also runs in Docker: `docker compose up -d --wait` raises the data layer, RabbitMQ
 (AMQP on 25672, management UI on <http://localhost:25673>) and the Pact broker, `docker compose --profile app up -d` adds the service with hot-reload

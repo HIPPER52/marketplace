@@ -11,9 +11,9 @@ const APP_ID = 'marketplace-api';
  * Two things make "published" mean something here, and without either of them it means
  * only "handed to a socket":
  *
- *   - **a confirm channel.** `waitForConfirms()` returns when the broker has taken
- *     responsibility for the message. Until then a publish is a write to a buffer, and a
- *     broker that dies in between took the event with it.
+ *   - **a confirm channel, awaited per message.** The publish resolves when the broker has
+ *     taken responsibility for *this* message. Until then a publish is a write to a
+ *     buffer, and a broker that dies in between took the event with it.
  *   - **`mandatory: true` and a listener for the return.** A confirm is not a delivery.
  *     If no binding matches the routing key, the broker discards the message and answers
  *     the publisher with a *positive* confirm — its responsibility for an unroutable
@@ -21,7 +21,9 @@ const APP_ID = 'marketplace-api';
  *     log and no dead-letter: the dead-letter exchange lives on a queue, and the message
  *     never reached one. With it, the broker hands the message back first, and the two
  *     arrive in that order by protocol — basic.return precedes the basic.ack for the same
- *     message, which is what makes the check below sound rather than hopeful.
+ *     message, and amqplib processes frames in order — so the 'return' listener has
+ *     already run by the time this message's confirm callback does, which is what makes
+ *     the check below sound rather than hopeful.
  *
  * The connection is opened on the first publish rather than in the constructor. The HTTP
  * service must come up whether or not a broker is reachable: the order is already
@@ -57,19 +59,42 @@ export class OrderEventPublisher {
 
         this.returned.delete(event.eventId);
 
-        channel.publish(EVENTS_EXCHANGE, ORDER_PLACED_KEY, Buffer.from(JSON.stringify(event)), {
-            // Survives a broker restart — together with a durable queue, which is the half
-            // of the pair people forget. One without the other persists nothing.
-            persistent: true,
-            mandatory: true,
-            messageId: event.eventId,
-            type: event.type,
-            contentType: 'application/json',
-            timestamp: Math.floor(Date.parse(event.occurredAt) / 1000),
-            appId: APP_ID,
+        // Per-message, not `waitForConfirms()`.
+        //
+        // `waitForConfirms()` resolves when *every* publish outstanding on the channel has
+        // been confirmed, and the channel is shared by every concurrent checkout. One slow
+        // confirm would therefore hold up orders it has nothing to do with: five checkouts
+        // at once would all wait for the slowest. The callback form of `publish` is handed
+        // to this message's own confirm and nobody else's.
+        await new Promise<void>((resolve, reject) => {
+            channel.publish(
+                EVENTS_EXCHANGE,
+                ORDER_PLACED_KEY,
+                Buffer.from(JSON.stringify(event)),
+                {
+                    // Survives a broker restart — together with a durable queue, which is
+                    // the half of the pair people forget. One without the other persists
+                    // nothing.
+                    persistent: true,
+                    mandatory: true,
+                    messageId: event.eventId,
+                    type: event.type,
+                    contentType: 'application/json',
+                    timestamp: Math.floor(Date.parse(event.occurredAt) / 1000),
+                    appId: APP_ID,
+                },
+                // Called once the broker has answered for *this* message: basic.ack, or an
+                // error on basic.nack. An unroutable message is confirmed rather than
+                // nacked, which is why the return check below is a separate question.
+                (error: unknown) => {
+                    if (error === null || error === undefined) {
+                        resolve();
+                    } else {
+                        reject(error instanceof Error ? error : new Error(String(error)));
+                    }
+                },
+            );
         });
-
-        await channel.waitForConfirms();
 
         if (this.returned.delete(event.eventId)) {
             throw new Error(

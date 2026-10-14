@@ -6,6 +6,7 @@ import { DEMO_BUYER_ID } from '../../users/constants/demo-buyer.constant';
 import {
     DELIVERY_LIMIT,
     ORDER_PLACED_DLQ,
+    ORDER_PLACED_QUEUE,
     ORDER_PLACED_TYPE,
 } from '../constants/topology.constant';
 import { OrderPlacedConsumer } from '../services/order-placed-consumer.service';
@@ -95,7 +96,7 @@ async function main(): Promise<void> {
         if (corpse !== false) {
             console.log(`\nx-first-death-reason : ${reason}`);
             console.log(`x-first-death-queue  : ${firstDeathQueue(corpse)}`);
-            console.log(`x-death[0].count     : ${deaths}`);
+            console.log(`x-death(${firstDeathQueue(corpse)}).count : ${deaths}`);
             console.log(`handler said         : ${reasons[0] ?? '(nothing)'}\n`);
 
             // Put it back: the DLQ is where a human or a redrive process finds it, and
@@ -173,29 +174,66 @@ interface Death {
     count?: number;
 }
 
-function firstDeath(message: GetMessage): Death {
-    const headers = message.properties.headers as Record<string, unknown> | undefined;
-    const deaths = headers?.['x-death'];
+/**
+ * The `x-death` entry for one queue.
+ *
+ * **`x-death[0]` is the most recent death, not the first.** RabbitMQ keeps one entry per
+ * `{queue, reason}` pair and moves the one it just touched to the front, so indexing by
+ * position reads correctly exactly once — while a message has died only once — and
+ * silently starts describing a different hop the moment it dies again. A redrive from the
+ * DLQ back into the work queue is enough to make it lie, and nothing about the output
+ * would look wrong.
+ *
+ * So the entry is looked up by the thing that identifies it. `x-first-death-queue` and
+ * `x-first-death-reason` are the headers that genuinely mean "the first one", and they do
+ * not move; the counter that belongs beside them is the entry they name.
+ */
+function deathAt(message: GetMessage, queue: string, reason?: string): Death {
+    const deaths = header(message, 'x-death');
 
-    return Array.isArray(deaths) ? ((deaths[0] ?? {}) as Death) : {};
+    if (!Array.isArray(deaths)) {
+        return {};
+    }
+
+    const entries = deaths as Death[];
+    const matches = entries.filter((death) => death.queue === queue);
+
+    return (
+        (reason === undefined ? undefined : matches.find((d) => d.reason === reason)) ??
+        matches[0] ??
+        {}
+    );
 }
 
-function deathReason(message: GetMessage): string {
+function header(message: GetMessage, name: string): unknown {
     const headers = message.properties.headers as Record<string, unknown> | undefined;
-    const first = headers?.['x-first-death-reason'];
 
-    return typeof first === 'string' ? first : (firstDeath(message).reason ?? 'none');
+    return headers?.[name];
 }
 
+function text(message: GetMessage, name: string): string | null {
+    const value = header(message, name);
+
+    return typeof value === 'string' ? value : null;
+}
+
+/** Where the message died first. Stamped once and never rewritten. */
 function firstDeathQueue(message: GetMessage): string {
-    const headers = message.properties.headers as Record<string, unknown> | undefined;
-    const first = headers?.['x-first-death-queue'];
-
-    return typeof first === 'string' ? first : (firstDeath(message).queue ?? 'unknown');
+    return text(message, 'x-first-death-queue') ?? ORDER_PLACED_QUEUE;
 }
 
+/** Why it died first — one of rejected, expired, maxlen, delivery_limit. */
+function deathReason(message: GetMessage): string {
+    return (
+        text(message, 'x-first-death-reason') ??
+        deathAt(message, firstDeathQueue(message)).reason ??
+        'none'
+    );
+}
+
+/** How many times that first death happened — read from the entry, not from position 0. */
 function deathCount(message: GetMessage): number {
-    return Number(firstDeath(message).count ?? 0);
+    return Number(deathAt(message, firstDeathQueue(message), deathReason(message)).count ?? 0);
 }
 
 main().catch((error: unknown) => {
