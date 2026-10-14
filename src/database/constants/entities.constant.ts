@@ -1,6 +1,7 @@
 import { Job } from '../../jobs/entities/job.entity';
 import { Order } from '../../orders/entities/order.entity';
 import { OrderItem } from '../../orders/entities/order-item.entity';
+import { OrderReceipt } from '../../orders/entities/order-receipt.entity';
 import { Product } from '../../products/entities/product.entity';
 import { User } from '../../users/entities/user.entity';
 
@@ -10,4 +11,4 @@ import { User } from '../../users/entities/user.entity';
  * integration tests point at a throwaway container. An entity registered in two of the
  * three is an entity that works until the suite is the thing that has to find it.
  */
-export const ENTITIES = [User, Product, Order, OrderItem, Job];
+export const ENTITIES = [User, Product, Order, OrderItem, OrderReceipt, Job];

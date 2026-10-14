@@ -165,16 +165,27 @@ every foreign key, and migrations instead of `synchronize`.
 
 ## Grading
 
-A grader has no access to the secret store. These four lines replace it — the dev
-credentials of the local stand, which live in [`docker-compose.yml`](docker-compose.yml)
-and [`init.sql`](init.sql) on purpose and are not a secret:
+A grader has no access to the secret store. These lines replace it — the dev credentials of
+the local stand, which live in [`docker-compose.yml`](docker-compose.yml) and
+[`init.sql`](init.sql) on purpose and are not a secret:
 
 ```bash
 docker compose up -d --wait
 export DATABASE_URL=postgres://marketplace_app:local_dev_password@127.0.0.1:26432/marketplace
 export DB_HOST=127.0.0.1 DB_PORT=26432 DB_USER=marketplace_app DB_PASSWORD=local_dev_password DB_NAME=marketplace
+export BROKER_URL=amqp://marketplace_app:local_dev_password@127.0.0.1:25672
 export SKIP_VAULT=1   # no access to the store: the values are already in the environment
+npm ci
 ```
+
+`--wait` matters more for RabbitMQ than it does for Postgres: between the TCP port opening
+and the Erlang node accepting `basic.publish` there is a window in which a client gets
+`ECONNRESET`. The broker's healthcheck asks `rabbitmq-diagnostics -q check_running` rather
+than whether a port answers, which is what makes that flag mean something here.
+
+Port **25672 is AMQP**; **25673** is the management UI, and it does not speak the protocol
+— `BROKER_URL` pointed there does not fail cleanly, it hangs and then dies looking like an
+outage, so the environment schema rejects that port by name.
 
 Port **26432 is PgBouncer**, not Postgres — everything goes through the pooler. Two
 variable shapes because two kinds of client read them: `DATABASE_URL` is a libpq URI and is
@@ -190,7 +201,8 @@ rotated under a running process. A real environment variable beats the `.env` fi
 `DATABASE_URL: must not carry a password`. Start the service from a shell that has not
 exported it, or `unset DATABASE_URL` first.
 
-That bare command raises Postgres, the pooler and the Pact broker, and stops there: the
+That bare command raises Postgres, the pooler, RabbitMQ and the Pact broker, and stops
+there: the
 `app` service sits behind the `app` profile precisely because it bind-mounts
 `secrets/db_password`, which a fresh clone does not have — Docker would create a
 root-owned _directory_ in its place. Nothing below needs the HTTP service.
@@ -222,9 +234,13 @@ npm run demo:retry     # HW-14: a serialization failure, caught and replayed
 
 bash scripts/with-secrets.sh dev bash scripts/backup.sh        # HW-15: prints the archive path
 bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh # HW-15: prints MATCH
+
+npm run demo:publish   # HW-19: 5 orders -> 5 events -> 5 effects; prefetch=10, dlq=0
+npm run demo:dlq       # HW-19: a poison message, dead-lettered, reason read from x-death
+npm run demo:duplicate # HW-19: one event, two deliveries, one effect
 ```
 
-Each of the five demos checks its own invariant and exits non-zero when it breaks, so
+Each of the eight demos checks its own invariant and exits non-zero when it breaks, so
 there is nothing to read carefully — a green exit code is the result.
 
 Port **25432**, not 5432: the stand must not collide with a Postgres already running on
@@ -1149,6 +1165,288 @@ its buffer would have to leave the process entirely. That is #23's subject.
 
 ---
 
+# Async-події через RabbitMQ — HW-19
+
+In #18 an order's status reached whoever happened to be connected: no receiver, no
+delivery. Here a broker sits between the service and its readers and **keeps the message
+until somebody takes responsibility for it**. That is the entire difference between a
+transport and a broker, and it is paid for in three separate currencies — work that can
+vanish, work that can run twice, and work that can get stuck forever.
+
+```bash
+npm run demo:publish     # 5 orders -> 5 events -> 5 effects, nothing in the DLQ
+npm run demo:dlq         # one message that can never succeed, and the contour it leaves by
+npm run demo:duplicate   # one event, two deliveries, one effect
+```
+
+Each one brings its own state to clean, prints `key=value` lines, checks its own invariant
+and exits non-zero when it breaks. A green exit code is the result; the numbers below are
+there so a reader can tell what the run was supposed to look like.
+
+## `npm run demo:publish` — the event leaves the business operation
+
+```
+published=5
+buffered=5
+delivered=5
+effect=5
+skipped=0
+acked=5
+work=0
+dlq=0
+prefetch=10
+```
+
+The five events come from five real checkouts, not from a loop calling the publisher. The
+event leaves `CheckoutService` — the same code path `POST /orders` runs — so it leaves
+whether the order came from HTTP, from a demo, or from whatever calls checkout next. A
+route that published would make the announcement a property of one entry point.
+
+`buffered=5` is the line worth reading twice: **nothing is subscribed at that moment**. The
+five messages are sitting in a durable queue with no consumer in existence, and they are
+all carried out when one arrives. That is the sentence #18 could not say.
+
+`published` counts confirms, not intentions. The channel is a confirm channel and every
+publish is `mandatory: true` with a listener on `basic.return`, so the number only moves
+after the broker has both taken the message and routed it. Each publish awaits **its own**
+confirm, through the callback form of `publish`, rather than `waitForConfirms()` — that
+method resolves only when every publish outstanding on the channel has been answered, and
+the channel is shared by every concurrent checkout, so one slow confirm would hold up
+orders that have nothing to do with it. Without that pair a publish is
+a write to a socket — and worse, **an unroutable message is discarded while the publisher
+is told everything is fine**: the broker's responsibility for a message no binding matched
+is precisely to throw it away, and it issues a positive confirm having done so. There is
+no error, no log and no dead-letter, because a dead-letter exchange belongs to a queue and
+the message never reached one. The three cures are `mandatory` plus a return handler, an
+alternate exchange on the exchange itself, and an `unroutable` metric; the first is used
+here, and the demo would fail with a sentence rather than silently print `published=5`.
+
+## `npm run demo:dlq` — a message that can never succeed
+
+```
+published=1
+delivered=4
+rejected=4
+effect=0
+work=0
+dlq=1
+dlq-reason=delivery_limit
+```
+
+```
+x-first-death-reason : delivery_limit
+x-first-death-queue  : shop.order-placed
+x-death[0].count     : 1
+handler said         : insert or update on table "order_receipts" violates foreign key
+                       constraint "FK_d7b2656cc5c1aee6b36f76581a3"
+```
+
+The poison is real rather than staged. The event names an order that does not exist, and
+`order_receipts.order_id` is a foreign key into `orders` — so no consumer, on any machine,
+at any time, can write that receipt. A handler that threw on a magic value would only have
+proved that a handler can throw.
+
+What the run shows is that the failure is **bounded**, and that the bound comes from one
+specific call. Every rejection is `reject(msg, true)`. Both `reject` and `nack` return a
+message to the queue and they look identical in a diff, but only `reject` moves the quorum
+queue's delivery counter, so only `reject` ever reaches `x-delivery-limit` and the
+dead-letter exchange. `nack(msg, false, true)` leaves the counter where it is: the message
+comes back forever, warm and invisible. That is why `OrderPlacedConsumer` rejects and never
+nacks. Limit 3, four deliveries, then out — and the cause of death is read off the message
+rather than guessed from a log.
+
+RabbitMQ has exactly four reasons for dead-lettering: `rejected`, `expired` (message TTL),
+`maxlen` and `delivery_limit`. There is no fifth, and **queue TTL is not one of them** — a
+queue that expires disappears taking its contents with it and dead-letters nothing.
+
+Reading `x-death` has one trap worth naming. **`x-death[0]` is the most recent death, not
+the first.** RabbitMQ keeps one entry per `{queue, reason}` pair and moves the one it just
+touched to the front, so indexing by position is right exactly while a message has died
+only once — and starts describing a different hop the moment it dies again, with nothing in
+the output looking wrong. Measured on a scratch topology, one message rejected out of two
+queues in turn:
+
+```
+x-first-death-queue = xd.a
+x-death             = [{"q":"xd.b",…},{"q":"xd.a",…}]
+```
+
+`x-first-death-queue` and `x-first-death-reason` are the headers that genuinely mean "the
+first one" and never move; the counter that belongs beside them is found by looking up the
+entry they name, which is what `demo:dlq` does.
+
+The handler makes no attempt to tell a transient failure from a permanent one. It cannot: a
+foreign key violation and a dropped connection both arrive as a rejected promise. The
+delivery limit is what makes the distinction unnecessary — a transient failure succeeds
+within three attempts, a permanent one lands in the DLQ with its reason attached.
+
+One honest limit, since it is invisible from the output. Dead-lettering here runs at the
+default `at-most-once` strategy: the message is removed from the work queue as soon as it
+has been published to the dead-letter target, without publisher confirms, so a dead-letter
+target that is unavailable loses it. The `at-least-once` strategy exists, but it silently
+falls back unless the queue also carries `overflow: reject-publish` — the broker accepts
+the policy, shows it in `effective_policy_definition`, and mentions the fallback only in
+its log. The default is right for this assignment; knowing it is the default is the point.
+
+## `npm run demo:duplicate` — one event, two deliveries, one effect
+
+```
+published=1
+deliveries=2
+effect=1
+skipped=1
+receipts=1
+work=0
+dlq=0
+prefetch=10
+```
+
+The duplicate is caused the way production causes it. A **separate process** takes the
+delivery, writes the receipt, and is killed with `SIGKILL` before it acknowledges anything.
+`channel.close()` would also have returned the message — closing a channel requeues what it
+holds — but a graceful close is not what happens at three in the morning. A process that
+disappears leaves the operating system to close the socket, the broker sees a dropped
+connection rather than a protocol goodbye, and that is the path a real redelivery takes.
+
+`deliveries=1` would not be a nicer-looking pass. It would mean no duplicate occurred and
+the run demonstrated nothing; the usual cause is `noAck: true`, under which the message is
+gone at the moment of delivery and there is nothing left to return.
+
+## Why this is at-least-once and not exactly-once
+
+**Exactly-once delivery does not exist — not in RabbitMQ, not in Kafka, not in SQS.** The
+AWS documentation says both things two pages apart: "FIFO queues deliver each message
+once" on one page, "at-least-once delivery model… no absolute guarantee that a message
+won't be delivered more than once" on the next. What this project has is at-least-once
+delivery plus an idempotent effect, and together those produce an exactly-once **result**.
+
+There are exactly three places where the outcome is uncertain, and one technique closes all
+three:
+
+| Where               | What goes wrong                                        | What this repository does                     |
+| ------------------- | ------------------------------------------------------ | --------------------------------------------- |
+| producer → broker   | the confirm is lost, the retry publishes a second copy | `eventId` derived from the order, not drawn   |
+| broker → consumer   | the ack is lost, the work is handed out again          | the effect is idempotent, so a repeat is free |
+| consumer → database | the row is written and the process dies before the ack | same — `demo:duplicate` is exactly this case  |
+
+So: **what had to be done for the result to be one.** The effect is expressed through a
+natural key. `order_receipts.order_id` is the primary key, an order has one receipt by
+definition, and the consumer writes it with `INSERT … ON CONFLICT (order_id) DO NOTHING`.
+Applying that twice is indistinguishable from applying it once, with no registry of seen
+message ids to keep in step and nothing to expire.
+
+Two words that are easy to run together, and are not the same thing:
+
+- **idempotency is a property of an operation.** It either has it or it does not.
+  `UPDATE orders SET status = 'packed' WHERE id = 42` has it; `UPDATE … SET qty = qty - 1`
+  does not, and no amount of care at the call site gives it to it.
+- **an idempotency key is a tool** for making an operation that lacks the property safe to
+  repeat — and it has to be built. `Idempotency-Key` on `POST /orders` from #09 is one of
+  those; `order_receipts.order_id` is not a key at all, it is the first case.
+
+A deduplication set held in the consumer's memory would be neither. It lasts exactly as
+long as one instance, does not exist between two replicas, and does not survive a restart —
+which is the one event it is supposed to be insurance against.
+
+### Where this stops, honestly
+
+Two gaps are left open on purpose, both of them #22's subject:
+
+- **The order commits and the event is published afterwards.** A broker cannot join a
+  Postgres transaction, so there is a window in which the order exists and nobody was told.
+  Publishing inside the transaction would be worse — it would announce an order a later
+  `40001` rolled back. The repair is a transactional outbox: the event written as a row
+  beside the order, a separate process publishing it. Until then a failed publish is logged
+  loudly and the customer is still answered, because the order is already committed and
+  refusing to answer would trade a repairable failure for an unrecoverable one.
+- **"Marked as processed" and "effect applied" are one write here, and would not always
+  be.** Because the effect _is_ the mark, this consumer has no gap. The moment a consumer
+  needs a separate `processed_messages` row, the two have to share a COMMIT — and a
+  separate registry in a separate statement is a window where the key says done and nothing
+  happened.
+
+## Why `prefetch=10`
+
+The broker's default is `0`, and **zero means no limit** — measured on this stand:
+
+```bash
+docker compose exec rabbitmq rabbitmqctl eval \
+  'application:get_env(rabbit, default_consumer_prefetch).'
+# {ok,{false,0}}
+```
+
+Left at the default, the first consumer to subscribe is handed the entire queue and the
+second one idles with nothing to do, however many replicas are running.
+
+**Ten, because the handler is a single INSERT of about 5 ms through the pooler, and ten of
+them in flight keep the socket busy across the round trip without parking work on a
+consumer that may die holding it** — the safety check is `prefetch × handler time <
+consumer_timeout`, which here is 10 × 5 ms = 50 ms against a stock timeout of 30 minutes.
+`prefetch=1` is the right answer when a message takes minutes and the wrong one when it
+takes milliseconds; at 2 ms per message it would spend a round trip per message. The hard
+ceiling on a quorum queue is 2000.
+
+## The topology, and who declares it
+
+```
+                 shop.events (topic)
+                        │  order.placed
+                        ▼
+              shop.order-placed  (quorum, x-delivery-limit 3)
+                        │  x-dead-letter-exchange
+                        ▼
+              shop.events.dlx (topic)  ──#──▶  shop.order-placed.dlq (quorum)
+```
+
+**The consumer declares it, never the producer.** The moment checkout declares the queue it
+publishes into, adding a second reader means editing checkout — and the coupling a broker
+was introduced to remove is back with extra steps. The publisher names an exchange and a
+routing key and nothing else.
+
+The order of declaration is load-bearing: exchange, then the dead-letter queue, then the
+work queue that points at it, then the binding. Publishing before the binding exists is the
+silent discard described above.
+
+**Who empties the queue in a deployment:** `npm run start:worker`, its own process. The
+three demos each raise a consumer for the length of one run, and the API process
+deliberately does not subscribe — two subscribers on one queue would make a demo's numbers
+depend on which process won the race, and a consumer wedged on a slow handler must not be
+able to stop `/health` from answering. A consumer and an HTTP service scale on different
+numbers and fail in different ways, so they are different processes.
+
+It stops the way a container orchestrator expects. On `SIGTERM` the subscription is
+cancelled first, so no new delivery arrives, and only then does it wait for the deliveries
+already in hand; anything still unacknowledged goes back to the queue, because an ack is
+"stop sending me this" and a process on its way out is in no position to say it. That is
+the exact opposite of what `demo:duplicate` does on purpose — both end with the message
+back in the queue, and only one of them leaves the work half-done.
+
+Quorum queues, not classic: classic queues stopped replicating in 4.0, and
+`x-delivery-limit` — the thing that bounds a poison message — is a quorum feature. Classic
+mirroring (`ha-mode`) is not an alternative; it was removed in the same release. The broker
+is **4.2**, the LTS series with commercial support to 30.06.2030, rather than the current
+4.3 — the same reasoning that pins every other version here.
+
+A queue's `x-arguments` cannot be changed once it exists. Changing `x-delivery-limit` and
+re-running is answered with `406 PRECONDITION_FAILED`, which is not a client bug and not
+something a retry fixes; `declareTopology` catches that one code and prints what to do
+about it. A policy can be rewritten in place, which is why production settings usually live
+there rather than in a declaration.
+
+## Where things are
+
+| Path                                                                                                                 | What                                                         |
+| -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
+| [`src/messaging/services/topology.service.ts`](src/messaging/services/topology.service.ts)                           | exchange, queues, bindings, the dead-letter contour          |
+| [`src/messaging/services/order-event-publisher.service.ts`](src/messaging/services/order-event-publisher.service.ts) | confirm channel, `mandatory`, the return listener            |
+| [`src/messaging/services/order-placed-consumer.service.ts`](src/messaging/services/order-placed-consumer.service.ts) | prefetch, manual ack after the effect, `reject` never `nack` |
+| [`src/orders/entities/order-receipt.entity.ts`](src/orders/entities/order-receipt.entity.ts)                         | the natural key that makes a duplicate free                  |
+| [`src/orders/services/checkout.service.ts`](src/orders/services/checkout.service.ts)                                 | where `order.placed` leaves the business operation           |
+| [`src/messaging/cli/worker.ts`](src/messaging/cli/worker.ts)                                                         | the process that drains the queue in a deployment            |
+| [`src/messaging/cli/`](src/messaging/cli/)                                                                           | the three demos, and the consumer that dies on purpose       |
+
+---
+
 # The contract — HW-09
 
 `express-openapi-validator` checks every request **and every response** against the spec,
@@ -1310,9 +1608,18 @@ production. Nothing outside that schema touches `process.env`.
 | `NODE_ENV`         | no       | `development`           | environment                                                                                                | `development` \| `test` \| `production`            |
 | `PORT`             | no       | `3000`                  | environment                                                                                                | HTTP port                                          |
 | `DATABASE_URL`     | **yes**  | —                       | **secrets store for the credential**; host and role from `docker-compose.yml` (dev/prod) or `.env` (local) | where the database is and which role to connect as |
+| `BROKER_URL`       | no\*     | —                       | **secrets store**; the dev stand's value is in `docker-compose.yml`                                        | where RabbitMQ is, with credentials inline         |
 | `DB_PASSWORD_FILE` | no       | `./secrets/db_password` | **secrets store** — the file itself, rotated by `rotate.sh`                                                | path to the file holding the password              |
 | `DB_POOL_MAX`      | no       | `10`                    | environment                                                                                                | maximum pooled connections                         |
 | `LOG_LEVEL`        | no       | `log`                   | environment                                                                                                | `error` \| `warn` \| `log` \| `debug` \| `verbose` |
+
+\* `BROKER_URL` is optional **for the HTTP service** and required by the three HW-19 demo
+scripts. An order that was placed is still an order when the asynchronous channel is
+unreachable, so the service logs that `order.placed` could not be published and still
+answers the customer; the demos exist to exercise the broker and have nothing to say
+without one. It is also the one connection string here that carries its password inline —
+AMQP has no per-connection re-read to hang a rotated secret off, so there is nothing for
+`rotate.sh` to hold.
 
 [`.env.example`](.env.example) is the contract: every variable above, each with a comment.
 Copy it and fill it in — `cp .env.example .env`. The real `.env` is git-ignored, never
@@ -1436,7 +1743,17 @@ npm run test:contract      # the consumer test; writes pacts/
 npm run verify:provider    # the real service against that contract
 ```
 
-The stack also runs in Docker: `docker compose up -d --wait` raises the data layer and the
-Pact broker, `docker compose --profile app up -d` adds the service with hot-reload
+```bash
+npm run start:worker       # drains shop.order-placed; SIGTERM finishes what it holds
+npm run demo:publish       # RabbitMQ: 5 orders -> 5 events -> 5 effects
+npm run demo:dlq           # a poison message and the contour it leaves by
+npm run demo:duplicate     # one event, two deliveries, one effect
+```
+
+The demos raise consumers of their own, so a worker left running alongside one will take
+messages the demo is counting. Stop it first.
+
+The stack also runs in Docker: `docker compose up -d --wait` raises the data layer, RabbitMQ
+(AMQP on 25672, management UI on <http://localhost:25673>) and the Pact broker, `docker compose --profile app up -d` adds the service with hot-reload
 alongside Postgres 17, and `docker compose -f docker-compose.yml --profile app up -d --build`
 is the production path.

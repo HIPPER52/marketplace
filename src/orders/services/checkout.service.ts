@@ -1,8 +1,13 @@
+import { Logger } from '@nestjs/common';
 import type { DataSource, EntityManager } from 'typeorm';
 import { Currency } from '../../common/constants/currency.constant';
 import { withRetry } from '../../database/utils/with-retry.util';
 import { JobKind } from '../../jobs/constants/job-status.constant';
 import { Job } from '../../jobs/entities/job.entity';
+import { ORDER_PLACED_TYPE } from '../../messaging/constants/topology.constant';
+import type { OrderEventPublisher } from '../../messaging/services/order-event-publisher.service';
+import type { OrderPlacedEvent } from '../../messaging/types/order-placed.types';
+import { deterministicEventId } from '../../messaging/utils/event-id.util';
 import type { User } from '../../users/entities/user.entity';
 import { OrderStatus } from '../constants/order-status.constant';
 import { Order } from '../entities/order.entity';
@@ -49,11 +54,44 @@ import type { CheckoutRequest, CheckoutResult } from '../types/checkout.types';
  * Two checkouts therefore take their locks in the same order and cannot form a cycle —
  * deadlock prevention is cheaper than deadlock recovery. `withRetry` still wraps the
  * transaction, because "cheaper" is not "guaranteed" once other writers exist.
+ *
+ * ## Why `order.placed` is published here and not in the controller
+ *
+ * The event leaves the business operation, so it leaves whether the order came from
+ * `POST /orders`, from a demo script, or from whatever calls checkout next. A route that
+ * published would make the announcement a property of one entry point — the same mistake
+ * #18 avoided by putting the realtime emit in OrderStatusService rather than in a handler.
+ *
+ * ## Why after the transaction, and what that costs
+ *
+ * A broker cannot join a Postgres transaction. Publishing inside it would announce an
+ * order that a later 40001 rolled back; publishing after it leaves a window in which the
+ * order exists and nobody was told. Neither is free, and the second is the one that can be
+ * repaired afterwards — `jobs` already carries, in the same transaction, the work that
+ * genuinely must not be lost. The real fix is a transactional outbox: the event written as
+ * a row beside the order, a separate process publishing it. That is #22, and until then
+ * this gap is named rather than hidden.
  */
 export class CheckoutService {
-    constructor(private readonly dataSource: DataSource) {}
+    private readonly logger = new Logger(CheckoutService.name);
+
+    constructor(
+        private readonly dataSource: DataSource,
+        /** Null when no broker is configured — see MessagingModule. */
+        private readonly publisher: OrderEventPublisher | null = null,
+    ) {}
 
     async checkout(request: CheckoutRequest): Promise<CheckoutResult> {
+        const result = await this.attempt(request);
+
+        if (result.outcome === 'created') {
+            await this.announce(result, request);
+        }
+
+        return result;
+    }
+
+    private async attempt(request: CheckoutRequest): Promise<CheckoutResult> {
         try {
             return await withRetry(this.dataSource, { label: 'checkout' }, (manager) =>
                 this.run(manager, request),
@@ -64,6 +102,43 @@ export class CheckoutService {
             }
 
             throw error;
+        }
+    }
+
+    /**
+     * The order is committed by the time this runs, so a broker that is unreachable must
+     * not turn a placed order into a failed request. The failure is logged and the customer
+     * is answered — and the window itself is what #22's outbox removes.
+     */
+    private async announce(
+        result: Extract<CheckoutResult, { outcome: 'created' }>,
+        request: CheckoutRequest,
+    ): Promise<void> {
+        if (this.publisher === null) {
+            return;
+        }
+
+        const event: OrderPlacedEvent = {
+            // Derived from the order, so a republish after a lost confirm carries the id
+            // the first attempt carried.
+            eventId: deterministicEventId(ORDER_PLACED_TYPE, result.orderId),
+            type: ORDER_PLACED_TYPE,
+            occurredAt: result.occurredAt,
+            data: {
+                orderId: result.orderId,
+                userId: request.userId,
+                totalCents: result.totalCents,
+                currency: request.currency ?? Currency.UAH,
+            },
+        };
+
+        try {
+            await this.publisher.publishOrderPlaced(event);
+        } catch (error: unknown) {
+            this.logger.error(
+                `order ${result.orderId} was placed but ${ORDER_PLACED_TYPE} was not ` +
+                    `published: ${error instanceof Error ? error.message : String(error)}`,
+            );
         }
     }
 
@@ -123,6 +198,11 @@ export class CheckoutService {
             throw new CheckoutAbort(await explainFundsFailure(manager, request.userId, totalCents));
         }
 
+        // Read before the write rather than from the saved row: `created_at` is a column
+        // default, and whether an INSERT hands defaults back depends on how TypeORM built
+        // the statement. The difference is a millisecond; the ambiguity is not worth it.
+        const occurredAt = new Date().toISOString();
+
         const order = new Order();
         order.user = { id: request.userId } as User;
         order.status = OrderStatus.Pending;
@@ -140,7 +220,7 @@ export class CheckoutService {
         job.payload = { orderId: order.id, totalCents, currency };
         await manager.save(job);
 
-        return { outcome: 'created', orderId: order.id, totalCents, jobId: job.id };
+        return { outcome: 'created', orderId: order.id, totalCents, jobId: job.id, occurredAt };
     }
 }
 

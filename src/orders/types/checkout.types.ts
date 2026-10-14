@@ -19,7 +19,14 @@ export interface CheckoutRequest {
  * message to find out. Faults — a dead connection, a serialization failure — still throw.
  */
 export type CheckoutResult =
-    | { outcome: 'created'; orderId: string; totalCents: number; jobId: string }
+    | {
+          outcome: 'created';
+          orderId: string;
+          totalCents: number;
+          jobId: string;
+          /** When the order was written, ISO 8601 — what `order.placed` carries. */
+          occurredAt: string;
+      }
     | { outcome: 'unknown-product'; productId: string }
     | { outcome: 'out-of-stock'; productId: string; requested: number; available: number }
     | { outcome: 'insufficient-funds'; requiredCents: number; availableCents: number };
