@@ -18,14 +18,13 @@ import type {
     UpdateOrderStatusRequest,
 } from '../../common/types/api.types';
 import { pageOf, readCursor, readLimit } from '../../common/utils/pagination.util';
-import { DEMO_BUYER_ID } from '../../users/constants/demo-buyer.constant';
+import { CheckoutOutcome, PlaceOrderOutcome } from '../constants/outcome.constant';
 import { ORDER_STATUS_EVENT, USER_ID_HEADER } from '../constants/realtime.constant';
 import { OrdersRepository } from '../repositories/orders.repository';
-import { CheckoutService } from '../services/checkout.service';
 import { ClaimedIdentityService } from '../services/claimed-identity.service';
-import { IdempotencyRegistry } from '../services/idempotency.service';
 import { OrderEventsService } from '../services/order-events.service';
 import { OrderStatusService } from '../services/order-status.service';
+import { PlaceOrderService } from '../services/place-order.service';
 import type { CheckoutResult } from '../types/checkout.types';
 import { type OrderEvent, toPayload } from '../types/order-event.types';
 import { toApiOrder } from '../utils/order.mapper';
@@ -33,9 +32,8 @@ import { toApiOrder } from '../utils/order.mapper';
 @Controller()
 export class OrdersController {
     constructor(
-        private readonly idempotency: IdempotencyRegistry,
+        private readonly placeOrder: PlaceOrderService,
         private readonly orders: OrdersRepository,
-        private readonly checkout: CheckoutService,
         private readonly status: OrderStatusService,
         private readonly orderEvents: OrderEventsService,
         private readonly identity: ClaimedIdentityService,
@@ -72,10 +70,12 @@ export class OrdersController {
         @Body() body: CreateOrderRequest,
         @Res({ passthrough: true }) res: Response,
     ): Promise<Order> {
-        const requestHash = this.idempotency.fingerprint(body);
-        const previous = this.idempotency.lookup(key, requestHash);
+        // One transaction moves the stock, the money, the order, its receipt job and the
+        // outbox row that announces it. Every way it can refuse is data, not an exception
+        // — see services/place-order.service.ts and types/checkout.types.ts.
+        const placement = await this.placeOrder.place({ key, body });
 
-        if (previous.outcome === 'conflict') {
+        if (placement.outcome === PlaceOrderOutcome.Conflict) {
             throw new ProblemError({
                 status: 422,
                 type: ProblemType.idempotencyConflict,
@@ -84,41 +84,38 @@ export class OrdersController {
             });
         }
 
-        if (previous.outcome === 'replay') {
+        if (placement.outcome === PlaceOrderOutcome.InFlight) {
+            // The key is reserved and the request that reserved it has not finished. A
+            // replay cannot be served yet — there is nothing to replay — and placing a
+            // second order would be exactly what the key exists to prevent.
+            throw new ProblemError({
+                status: 422,
+                type: ProblemType.idempotencyInFlight,
+                title: 'Idempotency key is still in use',
+                detail: `Idempotency-Key ${key} belongs to a request that is still being processed. Retry in a moment to receive its result.`,
+            });
+        }
+
+        if (placement.outcome === PlaceOrderOutcome.Refused) {
+            throw unprocessable(explain(placement.result));
+        }
+
+        if (placement.outcome === PlaceOrderOutcome.Replayed) {
             res.setHeader('Idempotency-Replay', 'true');
-            return previous.order;
         }
 
-        // One transaction moves the stock, the money, the order and its receipt job. The
-        // ways it can refuse are data, not exceptions — see types/checkout.types.ts.
-        const result = await this.checkout.checkout({
-            userId: DEMO_BUYER_ID,
-            lines: body.items.map((line) => ({
-                productId: line.product_id,
-                quantity: line.quantity,
-            })),
-            currency: body.currency,
-        });
-
-        if (result.outcome !== 'created') {
-            throw unprocessable(explain(result));
-        }
-
-        const order = await this.orders.findById(result.orderId);
+        const order = await this.orders.findById(placement.orderId);
 
         if (order === null) {
             throw new ProblemError({
                 status: 500,
                 type: ProblemType.internal,
                 title: 'Internal server error',
-                detail: `Order ${result.orderId} was committed but could not be read back.`,
+                detail: `Order ${placement.orderId} was committed but could not be read back.`,
             });
         }
 
-        const created = toApiOrder(order);
-        this.idempotency.remember(key, requestHash, created);
-
-        return created;
+        return toApiOrder(order);
     }
 
     @Patch('orders/:orderId')
@@ -267,16 +264,18 @@ function unprocessable(detail: string): ProblemError {
 }
 
 /** Every refusal checkout can return, in the words the customer gets. */
-function explain(result: Exclude<CheckoutResult, { outcome: 'created' }>): string {
+function explain(
+    result: Exclude<CheckoutResult, { outcome: typeof CheckoutOutcome.Created }>,
+): string {
     switch (result.outcome) {
-        case 'unknown-product':
+        case CheckoutOutcome.UnknownProduct:
             // Also the answer when the product exists but is priced in another currency:
             // an order cannot mix currencies, so from this order's point of view there is
             // no such product to buy.
             return `No product with id ${result.productId} available in this currency.`;
-        case 'out-of-stock':
+        case CheckoutOutcome.OutOfStock:
             return `Product ${result.productId} has ${result.available} units in stock, ${result.requested} requested.`;
-        case 'insufficient-funds':
+        case CheckoutOutcome.InsufficientFunds:
             return `The order costs ${result.requiredCents} cents and the account holds ${result.availableCents}.`;
     }
 }

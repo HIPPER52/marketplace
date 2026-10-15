@@ -1,12 +1,29 @@
 import type { ChannelModel, ConfirmChannel } from 'amqplib';
-import { EVENTS_EXCHANGE, ORDER_PLACED_KEY } from '../constants/topology.constant';
-import type { OrderPlacedEvent } from '../types/order-placed.types';
+import { EVENTS_EXCHANGE } from '../constants/topology.constant';
 import { closeQuietly, connectBroker, silenceChannelErrors } from '../utils/broker.util';
+
+/**
+ * What the publisher needs to know about a message, and nothing more.
+ *
+ * Shaped like an outbox row on purpose: the relay reads rows and hands them straight here,
+ * so there is no step that could invent a routing key the stored row did not ask for.
+ */
+export interface PublishableRecord {
+    /** The message id. Stable across republishes, which is what makes a duplicate free. */
+    id: string;
+    /** The event type, which is also the routing key. */
+    type: string;
+    payload: Record<string, unknown>;
+}
 
 const APP_ID = 'marketplace-api';
 
 /**
- * The one place an order event leaves this process.
+ * The one place a message leaves this process.
+ *
+ * Since #22 its caller is the relay rather than checkout: the business transaction writes
+ * an outbox row and knows nothing about a broker. What the relay hands over is that row,
+ * which is why this takes a record rather than a domain event.
  *
  * Two things make "published" mean something here, and without either of them it means
  * only "handed to a socket":
@@ -54,10 +71,10 @@ export class OrderEventPublisher {
      * that is worth — checkout logs it and still answers the customer, a demo fails the
      * process.
      */
-    async publishOrderPlaced(event: OrderPlacedEvent): Promise<void> {
+    async publish(record: PublishableRecord): Promise<void> {
         const channel = await this.ready();
 
-        this.returned.delete(event.eventId);
+        this.returned.delete(record.id);
 
         // Per-message, not `waitForConfirms()`.
         //
@@ -69,18 +86,18 @@ export class OrderEventPublisher {
         await new Promise<void>((resolve, reject) => {
             channel.publish(
                 EVENTS_EXCHANGE,
-                ORDER_PLACED_KEY,
-                Buffer.from(JSON.stringify(event)),
+                record.type,
+                Buffer.from(JSON.stringify(record.payload)),
                 {
                     // Survives a broker restart — together with a durable queue, which is
                     // the half of the pair people forget. One without the other persists
                     // nothing.
                     persistent: true,
                     mandatory: true,
-                    messageId: event.eventId,
-                    type: event.type,
+                    messageId: record.id,
+                    type: record.type,
                     contentType: 'application/json',
-                    timestamp: Math.floor(Date.parse(event.occurredAt) / 1000),
+                    timestamp: Math.floor(Date.now() / 1000),
                     appId: APP_ID,
                 },
                 // Called once the broker has answered for *this* message: basic.ack, or an
@@ -96,10 +113,10 @@ export class OrderEventPublisher {
             );
         });
 
-        if (this.returned.delete(event.eventId)) {
+        if (this.returned.delete(record.id)) {
             throw new Error(
-                `${event.type} was returned as unroutable: nothing is bound to ` +
-                    `'${ORDER_PLACED_KEY}' on exchange '${EVENTS_EXCHANGE}'. The broker ` +
+                `${record.type} was returned as unroutable: nothing is bound to ` +
+                    `'${record.type}' on exchange '${EVENTS_EXCHANGE}'. The broker ` +
                     'confirmed the publish and discarded the message — declare the topology ' +
                     'before publishing.',
             );

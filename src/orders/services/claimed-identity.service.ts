@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { NodeEnv } from '../../config/constants/node-env.constant';
 import type { Env } from '../../config/schemas/env.schema';
 
 /**
@@ -28,7 +29,7 @@ export class ClaimedIdentityService {
     private readonly trusted: boolean;
 
     constructor(config: ConfigService<Env, true>) {
-        this.trusted = config.get('NODE_ENV', { infer: true }) !== 'production';
+        this.trusted = config.get('NODE_ENV', { infer: true }) !== NodeEnv.Production;
 
         if (!this.trusted) {
             this.logger.warn(

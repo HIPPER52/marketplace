@@ -1,4 +1,6 @@
 import 'reflect-metadata';
+import { OutboxRepository } from '../../messaging/repositories/outbox.repository';
+import { CheckoutOutcome } from '../../orders/constants/outcome.constant';
 import { CheckoutService } from '../../orders/services/checkout.service';
 import type { CheckoutResult } from '../../orders/types/checkout.types';
 import { AppDataSource } from '../data-source';
@@ -67,7 +69,8 @@ async function main(): Promise<void> {
         console.log(`firing ${ATTEMPTS} concurrent checkouts of ${QUANTITY_PER_CALL}…\n`);
 
         // ---- the race ------------------------------------------------------------------
-        const checkout = new CheckoutService(ds);
+        // The outbox row rides along in every one of the fifty transactions.
+        const checkout = new CheckoutService(ds, new OutboxRepository());
         const startedAt = Date.now();
 
         const results = await Promise.all(
@@ -144,16 +147,16 @@ function count(results: CheckoutResult[]): Tally {
 
     for (const result of results) {
         switch (result.outcome) {
-            case 'created':
+            case CheckoutOutcome.Created:
                 tally.created += 1;
                 break;
-            case 'out-of-stock':
+            case CheckoutOutcome.OutOfStock:
                 tally.outOfStock += 1;
                 break;
-            case 'insufficient-funds':
+            case CheckoutOutcome.InsufficientFunds:
                 tally.insufficientFunds += 1;
                 break;
-            case 'unknown-product':
+            case CheckoutOutcome.UnknownProduct:
                 tally.unknownProduct += 1;
                 break;
         }

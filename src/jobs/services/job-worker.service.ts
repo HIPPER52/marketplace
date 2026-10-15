@@ -1,9 +1,7 @@
 import type { DataSource } from 'typeorm';
 import { sleep } from '../../database/utils/with-retry.util';
-import { JobStatus } from '../constants/job-status.constant';
+import { ClaimOutcome, JobStatus } from '../constants/job-status.constant';
 import { Job } from '../entities/job.entity';
-
-export type ClaimOutcome = 'done' | 'none-free';
 
 /**
  * One worker pulling from the `jobs` table.
@@ -43,7 +41,7 @@ export class JobWorker {
                 .getOne();
 
             if (job === null) {
-                return 'none-free';
+                return ClaimOutcome.NoneFree;
             }
 
             // The actual work — sending the receipt, in this domain. Held inside the
@@ -57,7 +55,7 @@ export class JobWorker {
                 [JobStatus.Done, this.name, job.id],
             );
 
-            return 'done';
+            return ClaimOutcome.Done;
         });
     }
 
@@ -68,7 +66,7 @@ export class JobWorker {
         for (;;) {
             const outcome = await this.claimOne(workMs);
 
-            if (outcome === 'done') {
+            if (outcome === ClaimOutcome.Done) {
                 handled += 1;
                 continue;
             }

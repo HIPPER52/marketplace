@@ -8,6 +8,7 @@ export const ProblemType = {
     notFound: `${BASE}/not-found`,
     unprocessable: `${BASE}/unprocessable-entity`,
     idempotencyConflict: `${BASE}/idempotency-key-conflict`,
+    idempotencyInFlight: `${BASE}/idempotency-key-in-flight`,
     internal: `${BASE}/internal-error`,
 } as const;
 

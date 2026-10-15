@@ -1,49 +1,22 @@
-import { Logger, Module } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import type { Env } from '../config/schemas/env.schema';
-import { ORDER_EVENT_PUBLISHER } from './constants/messaging.constants';
-import { OrderEventPublisher } from './services/order-event-publisher.service';
+import { Module } from '@nestjs/common';
+import { OutboxRepository } from './repositories/outbox.repository';
 
 /**
- * The publisher, and the decision that it is allowed to be absent.
+ * What the application needs from the messaging layer, which since #22 is one table.
  *
- * `BROKER_URL` is optional for the HTTP service and required for the three demo scripts,
- * which is not a contradiction but a statement about what each one is for. The demos exist
- * to exercise the broker; without one they have nothing to say and fail loudly. The API
- * serves orders, and an order that was placed is still an order when the asynchronous
- * side-channel is unreachable — the same judgement #18 made about realtime: a channel
- * being unavailable is an honest state, and taking the synchronous API down with it would
- * be the worse outcome.
+ * **The API process does not know a broker exists.** It was the last thing #19 left
+ * behind: checkout held a publisher, published after its COMMIT, and logged when it
+ * could not. Now the announcement is an `outbox` row written by the same transaction as
+ * the order, and carrying it to the broker is somebody else's job — `npm run start:relay`,
+ * its own process, which is also the only process that holds a connection.
  *
- * It also keeps the E2E suite truthful. Nothing is substituted there — no provider is
- * overridden, no broker is mocked — so the application it builds is the application
- * without a broker, and it behaves exactly as a deployment in that situation would.
- *
- * The consumer is deliberately not here. Running it inside the API process would mean two
- * subscribers on one queue whenever a demo runs beside a local `npm start`, and the demo's
- * numbers would silently become a statement about which process won the race.
+ * That removes a whole class of question from this module. There is no "what if the
+ * broker is down while an order is being placed": an order being placed is a single
+ * transaction against a single database, and it either commits with its event or does not
+ * commit at all.
  */
 @Module({
-    providers: [
-        {
-            provide: ORDER_EVENT_PUBLISHER,
-            inject: [ConfigService],
-            useFactory: (config: ConfigService<Env, true>): OrderEventPublisher | null => {
-                const url = config.get('BROKER_URL', { infer: true });
-
-                if (url === undefined) {
-                    new Logger(MessagingModule.name).warn(
-                        'BROKER_URL is not set: orders will be placed but order.placed will ' +
-                            'not be published. Set it to announce them.',
-                    );
-
-                    return null;
-                }
-
-                return new OrderEventPublisher(url);
-            },
-        },
-    ],
-    exports: [ORDER_EVENT_PUBLISHER],
+    providers: [OutboxRepository],
+    exports: [OutboxRepository],
 })
 export class MessagingModule {}

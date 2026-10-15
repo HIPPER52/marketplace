@@ -1,7 +1,9 @@
 import 'reflect-metadata';
+import { CheckoutOutcome } from '../../orders/constants/outcome.constant';
 import { CheckoutService } from '../../orders/services/checkout.service';
 import { DEMO_BUYER_ID } from '../../users/constants/demo-buyer.constant';
 import { DEMO_PRODUCT_ID } from '../constants/demo.constant';
+import { OutboxRepository } from '../repositories/outbox.repository';
 import { OrderPlacedConsumer } from '../services/order-placed-consumer.service';
 import { depths, emit, finish, openStand, seedFixture, settleAt } from '../utils/demo-stand.util';
 import { waitUntil } from '../utils/wait.util';
@@ -20,6 +22,11 @@ import { waitUntil } from '../utils/wait.util';
  * assignment is about. In #18 a WebSocket delivered to whoever happened to be connected —
  * no receiver, no delivery. Here the five messages sit in a durable queue (`buffered=5`
  * below) until a consumer arrives, and then every one of them is carried out.
+ *
+ * Since #22 the checkouts do not publish anything. Each one writes an `outbox` row in its
+ * own transaction and the relay carries the five rows over afterwards — which is why the
+ * drain below sits between the orders and the queue. The numbers are unchanged, and that
+ * is the point: the delivery guarantee did not move, only the thing that can lose it.
  */
 
 const ORDERS = 5;
@@ -32,7 +39,7 @@ async function main(): Promise<void> {
         await seedFixture(stand.dataSource);
 
         // ---- the business operation, five times -------------------------------------
-        const checkout = new CheckoutService(stand.dataSource, stand.publisher);
+        const checkout = new CheckoutService(stand.dataSource, new OutboxRepository());
         const results = await Promise.all(
             Array.from({ length: ORDERS }, () =>
                 checkout.checkout({
@@ -42,8 +49,11 @@ async function main(): Promise<void> {
             ),
         );
 
-        const created = results.filter((result) => result.outcome === 'created');
+        const created = results.filter((result) => result.outcome === CheckoutOutcome.Created);
         const orderIds = created.map((result) => result.orderId);
+
+        // ---- the relay carries the rows across -----------------------------------------
+        await stand.relay.drainOnce();
 
         // ---- what the broker is holding before anyone subscribes ----------------------
         const buffered = await settleAt(
@@ -67,7 +77,7 @@ async function main(): Promise<void> {
 
         // ---- the report ----------------------------------------------------------------
         emit({
-            published: stand.publisher.tally.published,
+            published: stand.relay.tally.published,
             buffered: buffered.work,
             delivered: consumer.tally.delivered,
             effect: consumer.tally.effect,
@@ -88,10 +98,10 @@ async function main(): Promise<void> {
             );
         }
 
-        if (stand.publisher.tally.published !== ORDERS) {
+        if (stand.relay.tally.published !== ORDERS) {
             failures.push(
-                `${stand.publisher.tally.published} of ${ORDERS} events were confirmed by ` +
-                    'the broker; checkout logs the reason and does not fail the order',
+                `the relay carried ${stand.relay.tally.published} of ${ORDERS} outbox rows ` +
+                    'to the broker',
             );
         }
 

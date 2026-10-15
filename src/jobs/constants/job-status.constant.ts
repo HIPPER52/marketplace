@@ -20,3 +20,18 @@ export const JobKind = {
 export type JobKind = (typeof JobKind)[keyof typeof JobKind];
 
 export const JOB_KINDS = Object.values(JobKind);
+
+/**
+ * What one turn of a worker found.
+ *
+ * `none-free` is not "the queue is empty": `FOR UPDATE SKIP LOCKED` skips rows another
+ * worker is holding, so it means "nothing I may take right now". The distinction is the
+ * whole reason `run()` re-counts before it gives up, and a bare `'none-free'` at the call
+ * site is where that distinction goes to die.
+ */
+export const ClaimOutcome = {
+    Done: 'done',
+    NoneFree: 'none-free',
+} as const;
+
+export type ClaimOutcome = (typeof ClaimOutcome)[keyof typeof ClaimOutcome];

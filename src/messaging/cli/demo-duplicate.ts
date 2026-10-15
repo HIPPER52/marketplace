@@ -1,10 +1,12 @@
 import 'reflect-metadata';
 import { fork } from 'node:child_process';
 import { join } from 'node:path';
+import { CheckoutOutcome } from '../../orders/constants/outcome.constant';
 import { OrderReceiptsRepository } from '../../orders/repositories/order-receipts.repository';
 import { CheckoutService } from '../../orders/services/checkout.service';
 import { DEMO_BUYER_ID } from '../../users/constants/demo-buyer.constant';
 import { DEMO_PRODUCT_ID } from '../constants/demo.constant';
+import { OutboxRepository } from '../repositories/outbox.repository';
 import { OrderPlacedConsumer } from '../services/order-placed-consumer.service';
 import { depths, emit, finish, openStand, seedFixture, settleAt } from '../utils/demo-stand.util';
 import { waitUntil } from '../utils/wait.util';
@@ -42,19 +44,21 @@ async function main(): Promise<void> {
         await seedFixture(stand.dataSource);
 
         // ---- one real order -----------------------------------------------------------
-        const checkout = new CheckoutService(stand.dataSource, stand.publisher);
+        const checkout = new CheckoutService(stand.dataSource, new OutboxRepository());
         const result = await checkout.checkout({
             userId: DEMO_BUYER_ID,
             lines: [{ productId: DEMO_PRODUCT_ID, quantity: QUANTITY }],
         });
 
-        if (result.outcome !== 'created') {
+        if (result.outcome !== CheckoutOutcome.Created) {
             throw new Error(`checkout did not place an order: ${result.outcome}`);
         }
 
         const receipts = new OrderReceiptsRepository(stand.dataSource.manager);
         await receipts.forget([result.orderId]);
 
+        // The checkout wrote a row, not a message. The relay is what hands it over.
+        await stand.relay.drainOnce();
         await settleAt(stand.channel, { work: 1, dlq: 0 }, 'the event to reach the queue');
         console.log(`order ${result.orderId} placed; order.placed is in the queue`);
 
@@ -97,7 +101,7 @@ async function main(): Promise<void> {
         const rows = await receipts.countFor([result.orderId]);
 
         emit({
-            published: stand.publisher.tally.published,
+            published: stand.relay.tally.published,
             deliveries,
             effect,
             skipped,

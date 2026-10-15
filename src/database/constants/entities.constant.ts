@@ -1,4 +1,7 @@
 import { Job } from '../../jobs/entities/job.entity';
+import { OutboxRecord } from '../../messaging/entities/outbox-record.entity';
+import { ProcessedMessage } from '../../messaging/entities/processed-message.entity';
+import { IdempotencyKey } from '../../orders/entities/idempotency-key.entity';
 import { Order } from '../../orders/entities/order.entity';
 import { OrderItem } from '../../orders/entities/order-item.entity';
 import { OrderReceipt } from '../../orders/entities/order-receipt.entity';
@@ -11,4 +14,14 @@ import { User } from '../../users/entities/user.entity';
  * integration tests point at a throwaway container. An entity registered in two of the
  * three is an entity that works until the suite is the thing that has to find it.
  */
-export const ENTITIES = [User, Product, Order, OrderItem, OrderReceipt, Job];
+export const ENTITIES = [
+    User,
+    Product,
+    Order,
+    OrderItem,
+    OrderReceipt,
+    IdempotencyKey,
+    Job,
+    OutboxRecord,
+    ProcessedMessage,
+];
