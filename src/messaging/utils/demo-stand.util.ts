@@ -13,6 +13,7 @@ import {
 import { ORDER_PLACED_DLQ, ORDER_PLACED_QUEUE } from '../constants/topology.constant';
 import { readBrokerEnv } from '../schemas/broker-env.schema';
 import { OrderEventPublisher } from '../services/order-event-publisher.service';
+import { OutboxRelay } from '../services/outbox-relay.service';
 import { declareTopology } from '../services/topology.service';
 import { closeQuietly, connectBroker, silenceChannelErrors } from './broker.util';
 import { waitUntil } from './wait.util';
@@ -28,6 +29,8 @@ export interface DemoStand {
     /** A plain channel: purge, check, get, consume. The publisher keeps its own. */
     channel: Channel;
     publisher: OrderEventPublisher;
+    /** The courier. Demos drive it a pass at a time rather than letting it loop. */
+    relay: OutboxRelay;
     close(): Promise<void>;
 }
 
@@ -64,9 +67,14 @@ export async function openStand({ purge = true }: StandOptions = {}): Promise<De
         if (purge) {
             await channel.purgeQueue(ORDER_PLACED_QUEUE);
             await channel.purgeQueue(ORDER_PLACED_DLQ);
+
+            // The outbox too. A demo counts what *it* published, and a row left behind by
+            // an earlier run would be carried out by this one's relay and counted here.
+            await dataSource.query('DELETE FROM outbox');
         }
 
         const publisher = new OrderEventPublisher(BROKER_URL);
+        const relay = new OutboxRelay(dataSource, publisher);
         const opened = model;
 
         return {
@@ -74,6 +82,7 @@ export async function openStand({ purge = true }: StandOptions = {}): Promise<De
             model: opened,
             channel,
             publisher,
+            relay,
             close: async () => {
                 await publisher.close();
                 await closeQuietly(channel);

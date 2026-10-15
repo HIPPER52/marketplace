@@ -58,7 +58,11 @@ async function main(): Promise<void> {
             },
         };
 
-        await stand.publisher.publishOrderPlaced(event);
+        await stand.publisher.publish({
+            id: event.eventId,
+            type: event.type,
+            payload: event as unknown as Record<string, unknown>,
+        });
 
         console.log(`order ${orphanOrderId} does not exist — the receipt cannot be written`);
         console.log(`x-delivery-limit is ${DELIVERY_LIMIT}; every failure is reject(requeue=true)`);

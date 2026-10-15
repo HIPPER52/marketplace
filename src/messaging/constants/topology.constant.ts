@@ -59,3 +59,11 @@ export const PREFETCH = 10;
  * consumer rejects and never nacks — see OrderPlacedConsumer.
  */
 export const DELIVERY_LIMIT = 3;
+
+/**
+ * Who, in `processed_messages`, has already acted on a message.
+ *
+ * A name rather than a hostname or a pid: replicas of one consumer are one reader and must
+ * share a mark, or two pods would each apply the effect once and call it idempotent.
+ */
+export const ORDER_RECEIPTS_CONSUMER = 'order-receipts';

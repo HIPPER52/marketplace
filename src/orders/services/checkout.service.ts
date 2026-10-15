@@ -1,17 +1,17 @@
-import { Logger } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import type { DataSource, EntityManager } from 'typeorm';
 import { Currency } from '../../common/constants/currency.constant';
 import { withRetry } from '../../database/utils/with-retry.util';
 import { JobKind } from '../../jobs/constants/job-status.constant';
 import { Job } from '../../jobs/entities/job.entity';
-import { ORDER_PLACED_TYPE } from '../../messaging/constants/topology.constant';
-import type { OrderEventPublisher } from '../../messaging/services/order-event-publisher.service';
-import type { OrderPlacedEvent } from '../../messaging/types/order-placed.types';
-import { deterministicEventId } from '../../messaging/utils/event-id.util';
+import type { OutboxWriter } from '../../messaging/repositories/outbox.repository';
+import { toOrderPlacedEvent, toOutboxRecord } from '../../messaging/utils/order-placed.mapper';
 import type { User } from '../../users/entities/user.entity';
 import { OrderStatus } from '../constants/order-status.constant';
+import { CheckoutOutcome } from '../constants/outcome.constant';
 import { Order } from '../entities/order.entity';
 import { OrderItem } from '../entities/order-item.entity';
+import type { IdempotencyCompleter } from '../repositories/idempotency-keys.repository';
 import type { CheckoutRequest, CheckoutResult } from '../types/checkout.types';
 
 /**
@@ -55,43 +55,43 @@ import type { CheckoutRequest, CheckoutResult } from '../types/checkout.types';
  * deadlock prevention is cheaper than deadlock recovery. `withRetry` still wraps the
  * transaction, because "cheaper" is not "guaranteed" once other writers exist.
  *
- * ## Why `order.placed` is published here and not in the controller
+ * ## Why the event is a row and not a publish
  *
- * The event leaves the business operation, so it leaves whether the order came from
- * `POST /orders`, from a demo script, or from whatever calls checkout next. A route that
- * published would make the announcement a property of one entry point — the same mistake
- * #18 avoided by putting the realtime emit in OrderStatusService rather than in a handler.
+ * A broker cannot join a Postgres transaction. Publishing after the COMMIT — which is what
+ * #19 did — leaves a window in which the order exists and nobody was told; publishing
+ * inside it would announce an order a later 40001 rolled back. Neither is a gap that can
+ * be closed by being careful, because a failed publish does not even mean the message was
+ * not delivered: the broker's answer is what went missing.
  *
- * ## Why after the transaction, and what that costs
+ * So the second write is removed rather than ordered. The event is an `outbox` row
+ * inserted by this transaction, and it commits with the order or not at all — two writes
+ * reduced to one. A separate relay carries the row to the broker afterwards and may
+ * publish it twice; that is the bill, and it is paid by the consumer's idempotent effect.
+ * The choice is between a duplicate and a loss, and only one of the two can be repaired.
  *
- * A broker cannot join a Postgres transaction. Publishing inside it would announce an
- * order that a later 40001 rolled back; publishing after it leaves a window in which the
- * order exists and nobody was told. Neither is free, and the second is the one that can be
- * repaired afterwards — `jobs` already carries, in the same transaction, the work that
- * genuinely must not be lost. The real fix is a transactional outbox: the event written as
- * a row beside the order, a separate process publishing it. That is #22, and until then
- * this gap is named rather than hidden.
+ * ## Why the idempotency key is completed in here
+ *
+ * Same rule, one layer up. The reservation taken at the API edge is finished by *this*
+ * transaction, so that "an order exists" and "the key that asked for it names it" can
+ * never disagree. A mark that can outlive its effect is a mark that lies — which is also
+ * why the consumer writes its inbox row and its receipt together.
+ *
  */
 export class CheckoutService {
-    private readonly logger = new Logger(CheckoutService.name);
-
     constructor(
         private readonly dataSource: DataSource,
-        /** Null when no broker is configured — see MessagingModule. */
-        private readonly publisher: OrderEventPublisher | null = null,
+        /**
+         * Where the event goes. An interface rather than the repository, because it is a
+         * real seam: `demo:crash-write` passes a writer that inserts the row and then
+         * fails, which is how the losing side of the COMMIT is demonstrated without a
+         * test-only branch living in here.
+         */
+        private readonly outbox: OutboxWriter,
+        /** Absent for callers that do not come through the API edge. */
+        private readonly idempotency: IdempotencyCompleter | null = null,
     ) {}
 
     async checkout(request: CheckoutRequest): Promise<CheckoutResult> {
-        const result = await this.attempt(request);
-
-        if (result.outcome === 'created') {
-            await this.announce(result, request);
-        }
-
-        return result;
-    }
-
-    private async attempt(request: CheckoutRequest): Promise<CheckoutResult> {
         try {
             return await withRetry(this.dataSource, { label: 'checkout' }, (manager) =>
                 this.run(manager, request),
@@ -102,43 +102,6 @@ export class CheckoutService {
             }
 
             throw error;
-        }
-    }
-
-    /**
-     * The order is committed by the time this runs, so a broker that is unreachable must
-     * not turn a placed order into a failed request. The failure is logged and the customer
-     * is answered — and the window itself is what #22's outbox removes.
-     */
-    private async announce(
-        result: Extract<CheckoutResult, { outcome: 'created' }>,
-        request: CheckoutRequest,
-    ): Promise<void> {
-        if (this.publisher === null) {
-            return;
-        }
-
-        const event: OrderPlacedEvent = {
-            // Derived from the order, so a republish after a lost confirm carries the id
-            // the first attempt carried.
-            eventId: deterministicEventId(ORDER_PLACED_TYPE, result.orderId),
-            type: ORDER_PLACED_TYPE,
-            occurredAt: result.occurredAt,
-            data: {
-                orderId: result.orderId,
-                userId: request.userId,
-                totalCents: result.totalCents,
-                currency: request.currency ?? Currency.UAH,
-            },
-        };
-
-        try {
-            await this.publisher.publishOrderPlaced(event);
-        } catch (error: unknown) {
-            this.logger.error(
-                `order ${result.orderId} was placed but ${ORDER_PLACED_TYPE} was not ` +
-                    `published: ${error instanceof Error ? error.message : String(error)}`,
-            );
         }
     }
 
@@ -172,7 +135,10 @@ export class CheckoutService {
             }
 
             if (product.currency !== currency) {
-                throw new CheckoutAbort({ outcome: 'unknown-product', productId: line.productId });
+                throw new CheckoutAbort({
+                    outcome: CheckoutOutcome.UnknownProduct,
+                    productId: line.productId,
+                });
             }
 
             const unitPriceCents = Number(product.price_cents);
@@ -220,7 +186,33 @@ export class CheckoutService {
         job.payload = { orderId: order.id, totalCents, currency };
         await manager.save(job);
 
-        return { outcome: 'created', orderId: order.id, totalCents, jobId: job.id, occurredAt };
+        // The announcement, as a row. Same transaction, same COMMIT, same fate.
+        //
+        // The id is drawn here rather than defaulted by the column because it is also the
+        // event's id inside the payload, and both need it before the INSERT returns. It is
+        // what the consumer deduplicates by, and it does not change when the relay
+        // republishes a row it failed to mark.
+        const event = toOrderPlacedEvent(randomUUID(), {
+            orderId: order.id,
+            userId: request.userId,
+            totalCents,
+            currency,
+            occurredAt,
+        });
+        await this.outbox.append(manager, toOutboxRecord(event));
+
+        if (request.idempotencyKey !== undefined && this.idempotency !== null) {
+            await this.idempotency.complete(manager, request.idempotencyKey, order.id);
+        }
+
+        return {
+            outcome: CheckoutOutcome.Created,
+            orderId: order.id,
+            totalCents,
+            jobId: job.id,
+            occurredAt,
+            eventId: event.eventId,
+        };
     }
 }
 
@@ -244,9 +236,9 @@ async function explainStockFailure(
     const product = rows[0];
 
     return product === undefined
-        ? { outcome: 'unknown-product', productId: line.productId }
+        ? { outcome: CheckoutOutcome.UnknownProduct, productId: line.productId }
         : {
-              outcome: 'out-of-stock',
+              outcome: CheckoutOutcome.OutOfStock,
               productId: line.productId,
               requested: line.quantity,
               available: Number(product.in_stock),
@@ -264,7 +256,7 @@ async function explainFundsFailure(
     );
 
     return {
-        outcome: 'insufficient-funds',
+        outcome: CheckoutOutcome.InsufficientFunds,
         requiredCents,
         availableCents: Number(rows[0]?.balance_cents ?? 0),
     };

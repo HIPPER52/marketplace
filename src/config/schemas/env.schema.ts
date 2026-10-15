@@ -1,9 +1,9 @@
 import { z } from 'zod';
-import { brokerUrlProblem } from '../../messaging/utils/broker-url.util';
+import { NODE_ENVS, NodeEnv } from '../constants/node-env.constant';
 import { databaseUrlProblem } from '../utils/database-url.util';
 
 export const envSchema = z.object({
-    NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+    NODE_ENV: z.enum(NODE_ENVS).default(NodeEnv.Development),
     PORT: z.coerce.number().int().positive().max(65535).default(3000),
 
     DATABASE_URL: z
@@ -16,24 +16,6 @@ export const envSchema = z.object({
                 ctx.addIssue({ code: 'custom', message: problem });
             }
         }),
-
-    /**
-     * Optional, deliberately. The three demo scripts require a broker and say so; the HTTP
-     * service publishes order.placed when one is configured and logs when it cannot. An
-     * order that was placed is still an order when the asynchronous channel is down, and
-     * taking the synchronous API with it would be the worse failure — see MessagingModule.
-     */
-    BROKER_URL: z
-        .string()
-        .min(1, 'required: amqp connection string')
-        .superRefine((value, ctx) => {
-            const problem = brokerUrlProblem(value);
-
-            if (problem !== null) {
-                ctx.addIssue({ code: 'custom', message: problem });
-            }
-        })
-        .optional(),
 
     DB_PASSWORD_FILE: z.string().min(1).default('./secrets/db_password'),
 

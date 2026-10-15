@@ -1,7 +1,12 @@
 import type { Channel, ConsumeMessage } from 'amqplib';
 import type { DataSource } from 'typeorm';
 import { OrderReceiptsRepository } from '../../orders/repositories/order-receipts.repository';
-import { ORDER_PLACED_QUEUE, PREFETCH } from '../constants/topology.constant';
+import {
+    ORDER_PLACED_QUEUE,
+    ORDER_RECEIPTS_CONSUMER,
+    PREFETCH,
+} from '../constants/topology.constant';
+import { ProcessedMessagesRepository } from '../repositories/processed-messages.repository';
 import type { OrderPlacedEvent } from '../types/order-placed.types';
 
 export interface ConsumerTally {
@@ -46,6 +51,20 @@ export interface ConsumerOptions {
  *     `x-delivery-limit` and ends in the dead-letter exchange. `nack(msg, false, true)`
  *     leaves the counter where it is: the message comes back forever, and a poison message
  *     becomes a permanent load on the cluster rather than a row in a DLQ.
+ *
+ * ## Two levels of idempotency, in one transaction
+ *
+ * The effect is a receipt whose primary key is the order, so applying it twice is already
+ * indistinguishable from applying it once — that is level one, and where it fits it is the
+ * cheapest correct answer there is.
+ *
+ * Level two is the inbox: a row in `processed_messages` saying this consumer has acted on
+ * this message. It exists for the effects that have no natural key of their own, and it
+ * records the decision instead of inferring it. **Both happen in one transaction.** Two
+ * transactions would be the dual write the outbox was introduced to remove, moved onto the
+ * consumer: a process dying between the mark and the effect would leave a message recorded
+ * as handled whose effect never happened, and no redelivery would ever repair it. Marking
+ * in Redis while writing the effect to Postgres is the same bug with better latency.
  *
  * The handler makes no attempt to tell a transient failure from a permanent one. It cannot
  * — a foreign key violation and a dropped connection both arrive as a rejected promise —
@@ -116,13 +135,24 @@ export class OrderPlacedConsumer {
 
         try {
             const event = parseEvent(message.content);
-            const receipts = new OrderReceiptsRepository(this.dataSource.manager);
 
-            const applied = await receipts.issue({
-                orderId: event.data.orderId,
-                eventId: event.eventId,
-                totalCents: event.data.totalCents,
-                currency: event.data.currency,
+            // One transaction: the mark and the effect, or neither.
+            const applied = await this.dataSource.transaction(async (manager) => {
+                const claimed = await new ProcessedMessagesRepository(manager).claim(
+                    event.eventId,
+                    ORDER_RECEIPTS_CONSUMER,
+                );
+
+                if (!claimed) {
+                    return false;
+                }
+
+                return new OrderReceiptsRepository(manager).issue({
+                    orderId: event.data.orderId,
+                    eventId: event.eventId,
+                    totalCents: event.data.totalCents,
+                    currency: event.data.currency,
+                });
             });
 
             if (applied) {

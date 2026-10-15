@@ -9,7 +9,12 @@ import {
 } from '@nestjs/websockets';
 import type { Subscription } from 'rxjs';
 import type { Server, Socket } from 'socket.io';
-import { JOIN_EVENT, ORDER_STATUS_EVENT, roomOf } from '../constants/realtime.constant';
+import {
+    JOIN_EVENT,
+    JoinRefusal,
+    ORDER_STATUS_EVENT,
+    roomOf,
+} from '../constants/realtime.constant';
 import { OrdersRepository } from '../repositories/orders.repository';
 import { ClaimedIdentityService } from '../services/claimed-identity.service';
 import { OrderEventsService } from '../services/order-events.service';
@@ -44,7 +49,7 @@ export type JoinAck =
     | { ok: true; room: string }
     | {
           ok: false;
-          error: 'unauthenticated' | 'bad-request' | 'not-found' | 'forbidden';
+          error: JoinRefusal;
           detail: string;
       };
 
@@ -92,26 +97,38 @@ export class OrdersGateway implements OnGatewayInit, OnModuleDestroy {
         const userId = this.identity.resolve(socket.handshake.auth?.userId);
 
         if (userId === null) {
-            return { ok: false, error: 'unauthenticated', detail: this.identity.refusal() };
+            return {
+                ok: false,
+                error: JoinRefusal.Unauthenticated,
+                detail: this.identity.refusal(),
+            };
         }
 
         const orderId = typeof body?.orderId === 'string' ? body.orderId : null;
 
         if (orderId === null) {
-            return { ok: false, error: 'bad-request', detail: 'join expects { orderId }.' };
+            return {
+                ok: false,
+                error: JoinRefusal.BadRequest,
+                detail: 'join expects { orderId }.',
+            };
         }
 
         const order = await this.orders.findById(orderId);
 
         if (order === null) {
-            return { ok: false, error: 'not-found', detail: `No order with id ${orderId}.` };
+            return {
+                ok: false,
+                error: JoinRefusal.NotFound,
+                detail: `No order with id ${orderId}.`,
+            };
         }
 
         // The one check this whole gateway exists for.
         if (order.userId !== userId) {
             return {
                 ok: false,
-                error: 'forbidden',
+                error: JoinRefusal.Forbidden,
                 detail: `Order ${orderId} does not belong to user ${userId}.`,
             };
         }

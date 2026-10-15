@@ -238,9 +238,13 @@ bash scripts/with-secrets.sh dev bash scripts/restore-drill.sh # HW-15: prints M
 npm run demo:publish   # HW-19: 5 orders -> 5 events -> 5 effects; prefetch=10, dlq=0
 npm run demo:dlq       # HW-19: a poison message, dead-lettered, reason read from x-death
 npm run demo:duplicate # HW-19: one event, two deliveries, one effect
+
+npm run demo:outbox      # HW-22: two requests, one key -> one order, one event, one effect
+npm run demo:crash-write # HW-22: the business write fails and no event gets out
+npm run demo:crash-relay # HW-22: published twice, effect applied once
 ```
 
-Each of the eight demos checks its own invariant and exits non-zero when it breaks, so
+Each of the eleven demos checks its own invariant and exits non-zero when it breaks, so
 there is nothing to read carefully — a green exit code is the result.
 
 Port **25432**, not 5432: the stand must not collide with a Postgres already running on
@@ -1202,6 +1206,12 @@ event leaves `CheckoutService` — the same code path `POST /orders` runs — so
 whether the order came from HTTP, from a demo, or from whatever calls checkout next. A
 route that published would make the announcement a property of one entry point.
 
+Since #22 those checkouts publish nothing. Each writes an `outbox` row in its own
+transaction and the relay carries the five rows over afterwards, which is why
+`demo:publish` drains the relay between placing the orders and watching the queue. Every
+number below is unchanged, and that is the point — the delivery guarantee did not move,
+only the thing that could lose it.
+
 `buffered=5` is the line worth reading twice: **nothing is subscribed at that moment**. The
 five messages are sitting in a durable queue with no consumer in existence, and they are
 all carried out when one arrives. That is the sentence #18 could not say.
@@ -1323,11 +1333,11 @@ delivery plus an idempotent effect, and together those produce an exactly-once *
 There are exactly three places where the outcome is uncertain, and one technique closes all
 three:
 
-| Where               | What goes wrong                                        | What this repository does                     |
-| ------------------- | ------------------------------------------------------ | --------------------------------------------- |
-| producer → broker   | the confirm is lost, the retry publishes a second copy | `eventId` derived from the order, not drawn   |
-| broker → consumer   | the ack is lost, the work is handed out again          | the effect is idempotent, so a repeat is free |
-| consumer → database | the row is written and the process dies before the ack | same — `demo:duplicate` is exactly this case  |
+| Where               | What goes wrong                                        | What this repository does                                   |
+| ------------------- | ------------------------------------------------------ | ----------------------------------------------------------- |
+| producer → broker   | the confirm is lost, the retry publishes a second copy | the event id is the outbox row's, so a republish carries it |
+| broker → consumer   | the ack is lost, the work is handed out again          | the effect is idempotent, so a repeat is free               |
+| consumer → database | the row is written and the process dies before the ack | same — `demo:duplicate` is exactly this case                |
 
 So: **what had to be done for the result to be one.** The effect is expressed through a
 natural key. `order_receipts.order_id` is the primary key, an order has one receipt by
@@ -1348,22 +1358,17 @@ A deduplication set held in the consumer's memory would be neither. It lasts exa
 long as one instance, does not exist between two replicas, and does not survive a restart —
 which is the one event it is supposed to be insurance against.
 
-### Where this stops, honestly
+### Where this stopped, and where it goes
 
-Two gaps are left open on purpose, both of them #22's subject:
+Two gaps were left open here on purpose, and **#22 closes both** — see
+[Outbox та ідемпотентність](#outbox-та-ідемпотентність--hw-22):
 
-- **The order commits and the event is published afterwards.** A broker cannot join a
-  Postgres transaction, so there is a window in which the order exists and nobody was told.
-  Publishing inside the transaction would be worse — it would announce an order a later
-  `40001` rolled back. The repair is a transactional outbox: the event written as a row
-  beside the order, a separate process publishing it. Until then a failed publish is logged
-  loudly and the customer is still answered, because the order is already committed and
-  refusing to answer would trade a repairable failure for an unrecoverable one.
-- **"Marked as processed" and "effect applied" are one write here, and would not always
-  be.** Because the effect _is_ the mark, this consumer has no gap. The moment a consumer
-  needs a separate `processed_messages` row, the two have to share a COMMIT — and a
-  separate registry in a separate statement is a window where the key says done and nothing
-  happened.
+- The order committed and the event was published afterwards, leaving a window in which
+  the order existed and nobody was told. The event is now a row written by the same
+  transaction, and a separate relay carries it.
+- "Marked as processed" and "effect applied" were one write only because the effect _was_
+  the mark. The consumer now keeps a `processed_messages` row as well, and writes it in the
+  same transaction as the receipt.
 
 ## Why `prefetch=10`
 
@@ -1398,16 +1403,18 @@ ceiling on a quorum queue is 2000.
               shop.events.dlx (topic)  ──#──▶  shop.order-placed.dlq (quorum)
 ```
 
-**The consumer declares it, never the producer.** The moment checkout declares the queue it
-publishes into, adding a second reader means editing checkout — and the coupling a broker
-was introduced to remove is back with extra steps. The publisher names an exchange and a
-routing key and nothing else.
+**The consumer declares it, never the producer.** A producer that declares the queue it
+publishes into has to be edited to add a second reader — and the coupling a broker was
+introduced to remove is back with extra steps. The publisher names an exchange and a
+routing key and nothing else; since #22 the producer is the relay, and checkout does not
+know a broker exists at all.
 
 The order of declaration is load-bearing: exchange, then the dead-letter queue, then the
 work queue that points at it, then the binding. Publishing before the binding exists is the
 silent discard described above.
 
-**Who empties the queue in a deployment:** `npm run start:worker`, its own process. The
+**Who runs what in a deployment:** two processes of their own, `npm run start:relay`
+(outbox → broker) and `npm run start:worker` (broker → effect). The
 three demos each raise a consumer for the length of one run, and the API process
 deliberately does not subscribe — two subscribers on one queue would make a demo's numbers
 depend on which process won the race, and a consumer wedged on a slow handler must not be
@@ -1435,15 +1442,226 @@ there rather than in a declaration.
 
 ## Where things are
 
-| Path                                                                                                                 | What                                                         |
-| -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ |
-| [`src/messaging/services/topology.service.ts`](src/messaging/services/topology.service.ts)                           | exchange, queues, bindings, the dead-letter contour          |
-| [`src/messaging/services/order-event-publisher.service.ts`](src/messaging/services/order-event-publisher.service.ts) | confirm channel, `mandatory`, the return listener            |
-| [`src/messaging/services/order-placed-consumer.service.ts`](src/messaging/services/order-placed-consumer.service.ts) | prefetch, manual ack after the effect, `reject` never `nack` |
-| [`src/orders/entities/order-receipt.entity.ts`](src/orders/entities/order-receipt.entity.ts)                         | the natural key that makes a duplicate free                  |
-| [`src/orders/services/checkout.service.ts`](src/orders/services/checkout.service.ts)                                 | where `order.placed` leaves the business operation           |
-| [`src/messaging/cli/worker.ts`](src/messaging/cli/worker.ts)                                                         | the process that drains the queue in a deployment            |
-| [`src/messaging/cli/`](src/messaging/cli/)                                                                           | the three demos, and the consumer that dies on purpose       |
+| Path                                                                                                                 | What                                                                    |
+| -------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| [`src/messaging/services/topology.service.ts`](src/messaging/services/topology.service.ts)                           | exchange, queues, bindings, the dead-letter contour                     |
+| [`src/messaging/services/order-event-publisher.service.ts`](src/messaging/services/order-event-publisher.service.ts) | confirm channel, `mandatory`, the return listener                       |
+| [`src/messaging/services/order-placed-consumer.service.ts`](src/messaging/services/order-placed-consumer.service.ts) | prefetch, manual ack after the effect, `reject` never `nack`            |
+| [`src/orders/entities/order-receipt.entity.ts`](src/orders/entities/order-receipt.entity.ts)                         | the natural key that makes a duplicate free                             |
+| [`src/orders/services/checkout.service.ts`](src/orders/services/checkout.service.ts)                                 | where `order.placed` leaves the business operation — as a row since #22 |
+| [`src/messaging/cli/worker.ts`](src/messaging/cli/worker.ts)                                                         | the process that drains the queue in a deployment                       |
+| [`src/messaging/cli/`](src/messaging/cli/)                                                                           | the three demos, and the consumer that dies on purpose                  |
+
+---
+
+# Outbox та ідемпотентність — HW-22
+
+Everything up to #19 rested on one assumption: the whole effect of an operation lives in
+one database. Placing an order breaks it. The moment the operation also has to tell the
+outside world, there is no shared COMMIT between Postgres and a broker — two resource
+managers, two writes, and between them a gap exactly the size of a process death.
+
+#19 put the publish after the COMMIT and named the gap. This closes it, and pays the bill
+that comes with closing it.
+
+```bash
+npm run demo:outbox        # two requests, one key -> one order, one event, one effect
+npm run demo:crash-write   # the business write fails: nothing gets out at all
+npm run demo:crash-relay   # the service record fails: published twice, effect once
+```
+
+## `npm run demo:outbox` — the happy path, and the key that holds it
+
+```
+requests=2
+orders=1
+outbox=1
+published=1
+deliveries=1
+effect=1
+processed=1
+work=0
+dlq=0
+```
+
+Two requests carry the same `Idempotency-Key`. Six of those numbers are six different
+mechanisms answering the same question — how many times did this actually happen? — and
+every one of them says once.
+
+The second request never reaches checkout. The key is reserved with
+`INSERT … ON CONFLICT DO NOTHING` **before** the first checkout runs, so the second finds
+a reservation that already names an order and answers with a replay. Reserving after a
+successful checkout — which is what the in-memory version did until now — leaves exactly
+the window two simultaneous requests need: both read "not seen", both place an order, and
+the key meant to prevent the second one ends up describing it.
+
+The reservation is completed **inside the checkout transaction**, so "an order exists" and
+"the key that asked for it names that order" cannot disagree.
+
+## `npm run demo:crash-write` — the business write fails
+
+```
+write-failed=1
+orders=0
+outbox=0
+published=0
+deliveries=0
+effect=0
+```
+
+The transaction inserts the order, inserts the announcement beside it, and is then refused.
+Both rows disappear together. This is the proof that the two writes really are one write:
+had they been two, the outbox row would have survived, and a relay would have cheerfully
+announced an order that does not exist.
+
+That failure — an event about a phantom — is the mirror image of the one dual write is
+usually criticised for, and it is the nastier of the two: nothing in the database can be
+queried to discover it, because the row it would be about was rolled back. Here it is not
+unlikely. It is unavailable.
+
+The failure is injected through a seam rather than a flag inside `CheckoutService`:
+production passes `OutboxRepository`, the demo passes a writer that appends the row and
+then throws. The class being demonstrated is the one that ships.
+
+## `npm run demo:crash-relay` — the service record fails ⭐
+
+```
+published=2
+deliveries=2
+applied=1
+effect=1
+processed=1
+skipped=1
+unmarked=1
+```
+
+A relay has two steps that are not atomic together: hand the row to the broker, then write
+`published_at`. Here a **separate process** does the first and is killed with `SIGKILL`
+before the second — a real `kill`, not a thrown exception, because a service at three in
+the morning does not politely raise an error. It disappears, the operating system closes
+its sockets, and Postgres finds an abandoned transaction rather than receiving a ROLLBACK.
+
+`unmarked=1` is that transaction rolling back: the broker already has the message and the
+row is still `published_at IS NULL`. The next pass publishes it again — `deliveries=2` —
+and the consumer applies the effect once.
+
+**The duplicate is ours, not the broker's.** No setting in RabbitMQ or Kafka removes it,
+because neither of them did it. That is what at-least-once delivery looks like from the
+inside, and `effect=1` beside `deliveries=2` is what exactly-once actually means: not a
+delivery guarantee — there is no such thing — but at-least-once delivery plus an effect
+that cannot count twice.
+
+### Why `publish` and `UPDATE published_at` cannot simply swap places
+
+Because the choice is not between a right order and a wrong one. It is between a
+**duplicate** and a **loss**, and only one of those can be repaired.
+
+| Order                       | A relay dying in between leaves                        | Repaired by          |
+| --------------------------- | ------------------------------------------------------ | -------------------- |
+| publish → mark _(this one)_ | a row still unpublished; the event is delivered twice  | an idempotent effect |
+| mark → publish              | a row claiming to be carried out; the event never sent | nothing              |
+
+A duplicate is visible and has a cure: the consumer's natural key, the inbox row. A loss is
+invisible — there is no record anywhere that something is missing, no queue to inspect, no
+counter that moved. The row says it was handled and nobody will ever look at it again.
+
+It is worse than a symmetric trade, too. **A publish that reports failure does not mean the
+message was not delivered** — what went missing may have been the broker's answer. So "mark
+first, and on a publish error roll the mark back" does not work either: the event may
+already be in the queue. That is also why deduplication on the consumer is mandatory
+regardless of how careful the relay is.
+
+## The relay
+
+```sql
+SELECT … FROM outbox
+ WHERE published_at IS NULL
+ ORDER BY created_at, id
+   FOR UPDATE SKIP LOCKED
+ LIMIT 100;
+```
+
+**`SKIP LOCKED`, not a bare `FOR UPDATE`.** Both give zero duplicates. A plain `FOR UPDATE`
+gives them at the price of zero parallelism — the second and third relay queue behind the
+first and the three finish in one relay's time. The lecture's measurement is the argument:
+three relays, thirty events, naive gives 90 messages with 60 duplicates, `FOR UPDATE` gives
+30 with no concurrency, `SKIP LOCKED` gives 30 at roughly the ideal time.
+
+**`WHERE published_at IS NULL`, not a cursor over ids.** A `bigserial` takes its number at
+`nextval` and the row becomes visible at COMMIT, so two concurrent inserts can become
+visible out of order — and "everything above the last id I saw" then skips one, silently
+and permanently. A nullable timestamp cannot be skipped: a row is either carried out or it
+is not.
+
+**`ORDER BY` orders the selection, not the delivery.** SKIP LOCKED hands rows to whichever
+relay is free, so sorting decides what a pass picks up and nothing about what arrives first.
+The only ordering that survives downstream is within one `aggregate_id`, which is why the
+order id is the partitioning key — if a consumer ever needs ordering, that is the scope it
+can have.
+
+**The mark is inside the claiming transaction**, because the lock lives until that
+transaction ends. Marking in a second transaction would release the row to another relay
+while this one was still publishing it.
+
+## Three levels of idempotency, and the one that is not a level
+
+| Level           | Mechanism                                                      | Where                          |
+| --------------- | -------------------------------------------------------------- | ------------------------------ |
+| 1 — natural key | `INSERT … ON CONFLICT (order_id) DO NOTHING`                   | `order_receipts`               |
+| 2 — inbox       | `processed_messages` **and the effect in one transaction**     | `OrderPlacedConsumer`          |
+| 3 — API edge    | `Idempotency-Key`, reserved before the work, completed with it | `PlaceOrderService`            |
+| ❌ not a level  | a `Set` or `Map` in the process                                | what #11 did until this change |
+| ❌ not a level  | the mark in Redis, the effect in Postgres                      | dual write wearing a hat       |
+
+**Idempotency is a property of an operation.** `UPDATE orders SET status = 'packed' WHERE
+id = 42` has it; `UPDATE … SET qty = qty - 1` does not, and no care at the call site gives
+it to it. An **idempotency key is a tool** for making an operation that lacks the property
+safe to repeat. The two get run together constantly and they are not the same thing: level
+one is the property, level three is the tool.
+
+Level two exists for effects with no natural key of their own, and its whole value is the
+single transaction. Two transactions would be the dual write the outbox just removed, moved
+onto the consumer: a process dying between the mark and the effect leaves a message
+recorded as handled whose effect never happened, and no redelivery repairs it.
+
+## How the table is kept from growing forever
+
+The outbox grows with every order and drags `outbox_unpublished_idx` — the partial index
+the relay's own query depends on — behind it. So the relay deletes carried-out rows older
+than an hour in the same pass it finds nothing new to do. Doing it there rather than from a
+cron is what makes this paragraph true rather than aspirational; the alternatives are a
+background job and partitioning, and both are more machinery than one `DELETE`.
+
+An hour rather than "immediately after publish" because a row just carried out is the only
+record of what was sent, and it is worth having when somebody asks why a consumer saw what
+it saw.
+
+## What this does not become
+
+The field names are the ones Debezium's Outbox Event Router reads, so replacing the polling
+relay with CDC later is a connector configuration rather than a rewrite of every consumer.
+That swap is not in this assignment, and one piece of fine print is worth recording now:
+Debezium's canonical names carry no underscores — `aggregatetype`, `aggregateid` — and
+`aggregatetype` is what `route.by.field` defaults to, so snake_case means setting that
+field explicitly rather than discovering it.
+
+Polling is the right choice at this size: one service, one relay, latency bounded by the
+interval. CDC buys real time and costs a Kafka Connect deployment and a replication slot in
+production — and a slot holds WAL until its consumer acknowledges, with
+`max_slot_wal_keep_size` defaulting to unlimited. A connector that dies on Friday can fill
+the disk by Monday and stop the database.
+
+## Where things are
+
+| Path                                                                                                                         | What                                                      |
+| ---------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| [`src/messaging/entities/outbox-record.entity.ts`](src/messaging/entities/outbox-record.entity.ts)                           | the table, its partial index and the Debezium field roles |
+| [`src/orders/services/checkout.service.ts`](src/orders/services/checkout.service.ts)                                         | the order and its announcement in one COMMIT              |
+| [`src/messaging/services/outbox-relay.service.ts`](src/messaging/services/outbox-relay.service.ts)                           | `FOR UPDATE SKIP LOCKED` → publish → mark, in that order  |
+| [`src/messaging/cli/relay.ts`](src/messaging/cli/relay.ts)                                                                   | the relay as a process of its own                         |
+| [`src/messaging/repositories/processed-messages.repository.ts`](src/messaging/repositories/processed-messages.repository.ts) | the inbox; the mark shares the effect's transaction       |
+| [`src/orders/repositories/idempotency-keys.repository.ts`](src/orders/repositories/idempotency-keys.repository.ts)           | reserve before, complete inside                           |
+| [`src/messaging/utils/order-placed.mapper.ts`](src/messaging/utils/order-placed.mapper.ts)                                   | the payload, written by hand so the schema is not the API |
 
 ---
 
@@ -1608,18 +1826,21 @@ production. Nothing outside that schema touches `process.env`.
 | `NODE_ENV`         | no       | `development`           | environment                                                                                                | `development` \| `test` \| `production`            |
 | `PORT`             | no       | `3000`                  | environment                                                                                                | HTTP port                                          |
 | `DATABASE_URL`     | **yes**  | —                       | **secrets store for the credential**; host and role from `docker-compose.yml` (dev/prod) or `.env` (local) | where the database is and which role to connect as |
-| `BROKER_URL`       | no\*     | —                       | **secrets store**; the dev stand's value is in `docker-compose.yml`                                        | where RabbitMQ is, with credentials inline         |
 | `DB_PASSWORD_FILE` | no       | `./secrets/db_password` | **secrets store** — the file itself, rotated by `rotate.sh`                                                | path to the file holding the password              |
 | `DB_POOL_MAX`      | no       | `10`                    | environment                                                                                                | maximum pooled connections                         |
 | `LOG_LEVEL`        | no       | `log`                   | environment                                                                                                | `error` \| `warn` \| `log` \| `debug` \| `verbose` |
 
-\* `BROKER_URL` is optional **for the HTTP service** and required by the three HW-19 demo
-scripts. An order that was placed is still an order when the asynchronous channel is
-unreachable, so the service logs that `order.placed` could not be published and still
-answers the customer; the demos exist to exercise the broker and have nothing to say
-without one. It is also the one connection string here that carries its password inline —
-AMQP has no per-connection re-read to hang a rotated secret off, so there is nothing for
-`rotate.sh` to hold.
+**`BROKER_URL` is deliberately not in that table.** Since #22 the HTTP service does not
+talk to a broker at all — placing an order is one transaction against one database — so the
+variable belongs to the processes that do: `start:relay`, `start:worker` and the demos.
+They read it through [`src/messaging/schemas/broker-env.schema.ts`](src/messaging/schemas/broker-env.schema.ts),
+the same way the command-line tools read the `DB_*` block, and
+[`scripts/with-secrets.sh`](scripts/with-secrets.sh) supplies it from the store. It is also
+the one connection string here that carries its password inline: AMQP has no
+per-connection re-read to hang a rotated secret off, so there is nothing for `rotate.sh`
+to hold.
+
+    BROKER_URL=amqp://marketplace_app:local_dev_password@localhost:25672
 
 [`.env.example`](.env.example) is the contract: every variable above, each with a comment.
 Copy it and fill it in — `cp .env.example .env`. The real `.env` is git-ignored, never
@@ -1744,14 +1965,21 @@ npm run verify:provider    # the real service against that contract
 ```
 
 ```bash
-npm run start:worker       # drains shop.order-placed; SIGTERM finishes what it holds
+npm run start:relay        # outbox -> broker; SIGTERM finishes the pass in flight
+npm run start:worker       # broker -> effect; SIGTERM finishes what it holds
+
 npm run demo:publish       # RabbitMQ: 5 orders -> 5 events -> 5 effects
 npm run demo:dlq           # a poison message and the contour it leaves by
 npm run demo:duplicate     # one event, two deliveries, one effect
+
+npm run demo:outbox        # two requests, one key -> one order, one event, one effect
+npm run demo:crash-write   # the business write fails: nothing gets out at all
+npm run demo:crash-relay   # the service record fails: published twice, effect once
 ```
 
-The demos raise consumers of their own, so a worker left running alongside one will take
-messages the demo is counting. Stop it first.
+The demos raise a relay and a consumer of their own, so a `start:relay` or `start:worker`
+left running alongside one will take rows and messages the demo is counting. Stop them
+first.
 
 The stack also runs in Docker: `docker compose up -d --wait` raises the data layer, RabbitMQ
 (AMQP on 25672, management UI on <http://localhost:25673>) and the Pact broker, `docker compose --profile app up -d` adds the service with hot-reload
