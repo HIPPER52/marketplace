@@ -2,6 +2,9 @@ import 'reflect-metadata';
 import type { Channel, ChannelModel } from 'amqplib';
 import type { DataSource } from 'typeorm';
 import { Currency } from '../../common/constants/currency.constant';
+
+export { emit, finish } from '../../common/utils/demo-report.util';
+
 import { AppDataSource } from '../../database/data-source';
 import { DEMO_BUYER_BALANCE_CENTS, DEMO_BUYER_ID } from '../../users/constants/demo-buyer.constant';
 import {
@@ -158,33 +161,4 @@ export async function settleAt(
     });
 
     return seen;
-}
-
-/**
- * One line per fact, `key=value`, nothing else on the line.
- *
- * The grader greps for whole lines — `grep -qx 'effect=5'` — so a leading space or a
- * trailing comment is the difference between a passing run and a missing criterion.
- */
-export function emit(facts: Record<string, string | number>): void {
-    for (const [key, value] of Object.entries(facts)) {
-        console.log(`${key}=${value}`);
-    }
-}
-
-/**
- * The exit code is the result. A demo that measured the wrong thing and printed it calmly
- * is a demo nobody will notice breaking.
- */
-export function finish(failures: string[], verdict: string): void {
-    if (failures.length > 0) {
-        console.error('\nFAIL:\n');
-        for (const failure of failures) {
-            console.error(`  ${failure}`);
-        }
-        process.exitCode = 1;
-        return;
-    }
-
-    console.log(`\nOK — ${verdict}`);
 }

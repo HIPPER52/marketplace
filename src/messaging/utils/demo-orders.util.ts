@@ -4,6 +4,7 @@ import { IdempotencyKeysRepository } from '../../orders/repositories/idempotency
 import { CheckoutService } from '../../orders/services/checkout.service';
 import { IdempotencyRegistry } from '../../orders/services/idempotency.service';
 import { PlaceOrderService } from '../../orders/services/place-order.service';
+import { noCardRefreshQueue } from '../../queue/types/card-refresh-queue.types';
 import { DEMO_PRODUCT_ID } from '../constants/demo.constant';
 import { OutboxRepository } from '../repositories/outbox.repository';
 
@@ -21,7 +22,9 @@ export function placeOrderService(dataSource: DataSource): PlaceOrderService {
     const idempotency = new IdempotencyRegistry(dataSource);
     const checkout = new CheckoutService(dataSource, new OutboxRepository(), idempotency.completer);
 
-    return new PlaceOrderService(idempotency, checkout);
+    // No queue: these demos are about the broker, and a card refresh they did not
+    // ask for would mean a Redis they do not need.
+    return new PlaceOrderService(idempotency, checkout, noCardRefreshQueue);
 }
 
 /** One unit of the demos' own product. */

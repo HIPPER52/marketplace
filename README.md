@@ -174,6 +174,8 @@ docker compose up -d --wait
 export DATABASE_URL=postgres://marketplace_app:local_dev_password@127.0.0.1:26432/marketplace
 export DB_HOST=127.0.0.1 DB_PORT=26432 DB_USER=marketplace_app DB_PASSWORD=local_dev_password DB_NAME=marketplace
 export BROKER_URL=amqp://marketplace_app:local_dev_password@127.0.0.1:25672
+export REDIS_URL=redis://127.0.0.1:26379         # the cache instance: allkeys-lru
+export REDIS_QUEUE_URL=redis://127.0.0.1:26380   # the queue instance: noeviction
 export SKIP_VAULT=1   # no access to the store: the values are already in the environment
 npm ci
 ```
@@ -186,6 +188,11 @@ than whether a port answers, which is what makes that flag mean something here.
 Port **25672 is AMQP**; **25673** is the management UI, and it does not speak the protocol
 — `BROKER_URL` pointed there does not fail cleanly, it hangs and then dies looking like an
 outage, so the environment schema rejects that port by name.
+
+**Two Redis addresses, because there are two Redis processes.** 26379 is the cache
+(`allkeys-lru`, with a memory limit) and 26380 is the queue (`noeviction`, AOF on). They
+cannot be one instance with two databases: `maxmemory-policy` belongs to the whole process.
+See [Redis: кеш, сесії, ліміти, черга](#redis-кеш-сесії-ліміти-черга--hw-23).
 
 Port **26432 is PgBouncer**, not Postgres — everything goes through the pooler. Two
 variable shapes because two kinds of client read them: `DATABASE_URL` is a libpq URI and is
@@ -201,8 +208,8 @@ rotated under a running process. A real environment variable beats the `.env` fi
 `DATABASE_URL: must not carry a password`. Start the service from a shell that has not
 exported it, or `unset DATABASE_URL` first.
 
-That bare command raises Postgres, the pooler, RabbitMQ and the Pact broker, and stops
-there: the
+That bare command raises Postgres, the pooler, RabbitMQ, both Redis instances and the Pact
+broker, and stops there: the
 `app` service sits behind the `app` profile precisely because it bind-mounts
 `secrets/db_password`, which a fresh clone does not have — Docker would create a
 root-owned _directory_ in its place. Nothing below needs the HTTP service.
@@ -242,9 +249,14 @@ npm run demo:duplicate # HW-19: one event, two deliveries, one effect
 npm run demo:outbox      # HW-22: two requests, one key -> one order, one event, one effect
 npm run demo:crash-write # HW-22: the business write fails and no event gets out
 npm run demo:crash-relay # HW-22: published twice, effect applied once
+
+npm run demo:cache       # HW-23: 50 readers on a vanished key -> one query
+npm run demo:session     # HW-23: one session, an expiry that moves with activity
+npm run demo:ratelimit   # HW-23: two instances, one allowance, 429 + Retry-After
+npm run demo:queue       # HW-23: retries, deduplicates, and schedules itself
 ```
 
-Each of the eleven demos checks its own invariant and exits non-zero when it breaks, so
+Each of the fifteen demos checks its own invariant and exits non-zero when it breaks, so
 there is nothing to read carefully — a green exit code is the result.
 
 Port **25432**, not 5432: the stand must not collide with a Postgres already running on
@@ -1468,6 +1480,11 @@ that comes with closing it.
 npm run demo:outbox        # two requests, one key -> one order, one event, one effect
 npm run demo:crash-write   # the business write fails: nothing gets out at all
 npm run demo:crash-relay   # the service record fails: published twice, effect once
+
+npm run demo:cache         # Redis: a stampede on one key costs a single query
+npm run demo:session       # one session, an expiry that moves with activity
+npm run demo:ratelimit     # two instances, one allowance, 429 + Retry-After
+npm run demo:queue         # BullMQ: retries, deduplicates, schedules itself
 ```
 
 ## `npm run demo:outbox` — the happy path, and the key that holds it
@@ -1578,7 +1595,7 @@ SELECT … FROM outbox
  WHERE published_at IS NULL
  ORDER BY created_at, id
    FOR UPDATE SKIP LOCKED
- LIMIT 100;
+ LIMIT 10;
 ```
 
 **`SKIP LOCKED`, not a bare `FOR UPDATE`.** Both give zero duplicates. A plain `FOR UPDATE`
@@ -1602,6 +1619,18 @@ can have.
 **The mark is inside the claiming transaction**, because the lock lives until that
 transaction ends. Marking in a second transaction would release the row to another relay
 while this one was still publishing it.
+
+**A publish that fails stops the pass; it does not roll it back.** The rows already marked
+are committed, the failed row keeps `published_at IS NULL`, and the rest release their
+locks unpublished. Rolling the batch back — which is what this did until the review of #22
+— would un-mark rows the pass had genuinely delivered and send every one of them again for
+somebody else's failure. Measured on five rows with a publisher that refuses the third:
+`marked=2 unmarked=3`, where a rollback gave `marked=0 unmarked=5`.
+
+What no transaction prevents is a relay that is _killed_ mid-pass: everything published and
+not yet marked goes again. That is the duplicate this design exists to pay for, and the
+batch size is its blast radius — hence **ten**, not a hundred. A transaction per row would
+make it zero and cost a round trip per row.
 
 ## Three levels of idempotency, and the one that is not a level
 
@@ -1628,9 +1657,15 @@ recorded as handled whose effect never happened, and no redelivery repairs it.
 
 The outbox grows with every order and drags `outbox_unpublished_idx` — the partial index
 the relay's own query depends on — behind it. So the relay deletes carried-out rows older
-than an hour in the same pass it finds nothing new to do. Doing it there rather than from a
-cron is what makes this paragraph true rather than aspirational; the alternatives are a
+than an hour, **on a timer**, once a minute. Doing it in the relay rather than from a cron
+is what makes this paragraph true rather than aspirational; the alternatives are a
 background job and partitioning, and both are more machinery than one `DELETE`.
+
+On a timer and not "whenever a pass finds nothing to do", which is what it was until the
+review of #22. A busy relay never has an idle pass, so tying cleanup to idleness tidies the
+table exactly when it is not growing and leaves it alone exactly when it is. A failed
+cleanup is counted and ignored: deleting old rows says nothing about this relay's ability
+to carry events, and a statement timeout against it must not stop the courier.
 
 An hour rather than "immediately after publish" because a row just carried out is the only
 record of what was sent, and it is worth having when somebody asks why a consumer saw what
@@ -1662,6 +1697,243 @@ the disk by Monday and stop the database.
 | [`src/messaging/repositories/processed-messages.repository.ts`](src/messaging/repositories/processed-messages.repository.ts) | the inbox; the mark shares the effect's transaction       |
 | [`src/orders/repositories/idempotency-keys.repository.ts`](src/orders/repositories/idempotency-keys.repository.ts)           | reserve before, complete inside                           |
 | [`src/messaging/utils/order-placed.mapper.ts`](src/messaging/utils/order-placed.mapper.ts)                                   | the payload, written by hand so the schema is not the API |
+
+---
+
+# Redis: кеш, сесії, ліміти, черга — HW-23
+
+Four jobs that any backend ends up doing, and one sentence that decides how seriously to
+take each of them: **Redis does not make the system correct — it makes it fast.** The
+stampede lock below is an optimisation. If it breaks, the database is asked twice and
+somebody pays a fraction of a cent. The same `SET NX PX` guarding a business invariant
+would be paying for broken state instead, which is why no invariant in this repository is
+guarded by one.
+
+```bash
+npm run demo:cache       # 50 readers on a vanished key -> one query
+npm run demo:session     # three requests, one session, an expiry that moves
+npm run demo:ratelimit   # two instances, one allowance, 429 + Retry-After
+npm run demo:queue       # retries, deduplicates, and comes back on its own
+```
+
+## Two Redis instances, and why that is not a preference
+
+A cache has to be allowed to throw things away: `maxmemory` with `allkeys-lru`. On the
+stock configuration — `maxmemory 0`, policy `noeviction` — a cache does not get slower as
+it fills, it starts **refusing writes** with `OOM command not allowed when used memory >
+'maxmemory'`. If `cacheSet()` is not wrapped, that exception surfaces in a customer's
+request, and a cache that drops requests is not a cache.
+
+BullMQ's documentation asks for the exact opposite — it "cannot work properly if Redis
+evicts keys arbitrarily" — and so does anything else nobody is allowed to lose. Those two
+settings cannot coexist, because `maxmemory-policy` belongs to a **process** rather than to
+a database: `SELECT 1` does not separate them. Hence two containers.
+
+| Instance      | Port  | Policy                          | What lives there                          |
+| ------------- | ----- | ------------------------------- | ----------------------------------------- |
+| `redis-cache` | 26379 | `allkeys-lru`, `maxmemory 64mb` | product cards, single-flight locks        |
+| `redis-queue` | 26380 | `noeviction`, AOF `everysec`    | BullMQ, session state, rate-limit windows |
+
+**Sessions are not in the cache instance, and that is the point of the split.** An LRU
+picks its victim from a sample of five with no idea what the key means; a busy minute would
+log people out at random, producing an incident with no pattern and no reproduction. The
+rate-limit windows are there for a related reason: an evicted counter does not slow the
+limiter down, it silently raises the limit.
+
+## `npm run demo:cache` — what a cache buys, and what a crowd costs
+
+```
+cache-lru=1
+cache-maxmemory=1
+warmed=60
+ttl-distinct=42
+concurrent=50
+db-calls=1
+db-calls-warm=0
+```
+
+```
+cache instance: maxmemory-policy=allkeys-lru maxmemory=67108864
+warmed 60 keys; TTLs span 300..356 s
+50 simultaneous readers on a key that had just vanished:
+  roles: leader=1 follower=49
+```
+
+The cached read is `GET /products/{id}`, and it is cached because it is genuinely
+expensive: the card is a join against `order_items` and an aggregate over every line that
+ever named this product, so its cost grows with the history of the shop rather than with
+the size of the catalogue. `db-calls-warm=0` is a hundred reads of a warm card that never
+reach Postgres.
+
+**`ttl-distinct=42` is the jitter.** Sixty keys warmed by one loop, written within
+milliseconds of each other — with a fixed TTL they would expire within milliseconds of each
+other too, and the whole set would arrive at the database in the same second. The TTL is
+`300 + floor(random() * 60)`, so they come apart across forty-two different seconds.
+Without it that number is 1. The lock protects one key from a crowd; the jitter stops the
+keys from agreeing on a time, and it costs nothing.
+
+**`db-calls=1` is the single-flight lock.** Fifty readers arrive on a key that has just
+disappeared; one takes `SET lock:<key> <token> NX PX 3000`, loads, publishes, releases. The
+other forty-nine poll the cache and find the value the moment the leader writes it —
+`leader=1 follower=49`. None of those fifty has a bug: each saw a miss and honestly went to
+load, which is exactly why a stampede is not something code review finds.
+
+The lock is released by **comparing**, never by deleting:
+
+```lua
+if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end
+```
+
+A bare `DEL` does not ask whose lock it is. Between "my lock expired" and "I am releasing
+it" there is room for somebody else's `SET … NX` to succeed, and the `DEL` deletes _their_
+lock. Redis 8.4 added `DELEX key IFEQ <token>` for this; the Lua above does the same thing
+on any version, and it is atomic for the reason every Lua script here is — the server is
+single-threaded, so while it runs nobody else gets in.
+
+### What happens when the stampede lock breaks
+
+It is worth being exact, because the answer is the reason this design is allowed at all.
+
+The lock fails in three ways. **Redis is unreachable** — every reader becomes a `fallback`
+and goes to Postgres, which is the behaviour the service had before any of this existed.
+**The leader is slower than `LOCK_TTL_MS`** — a second leader starts and the query runs
+twice. **The leader dies after taking the lock** — its followers wait out the lock's three
+seconds and then load for themselves.
+
+Every one of those outcomes is _extra queries_. None of them is a wrong answer, a lost
+write or a corrupted row, because the cache is not where any fact lives: Postgres is, and
+the cache has a TTL on every entry precisely so that being wrong is always temporary. The
+bill for a broken lock is measured in database CPU and a slower page, and the honest
+response is a metric and a shrug.
+
+That is **not** true of a lock around a business invariant. If `SET NX PX` were what stops
+two checkouts from selling the same last unit, the same three failures would mean overselling
+— and no retry repairs stock that was promised twice. Which is why this repository does not
+do that: stock is held by `UPDATE … WHERE in_stock >= $n` and a `CHECK` constraint (#14),
+duplicate orders by a unique key (#22), and duplicate deliveries by a primary key (#19).
+A distributed lock reduces the _probability_ of a duplicate; idempotency makes the duplicate
+_not matter_. The lock does not survive a process pause longer than its own TTL — nothing
+short of a fencing token the storage itself checks does — and the only reason that is
+tolerable here is that there is nothing to corrupt.
+
+## `npm run demo:session` — who came, between requests
+
+```
+requests=3
+sessions=1
+in-redis=1
+ttl-renewed=1
+```
+
+```
+request 1: requests=1 ttl -2s -> 30s
+request 2: requests=2 ttl 28s -> 30s
+request 3: requests=3 ttl 28s -> 30s
+read back through a fresh connection: 3 request(s), first seen 2026-10-22T16:00:58.548Z
+```
+
+There is no authentication yet — that is #24 — so the session is the state behind the claim
+#18 already declares: `X-User-Id` says who the client _claims_ to be, and `sess:<id>` is
+where "the same person is still here" lives between requests. When the claim becomes a
+verified identity, this store does not change.
+
+**Rolling, not absolute.** Every request pushes the expiry back, which is why the demo waits
+two seconds between them: renewing a TTL that has not visibly shrunk proves nothing, and
+three requests fired in the same millisecond is the usual way this requirement gets passed
+without being met. The renewal and the counter move together in one `MULTI` — for a session
+held as a plain string `GETEX key EX n` does read-and-renew in a single command, and Redis
+7.4 added `HEXPIRE` for a TTL on one hash field.
+
+The last line reads the session back through a **connection opened afterwards**, which is
+the closest a single process gets to asking "would this have survived a restart?". A `Map`
+in the process answers that question with silence.
+
+## `npm run demo:ratelimit` — one allowance, two instances
+
+```
+instances=2
+limit=5
+requests=12
+allowed=5
+blocked=7
+status=429
+retry-after=1
+```
+
+The demo raises **two** limiters with two connections and spends the allowance across both,
+because that is the only arrangement that can catch the common mistake. A counter in process
+memory would let each of them through five times — `allowed = 2 × limit` — while every local
+test stayed green, since locally there is one process. `@nestjs/throttler` counts in memory
+by default.
+
+**A sliding window**, and the question behind that choice is always the same: do we allow a
+burst? A fixed window does, by construction — five requests at 12:00:59 and five more at
+12:01:00 are ten in 320 ms against a limit of five, because the counter resets on a
+wall-clock boundary rather than relative to the caller. Here the limit exists to stop one
+client eating the service, so a sanctioned 2× burst every minute is the wrong default and
+the sorted set is worth its memory. A token bucket would be right if bursts were _wanted_.
+
+The window is **one Lua script**, not `ZREMRANGEBYSCORE` → `ZCARD` → `ZADD` from the
+application. Written as three commands, a second process fits between the count and the
+add: both read "four used, limit five", both add, and six requests pass a limit of five. The
+leak appears exactly under load, which is the only time the limit matters. Note the
+difference from the cache lock — there atomicity was an optimisation; here it is the
+correctness of the limit.
+
+The refusal is a `429` with `Retry-After`, and both are in the contract. That is not
+decoration: `validateResponses: true` has been on since #09, so a 429 the spec did not
+declare would be rejected by the validator before it reached the client. The guard throws a
+`ProblemError`, which travels back through `ProblemFilter` and therefore through the
+validator — the declaration checks the implementation rather than describing it.
+
+## `npm run demo:queue` — retries, deduplicates, comes back on its own
+
+```
+queue-noeviction=1
+attempts=3
+completed=1
+added=2
+queued=1
+schedulers=1
+scheduled-runs=2
+```
+
+The queue carries work that must happen but must not happen inside an HTTP request:
+recomputing a product card after an order moved its stock. Placing an order enqueues a
+refresh per line and answers the customer immediately.
+
+**That enqueue is best effort, deliberately.** Every cache entry carries a TTL, so a refresh
+that never happens costs staleness bounded by five minutes. Explicit invalidation is an
+optimisation layered on an expiry and never a replacement for one — which is the opposite of
+the outbox in #22, where losing the write would have lost a fact.
+
+Three BullMQ details that are easy to get wrong:
+
+- **`jobId` deduplicates** — two orders for the same product while the first refresh is
+  still waiting produce one job, not two. `added=2 queued=1`.
+- **`removeOnComplete` is an age, never `true`.** Deduplication is against jobs that still
+  exist, so removing a job the instant it completes removes the record that made the next
+  identical `add` a duplicate. The documentation says so outright.
+- **`upsertJobScheduler`, not `add` with a repeat option.** A scheduler is identified by its
+  name, so a restart replaces it instead of adding a second one. The repeatable-job API that
+  half the internet still teaches was removed in BullMQ 6.
+
+`attempts=3` is a handler that failed twice and succeeded on the third try, on the options
+production uses: exponential backoff **with jitter**, for the same reason the TTL has it —
+without it every job that failed during one blip retries at the same instant and reproduces
+the blip.
+
+## Where things are
+
+| Path                                                                                                   | What                                                        |
+| ------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------- |
+| [`src/cache/services/single-flight.service.ts`](src/cache/services/single-flight.service.ts)           | `SET NX PX`, the follower loop, compare-and-delete          |
+| [`src/cache/services/product-card-cache.service.ts`](src/cache/services/product-card-cache.service.ts) | cache-aside, TTL with jitter, every failure swallowed       |
+| [`src/ratelimit/constants/lua.constant.ts`](src/ratelimit/constants/lua.constant.ts)                   | the sliding window, in one script                           |
+| [`src/sessions/services/session-store.service.ts`](src/sessions/services/session-store.service.ts)     | rolling TTL, on the instance that may not evict             |
+| [`src/queue/constants/queue.constant.ts`](src/queue/constants/queue.constant.ts)                       | attempts, backoff with jitter, `removeOnComplete` as an age |
+| [`src/queue/cli/cards-worker.ts`](src/queue/cli/cards-worker.ts)                                       | the worker process, and where the scheduler is installed    |
+| [`docker-compose.yml`](docker-compose.yml)                                                             | the two instances, with their policies on the command line  |
 
 ---
 
@@ -1826,9 +2098,16 @@ production. Nothing outside that schema touches `process.env`.
 | `NODE_ENV`         | no       | `development`           | environment                                                                                                | `development` \| `test` \| `production`            |
 | `PORT`             | no       | `3000`                  | environment                                                                                                | HTTP port                                          |
 | `DATABASE_URL`     | **yes**  | —                       | **secrets store for the credential**; host and role from `docker-compose.yml` (dev/prod) or `.env` (local) | where the database is and which role to connect as |
+| `REDIS_URL`        | **yes**  | —                       | **secrets store**; the dev stand's value is in `docker-compose.yml`                                        | the cache instance — `allkeys-lru`                 |
+| `REDIS_QUEUE_URL`  | **yes**  | —                       | **secrets store**; the dev stand's value is in `docker-compose.yml`                                        | the queue instance — `noeviction`                  |
 | `DB_PASSWORD_FILE` | no       | `./secrets/db_password` | **secrets store** — the file itself, rotated by `rotate.sh`                                                | path to the file holding the password              |
 | `DB_POOL_MAX`      | no       | `10`                    | environment                                                                                                | maximum pooled connections                         |
 | `LOG_LEVEL`        | no       | `log`                   | environment                                                                                                | `error` \| `warn` \| `log` \| `debug` \| `verbose` |
+
+Both Redis addresses **are** in that table, unlike `BROKER_URL`: this service reads through
+a cache, counts its rate limit and remembers who came between requests on every request it
+serves, so a deployment without them is not a degraded deployment but a different one. The
+E2E suite raises its own Redis for exactly that reason.
 
 **`BROKER_URL` is deliberately not in that table.** Since #22 the HTTP service does not
 talk to a broker at all — placing an order is one transaction against one database — so the
@@ -1967,6 +2246,7 @@ npm run verify:provider    # the real service against that contract
 ```bash
 npm run start:relay        # outbox -> broker; SIGTERM finishes the pass in flight
 npm run start:worker       # broker -> effect; SIGTERM finishes what it holds
+npm run start:cards        # recomputes product cards; installs the periodic warmer
 
 npm run demo:publish       # RabbitMQ: 5 orders -> 5 events -> 5 effects
 npm run demo:dlq           # a poison message and the contour it leaves by
@@ -1982,6 +2262,7 @@ left running alongside one will take rows and messages the demo is counting. Sto
 first.
 
 The stack also runs in Docker: `docker compose up -d --wait` raises the data layer, RabbitMQ
-(AMQP on 25672, management UI on <http://localhost:25673>) and the Pact broker, `docker compose --profile app up -d` adds the service with hot-reload
+(AMQP on 25672, management UI on <http://localhost:25673>), the two Redis instances (26379
+cache, 26380 queue) and the Pact broker, `docker compose --profile app up -d` adds the service with hot-reload
 alongside Postgres 17, and `docker compose -f docker-compose.yml --profile app up -d --build`
 is the production path.

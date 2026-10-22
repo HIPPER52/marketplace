@@ -43,6 +43,62 @@ services:
       db:
         condition: service_healthy
 
+  # Two Redis instances, and the second one is not a luxury.
+  #
+  # A cache needs `maxmemory` with `allkeys-lru`: without a limit Redis grows until the
+  # machine says no, and with the stock `noeviction` policy a full cache does not get
+  # slower — it starts **refusing writes** with "OOM command not allowed when used memory >
+  # 'maxmemory'". A queue needs the exact opposite: BullMQ's own documentation says it
+  # "cannot work properly if Redis evicts keys arbitrarily", so its instance must be
+  # `noeviction`.
+  #
+  # Those two settings cannot coexist in one process. `maxmemory-policy` is per instance,
+  # not per database, so `SELECT 1` does not separate them — which is why this is two
+  # containers rather than two logical databases.
+  redis-cache:
+    image: redis:8-alpine
+    # Set on the command line rather than in a mounted redis.conf: there are two settings,
+    # both load-bearing, and a reader of this file should see them without opening another.
+    command:
+      ["redis-server", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru", "--save", ""]
+    ports:
+      # 26379 and 26380, following 25432/26432/25672. Deliberately outside 22300-22399,
+      # which is the lecture stand's range — the two must be able to run side by side.
+      - "26379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+  # The queue's instance, and where session state lives too. Both have the same
+  # requirement — nobody may evict them — and a session thrown out by an LRU is a logout
+  # nobody can reproduce.
+  redis-queue:
+    image: redis:8-alpine
+    # AOF with `everysec`: a queue that forgets its jobs on restart is a queue that loses
+    # work, and one second of exposure is the usual trade. `maxmemory` is deliberately
+    # absent — see the policy below; a limit without eviction is a write that fails.
+    command:
+      [
+        "redis-server",
+        "--maxmemory-policy",
+        "noeviction",
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "everysec",
+      ]
+    ports:
+      - "26380:6379"
+    volumes:
+      - redisqueuedata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
   # RabbitMQ: the broker that keeps an event until somebody is there to take it. #18's
   # WebSocket delivered to whoever happened to be connected — no receiver, no delivery.
   # This one stores the message first and worries about readers afterwards, which is the
@@ -152,3 +208,4 @@ volumes:
   pgdata:
   pactbrokerdata:
   rabbitmqdata:
+  redisqueuedata:

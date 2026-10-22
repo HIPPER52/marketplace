@@ -1,5 +1,9 @@
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 import type { CreateOrderRequest } from '../../common/types/api.types';
+import {
+    CARD_REFRESH_QUEUE,
+    type CardRefreshQueue,
+} from '../../queue/types/card-refresh-queue.types';
 import { DEMO_BUYER_ID } from '../../users/constants/demo-buyer.constant';
 import { CheckoutOutcome, KeyClaimOutcome, PlaceOrderOutcome } from '../constants/outcome.constant';
 import type { CheckoutResult } from '../types/checkout.types';
@@ -39,6 +43,7 @@ export class PlaceOrderService {
     constructor(
         private readonly idempotency: IdempotencyRegistry,
         private readonly checkout: CheckoutService,
+        @Inject(CARD_REFRESH_QUEUE) private readonly cards: CardRefreshQueue,
     ) {}
 
     async place(input: { key: string; body: CreateOrderRequest }): Promise<PlaceOrderResult> {
@@ -76,6 +81,15 @@ export class PlaceOrderService {
                 await this.idempotency.release(input.key);
 
                 return { outcome: PlaceOrderOutcome.Refused, result };
+            }
+
+            // The order moved this product's stock and its sales totals, so the cached
+            // card is now wrong. Queued rather than recomputed here: the customer should
+            // not wait for a join and an aggregate, and a refresh that never happens costs
+            // staleness bounded by the TTL — explicit invalidation on top of an expiry,
+            // never instead of one.
+            for (const line of input.body.items) {
+                await this.cards.refresh(line.product_id);
             }
 
             return { outcome: PlaceOrderOutcome.Created, orderId: result.orderId };
