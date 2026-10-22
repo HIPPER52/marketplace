@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { DATA_SOURCE } from '../database/constants/database.constants';
 import { MessagingModule } from '../messaging/messaging.module';
 import { OutboxRepository } from '../messaging/repositories/outbox.repository';
+import { QueueModule } from '../queue/queue.module';
 import { OrdersController } from './controllers/orders.controller';
 import { OrdersGateway } from './gateways/orders.gateway';
 import { OrdersRepository } from './repositories/orders.repository';
@@ -13,7 +14,7 @@ import { OrderStatusService } from './services/order-status.service';
 import { PlaceOrderService } from './services/place-order.service';
 
 @Module({
-    imports: [MessagingModule],
+    imports: [MessagingModule, QueueModule],
     controllers: [OrdersController],
     providers: [
         IdempotencyRegistry,

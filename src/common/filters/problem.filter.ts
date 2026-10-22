@@ -1,6 +1,6 @@
 import { type ArgumentsHost, Catch, type ExceptionFilter, HttpException } from '@nestjs/common';
 import type { Request, Response } from 'express';
-import { describe, ProblemType, TITLE_BY_STATUS } from '../errors/problem.error';
+import { describe, ProblemError, ProblemType, TITLE_BY_STATUS } from '../errors/problem.error';
 
 @Catch()
 export class ProblemFilter implements ExceptionFilter {
@@ -11,6 +11,12 @@ export class ProblemFilter implements ExceptionFilter {
 
         const body =
             exception instanceof HttpException ? fromHttpException(exception) : describe(exception);
+
+        if (exception instanceof ProblemError) {
+            // The contract declares Retry-After on a 429 as required, and a header set
+            // after the body has been written is a header nobody receives.
+            response.set(exception.headers);
+        }
 
         response
             .status(body.status)

@@ -9,6 +9,7 @@ export const ProblemType = {
     unprocessable: `${BASE}/unprocessable-entity`,
     idempotencyConflict: `${BASE}/idempotency-key-conflict`,
     idempotencyInFlight: `${BASE}/idempotency-key-in-flight`,
+    rateLimited: `${BASE}/too-many-requests`,
     internal: `${BASE}/internal-error`,
 } as const;
 
@@ -16,13 +17,28 @@ export class ProblemError extends Error {
     readonly status: number;
     readonly type: string;
     readonly title: string;
+    /**
+     * Headers the answer must carry.
+     *
+     * One case needs it and the contract says so: a 429 declares `Retry-After` as
+     * required, and a refusal that does not say when to come back is a refusal the client
+     * can only answer by guessing.
+     */
+    readonly headers: Record<string, string>;
 
-    constructor(args: { status: number; type: string; title: string; detail: string }) {
+    constructor(args: {
+        status: number;
+        type: string;
+        title: string;
+        detail: string;
+        headers?: Record<string, string>;
+    }) {
         super(args.detail);
         this.name = 'ProblemError';
         this.status = args.status;
         this.type = args.type;
         this.title = args.title;
+        this.headers = args.headers ?? {};
     }
 }
 
@@ -31,6 +47,7 @@ export const TITLE_BY_STATUS: Record<number, { title: string; type: string }> = 
     403: { title: 'Forbidden', type: ProblemType.forbidden },
     404: { title: 'Resource not found', type: ProblemType.notFound },
     422: { title: 'Unprocessable entity', type: ProblemType.unprocessable },
+    429: { title: 'Too many requests', type: ProblemType.rateLimited },
 };
 
 export function describe(error: unknown): Omit<Problem, 'instance'> {

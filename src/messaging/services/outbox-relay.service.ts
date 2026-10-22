@@ -1,5 +1,10 @@
 import type { DataSource } from 'typeorm';
-import { OUTBOX_RETENTION_MS, RELAY_BATCH, RELAY_IDLE_MS } from '../constants/outbox.constant';
+import {
+    OUTBOX_RETENTION_MS,
+    PRUNE_INTERVAL_MS,
+    RELAY_BATCH,
+    RELAY_IDLE_MS,
+} from '../constants/outbox.constant';
 import { OutboxRepository } from '../repositories/outbox.repository';
 import type { PendingOutboxRecord } from '../types/outbox.types';
 import { sleep } from '../utils/wait.util';
@@ -16,6 +21,8 @@ export interface RelayTally {
     failed: number;
     /** Carried-out rows deleted as too old to be of further interest. */
     pruned: number;
+    /** Cleanup passes that failed. Maintenance, so they do not stop the courier. */
+    pruneFailed: number;
 }
 
 export interface RelayOptions {
@@ -62,10 +69,14 @@ export interface RelayOptions {
  * connection and the row is immediately claimable again. Marking in a second transaction
  * would hand the row to another relay while this one was still publishing it.
  *
- * A failure anywhere in the batch rolls the whole batch back, so rows published earlier in
- * the same pass are published again later. That is deliberate: a smaller blast radius
- * would need a transaction per row, which is a round trip per row for a problem the
- * consumer already solves.
+ * A publish that fails **stops** the pass rather than rolling it back: the rows already
+ * marked are committed, the failed row keeps `published_at IS NULL`, and the rest release
+ * their locks unpublished. Rolling back would have un-marked rows this pass genuinely
+ * delivered and sent every one of them a second time for somebody else's failure.
+ *
+ * What no transaction can prevent is a relay that is *killed* mid-pass: everything it
+ * published and had not yet marked goes again. That is the duplicate this whole design
+ * pays for, and the batch size is its blast radius — see RELAY_BATCH.
  */
 export class OutboxRelay {
     readonly tally: RelayTally = {
@@ -74,6 +85,7 @@ export class OutboxRelay {
         marked: 0,
         failed: 0,
         pruned: 0,
+        pruneFailed: 0,
     };
 
     private readonly outbox = new OutboxRepository();
@@ -93,39 +105,43 @@ export class OutboxRelay {
         let published = 0;
         let failedRow: string | null = null;
 
-        try {
-            await this.dataSource.transaction(async (manager) => {
-                const rows = await this.outbox.claimBatch(manager, this.batch);
-                this.tally.claimed += rows.length;
+        await this.dataSource.transaction(async (manager) => {
+            const rows = await this.outbox.claimBatch(manager, this.batch);
+            this.tally.claimed += rows.length;
 
-                for (const row of rows) {
-                    try {
-                        await this.publisher.publish({
-                            id: row.id,
-                            type: row.type,
-                            payload: row.payload,
-                        });
-                    } catch (error: unknown) {
-                        failedRow = row.id;
-                        throw error;
-                    }
-
-                    this.tally.published += 1;
-                    published += 1;
-
-                    await this.options.onPublished?.(row);
-
-                    await this.outbox.markPublished(manager, row.id);
-                    this.tally.marked += 1;
+            for (const row of rows) {
+                try {
+                    await this.publisher.publish({
+                        id: row.id,
+                        type: row.type,
+                        payload: row.payload,
+                    });
+                } catch (error: unknown) {
+                    // Stop the pass and **commit what is already marked**, rather than
+                    // throwing and rolling the batch back. A rollback would un-mark rows
+                    // this pass had genuinely published, and every one of them would be
+                    // delivered a second time for a failure that had nothing to do with
+                    // them. This row keeps `published_at IS NULL` and is claimed again
+                    // next pass, which is exactly the intended behaviour; the rows after
+                    // it were never published and simply release their locks.
+                    failedRow = row.id;
+                    break;
                 }
-            });
-        } catch (error: unknown) {
-            if (failedRow === null) {
-                throw error;
-            }
 
-            // Its own statement, outside the transaction that just rolled back — that
-            // transaction would have taken the count with it.
+                this.tally.published += 1;
+                published += 1;
+
+                await this.options.onPublished?.(row);
+
+                await this.outbox.markPublished(manager, row.id);
+                this.tally.marked += 1;
+            }
+        });
+
+        if (failedRow !== null) {
+            // After the commit, not inside it: the attempt is a fact about a row this pass
+            // deliberately left unpublished, and counting it in the same transaction would
+            // be fine — but doing it here keeps the transaction to the one job it has.
             this.tally.failed += 1;
             await this.outbox.recordAttempt(this.dataSource.manager, failedRow);
         }
@@ -153,14 +169,34 @@ export class OutboxRelay {
      * mechanism to keep correct, and the poll has to stay anyway as the thing that catches
      * a row whose notification was missed.
      */
-    async run(intervalMs = RELAY_IDLE_MS): Promise<void> {
+    async run(intervalMs = RELAY_IDLE_MS, pruneEveryMs = PRUNE_INTERVAL_MS): Promise<void> {
         this.running = true;
+
+        // Zero rather than `Date.now()`: a relay starting after downtime should tidy up
+        // before it settles into its rhythm, not a minute later.
+        let prunedAt = 0;
 
         while (this.running) {
             const moved = await this.drainOnce();
 
+            // On a timer, not on an idle pass. Cleanup used to happen only when a pass
+            // found nothing to do, which means a relay under sustained load never ran it —
+            // the table was tidied exactly when it was not growing and left alone exactly
+            // when it was.
+            if (Date.now() - prunedAt >= pruneEveryMs) {
+                prunedAt = Date.now();
+
+                try {
+                    await this.prune();
+                } catch {
+                    // Deleting old rows is maintenance. A statement timeout or a deadlock
+                    // against it says nothing about this relay's ability to carry events,
+                    // so it is counted and the loop goes on; the next timer tries again.
+                    this.tally.pruneFailed += 1;
+                }
+            }
+
             if (moved === 0) {
-                await this.prune();
                 await sleep(intervalMs);
             }
         }

@@ -4,6 +4,21 @@ import { KeyClaimOutcome } from '../constants/outcome.constant';
 /** How long a reservation nobody completed is honoured before another request may take it. */
 export const RESERVATION_STALE_MS = 60_000;
 
+/**
+ * How many times `claim` re-reads a key that vanished under it.
+ *
+ * The reservation is taken in one statement and read back in another, and between them a
+ * different request can release the key it was holding — a checkout that refused deletes
+ * its reservation. The INSERT then says "somebody has it" and the SELECT says "nobody
+ * does", and the only sensible response is to ask again.
+ *
+ * Bounded, because "ask again" written as recursion is a stack that grows for as long as
+ * two callers keep missing each other, and an unbounded retry loop around two round trips
+ * is a request that never answers. Three is already generous: each attempt needs a fresh
+ * delete to land in the same microsecond-wide window.
+ */
+const CLAIM_ATTEMPTS = 3;
+
 export type KeyClaim =
     | { outcome: typeof KeyClaimOutcome.Claimed }
     | { outcome: typeof KeyClaimOutcome.Replay; orderId: string }
@@ -39,40 +54,50 @@ export class IdempotencyKeysRepository implements IdempotencyCompleter {
      * it gets a 422 rather than a quiet takeover.
      */
     async claim(key: string, requestHash: string): Promise<KeyClaim> {
-        const claimed = await this.dataSource.query<{ key: string }[]>(
-            `INSERT INTO idempotency_keys (key, request_hash)
-             VALUES ($1, $2)
-             ON CONFLICT (key) DO UPDATE
-                SET created_at = now()
-              WHERE idempotency_keys.order_id IS NULL
-                AND idempotency_keys.created_at < now() - make_interval(secs => $3)
-                AND idempotency_keys.request_hash = EXCLUDED.request_hash
-             RETURNING key`,
-            [key, requestHash, RESERVATION_STALE_MS / 1000],
-        );
+        // A loop rather than recursion: the bound is visible, the stack does not grow, and
+        // there is one obvious place to say what happens when the attempts run out.
+        for (let attempt = 1; attempt <= CLAIM_ATTEMPTS; attempt += 1) {
+            const claimed = await this.dataSource.query<{ key: string }[]>(
+                `INSERT INTO idempotency_keys (key, request_hash)
+                 VALUES ($1, $2)
+                 ON CONFLICT (key) DO UPDATE
+                    SET created_at = now()
+                  WHERE idempotency_keys.order_id IS NULL
+                    AND idempotency_keys.created_at < now() - make_interval(secs => $3)
+                    AND idempotency_keys.request_hash = EXCLUDED.request_hash
+                 RETURNING key`,
+                [key, requestHash, RESERVATION_STALE_MS / 1000],
+            );
 
-        if (claimed.length === 1) {
-            return { outcome: KeyClaimOutcome.Claimed };
+            if (claimed.length === 1) {
+                return { outcome: KeyClaimOutcome.Claimed };
+            }
+
+            const rows = await this.dataSource.query<
+                { request_hash: string; order_id: string | null }[]
+            >('SELECT request_hash, order_id FROM idempotency_keys WHERE key = $1', [key]);
+            const held = rows[0];
+
+            if (held === undefined) {
+                // Released between the two statements — a first attempt that refused and
+                // deleted its reservation. Asking again is the right answer, not an error.
+                continue;
+            }
+
+            if (held.request_hash !== requestHash) {
+                return { outcome: KeyClaimOutcome.Conflict };
+            }
+
+            return held.order_id === null
+                ? { outcome: KeyClaimOutcome.InFlight }
+                : { outcome: KeyClaimOutcome.Replay, orderId: held.order_id };
         }
 
-        const rows = await this.dataSource.query<
-            { request_hash: string; order_id: string | null }[]
-        >('SELECT request_hash, order_id FROM idempotency_keys WHERE key = $1', [key]);
-        const held = rows[0];
-
-        if (held === undefined) {
-            // Deleted between the two statements — a first attempt that refused and
-            // released its key. Asking again is the right answer, not an error.
-            return this.claim(key, requestHash);
-        }
-
-        if (held.request_hash !== requestHash) {
-            return { outcome: KeyClaimOutcome.Conflict };
-        }
-
-        return held.order_id === null
-            ? { outcome: KeyClaimOutcome.InFlight }
-            : { outcome: KeyClaimOutcome.Replay, orderId: held.order_id };
+        // Three times in a row the key was taken when we tried to insert and gone when we
+        // looked. Something is holding and releasing it in a tight loop; the honest answer
+        // is the one that asks the caller to come back, which is what the route turns into
+        // "retry in a moment" rather than inventing an order.
+        return { outcome: KeyClaimOutcome.InFlight };
     }
 
     /**

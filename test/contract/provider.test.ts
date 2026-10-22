@@ -5,6 +5,7 @@ import { Verifier, type VerifierOptions } from '@pact-foundation/pact';
 import { Currency } from '../../src/common/constants/currency.constant';
 import { configureApp } from '../../src/common/utils/configure-app.util';
 import { type PgHandle, seatDemoBuyer, startPg, truncateAll } from '../testkit/pg-container';
+import { type RedisHandle, startRedis } from '../testkit/redis-container';
 import {
     KNOWN_PRODUCT_ID,
     MISSING_PRODUCT_ID,
@@ -26,21 +27,27 @@ import {
  * the result is published back to it, which is what makes can-i-deploy able to answer.
  */
 let pg: PgHandle;
+let redis: RedisHandle;
 let app: INestApplication;
 let port: number;
 
 beforeAll(async () => {
     pg = await startPg('(provider)');
+    redis = await startRedis('(provider)');
 
     process.env.NODE_ENV = 'test';
     process.env.DATABASE_URL = pg.env.DATABASE_URL;
     process.env.DB_PASSWORD_FILE = pg.env.DB_PASSWORD_FILE;
 
+    // Redis is required, so the suite supplies one rather than pointing the application at
+    // a developer's stand — a test that wrote into the machine's own cache would be a test
+    // whose result depended on what else had run that day.
+    process.env.REDIS_URL = redis.cacheUrl;
+    process.env.REDIS_QUEUE_URL = redis.queueUrl;
+
     // No broker variable here, and none needed. Since #22 the application does not talk to
     // a broker at all: placing an order writes an `outbox` row in the same transaction, and
     // carrying that row to RabbitMQ belongs to `npm run start:relay`, a different process.
-    // The suite that used to point this at a dead address to stop a developer's stand from
-    // receiving real events now has nothing to point.
 
     const { AppModule } = await import('../../src/app.module');
     const moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
@@ -57,6 +64,7 @@ beforeAll(async () => {
 afterAll(async () => {
     await app.close();
     await pg.stop();
+    await redis.stop();
 });
 
 /**

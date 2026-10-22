@@ -72,13 +72,18 @@ paths:
                 $ref: "#/components/schemas/ProductPage"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
 
   /products/{productId}:
     get:
       tags: [Products]
       operationId: getProduct
       summary: Get a product by id
-      description: Returns a single product from the catalogue.
+      description: >
+        Returns a single product together with what has been sold of it. The totals are an
+        aggregate over every order line that ever named this product, which makes this the
+        most expensive read in the contract — and the reason it is served from a cache.
       parameters:
         - name: productId
           in: path
@@ -89,15 +94,17 @@ paths:
             format: uuid
       responses:
         "200":
-          description: The requested product.
+          description: The requested product and its sales totals.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/Product"
+                $ref: "#/components/schemas/ProductCard"
         "400":
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
 
   /orders:
     get:
@@ -137,6 +144,8 @@ paths:
                 $ref: "#/components/schemas/OrderPage"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
 
     post:
       tags: [Orders]
@@ -185,6 +194,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "422":
           $ref: "#/components/responses/UnprocessableEntity"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
 
   /orders/{orderId}:
     get:
@@ -211,6 +222,8 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
 
     patch:
       tags: [Orders]
@@ -248,6 +261,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "422":
           $ref: "#/components/responses/UnprocessableEntity"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
 
   /orders/{orderId}/events:
     get:
@@ -306,6 +321,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
 
 components:
   responses:
@@ -332,6 +349,22 @@ components:
 
     UnprocessableEntity:
       description: The request is well-formed but cannot be processed.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+    TooManyRequests:
+      description: >
+        The caller has spent its allowance for the current window. The limit is counted in
+        shared storage, so every instance of this service enforces the same one.
+      headers:
+        Retry-After:
+          description: Whole seconds to wait before the allowance frees up (RFC 6585).
+          required: true
+          schema:
+            type: integer
+            minimum: 1
       content:
         application/problem+json:
           schema:
@@ -388,6 +421,27 @@ components:
           minimum: 0
           description: Units currently available.
           example: 7
+
+    ProductCard:
+      description: >
+        A product plus what has been sold of it. Separate from `Product` because the totals
+        cost a join and an aggregate over every order line, and a list of twenty of them
+        would pay that twenty times.
+      allOf:
+        - $ref: "#/components/schemas/Product"
+        - type: object
+          required: [units_sold, revenue_cents]
+          properties:
+            units_sold:
+              type: integer
+              minimum: 0
+              description: Units of this product across every order ever placed.
+              example: 12
+            revenue_cents:
+              type: integer
+              minimum: 0
+              description: What those units came to, in minor units.
+              example: 3120000
 
     ProductPage:
       type: object
