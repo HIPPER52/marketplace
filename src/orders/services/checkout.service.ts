@@ -77,6 +77,19 @@ import type { CheckoutRequest, CheckoutResult } from '../types/checkout.types';
  * why the consumer writes its inbox row and its receipt together.
  *
  */
+/**
+ * What TypeORM answers for a data-modifying statement: the rows, then how many were
+ * affected. A `SELECT` comes back as a bare array, which is the whole reason this is
+ * written down — see the gotcha in CLAUDE.md.
+ */
+type UpdateResult<Row> = [Row[], number];
+
+/** What the atomic stock claim returns. `price_cents` is bigint, so it arrives a string. */
+interface ClaimedStockRow {
+    price_cents: string;
+    currency: Currency;
+}
+
 export class CheckoutService {
     constructor(
         private readonly dataSource: DataSource,
@@ -119,9 +132,7 @@ export class CheckoutService {
             // array for everything else, so a RETURNING clause does not come back the shape
             // a SELECT does. Destructuring the tuple is the difference between reading the
             // row and reading the array that holds it.
-            const [claimed] = await manager.query<
-                [{ price_cents: string; currency: Currency }[], number]
-            >(
+            const [claimed] = await manager.query<UpdateResult<ClaimedStockRow>>(
                 `UPDATE products SET in_stock = in_stock - $2
                   WHERE id = $1 AND in_stock >= $2
                   RETURNING price_cents, currency`,

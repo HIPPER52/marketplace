@@ -92,9 +92,15 @@ async function main(): Promise<void> {
  * holding have gone back to the queue, and the honest response is to exit non-zero and let
  * whatever started it start it again — with a fresh connection and a fresh channel.
  */
-function untilStopped(model: {
+/**
+ * The only thing this function needs of a connection: that it says when it is gone.
+ * Narrower than `ChannelModel` on purpose — a test can satisfy it with an EventEmitter.
+ */
+interface Closable {
     on(event: 'close', listener: () => void): unknown;
-}): Promise<string> {
+}
+
+function untilStopped(model: Closable): Promise<string> {
     return new Promise((resolve, reject) => {
         let settled = false;
 

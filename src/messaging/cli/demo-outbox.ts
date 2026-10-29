@@ -1,6 +1,7 @@
 import 'reflect-metadata';
 import { randomUUID } from 'node:crypto';
 import { PlaceOrderOutcome } from '../../orders/constants/outcome.constant';
+import { DEMO_BUYER_ID } from '../../users/constants/demo-accounts.constant';
 import { ORDER_RECEIPTS_CONSUMER } from '../constants/topology.constant';
 import { ProcessedMessagesRepository } from '../repositories/processed-messages.repository';
 import { OrderPlacedConsumer } from '../services/order-placed-consumer.service';
@@ -42,8 +43,8 @@ async function main(): Promise<void> {
         const key = `demo-outbox-${randomUUID()}`;
         const body = oneItemOrder();
 
-        const first = await placeOrder.place({ key, body });
-        const second = await placeOrder.place({ key, body });
+        const first = await placeOrder.place({ key, body, userId: DEMO_BUYER_ID });
+        const second = await placeOrder.place({ key, body, userId: DEMO_BUYER_ID });
 
         const requests = 2;
         const outcomes = [first, second];

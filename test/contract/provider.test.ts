@@ -4,6 +4,7 @@ import { Test } from '@nestjs/testing';
 import { Verifier, type VerifierOptions } from '@pact-foundation/pact';
 import { Currency } from '../../src/common/constants/currency.constant';
 import { configureApp } from '../../src/common/utils/configure-app.util';
+import { seedSigningEnv } from '../testkit/auth';
 import { type PgHandle, seatDemoBuyer, startPg, truncateAll } from '../testkit/pg-container';
 import { type RedisHandle, startRedis } from '../testkit/redis-container';
 import {
@@ -44,6 +45,12 @@ beforeAll(async () => {
     // whose result depended on what else had run that day.
     process.env.REDIS_URL = redis.cacheUrl;
     process.env.REDIS_QUEUE_URL = redis.queueUrl;
+
+    // Required with no defaults, and generated rather than carried: a key in a fixture is
+    // a key in git. Nothing in the contract presents a token — the two interactions are
+    // catalogue reads, which are `security: []` — but the service still refuses to start
+    // without a pair, and that refusal is the subject of its own criterion.
+    seedSigningEnv();
 
     // No broker variable here, and none needed. Since #22 the application does not talk to
     // a broker at all: placing an order writes an `outbox` row in the same transaction, and

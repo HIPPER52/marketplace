@@ -38,6 +38,21 @@ export async function configureApp(app: INestApplication): Promise<void> {
             apiSpec: SPEC_PATH,
             validateRequests: true,
             validateResponses: true,
+
+            // Authentication is the guard's, not the validator's.
+            //
+            // Left on, the validator answers its own 401 ("Authorization header
+            // required") the moment a path declares `security`, before any guard runs.
+            // It is checking the only thing it can — that a header is present — and that
+            // is not the question: a present header holding an expired, forged or
+            // revoked token must also be 401, and all four refusals have to carry
+            // `WWW-Authenticate: Bearer` (RFC 6750 §3), which its answer does not.
+            //
+            // Two things answering 401 with different details and different headers is a
+            // contract honoured twice and kept once. The spec still declares `security`
+            // and the 401 it produces — that declaration is what `validateResponses`
+            // holds the guard's answer to.
+            validateSecurity: false,
             // /health and /readiness are operational and are not in the contract.
             //
             // /socket.io is the trap worth naming. Socket.IO does not open with a

@@ -53,9 +53,16 @@ export class Order {
     user!: User;
 
     /**
-     * The owner's id without loading the owner. The realtime gateway answers one
-     * question — "is this order yours?" — and joining the users table to answer it would
-     * be a row fetched to look at one column.
+     * The owner's id without loading the owner. The realtime gateway and every ownership
+     * check answer one question — "is this order yours?" — and joining the users table to
+     * answer it would be a row fetched to look at one column.
+     *
+     * It is **not** a column, which is the thing to know about it: `@RelationId` is a
+     * second query TypeORM issues after the rows come back, so it cannot appear in a
+     * `WHERE` (`Property "userId" was not found in "Order"`). `OrdersRepository.page`
+     * therefore filters through the relation. Mapping `user_id` a second time with
+     * `@Column` makes the predicate possible and breaks the insert — TypeORM then writes
+     * the row through this property instead of the relation, and `user_id` goes in null.
      */
     @RelationId((order: Order) => order.user)
     userId!: string;

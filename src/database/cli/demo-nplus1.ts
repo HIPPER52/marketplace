@@ -57,6 +57,12 @@ class QueryCountLogger implements TypeOrmLogger {
     log(): void {}
 }
 
+/** One page size, and what every strategy cost at it. */
+interface Run {
+    take: number;
+    measured: Measurement[];
+}
+
 interface Measurement {
     strategy: string;
     queries: number;
@@ -89,7 +95,7 @@ async function main(): Promise<void> {
             throw new Error('No orders in the database. Run `npm run seed` first.');
         }
 
-        const runs: { take: number; measured: Measurement[] }[] = [];
+        const runs: Run[] = [];
 
         for (const take of [Math.ceil(total / 2), total]) {
             console.log(`\n═══ a page of ${take} orders (of ${total}) ═══`);

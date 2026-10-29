@@ -1,6 +1,7 @@
 import 'reflect-metadata';
 import { Currency } from '../../common/constants/currency.constant';
 import { emit, finish } from '../../common/utils/demo-report.util';
+import type { Queryable } from '../../database/types/queryable.types';
 import { ProductsRepository } from '../../products/repositories/products.repository';
 import { evictionPolicy, openRedisStand } from '../../redis/utils/redis-stand.util';
 import {
@@ -152,10 +153,7 @@ async function main(): Promise<void> {
 }
 
 /** Deterministic rows, re-stocked on every run. */
-async function seed(
-    dataSource: { query: (sql: string, p?: unknown[]) => Promise<unknown> },
-    ids: string[],
-): Promise<void> {
+async function seed(dataSource: Queryable, ids: string[]): Promise<void> {
     await dataSource.query(
         `INSERT INTO products (id, title, description, price_cents, currency, in_stock)
          SELECT id, 'Cache demo item ' || ordinality, 'Owned by demo:cache.', 1000, $2, 100

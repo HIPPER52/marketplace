@@ -11,6 +11,9 @@ import {
     Res,
 } from '@nestjs/common';
 import type { Response } from 'express';
+import { Role } from '../../auth/constants/role.constant';
+import { CurrentUser } from '../../auth/decorators/principal.decorator';
+import type { Principal } from '../../auth/types/auth.types';
 import { ProblemError, ProblemType } from '../../common/errors/problem.error';
 import type {
     CreateOrderRequest,
@@ -19,9 +22,8 @@ import type {
 } from '../../common/types/api.types';
 import { pageOf, readCursor, readLimit } from '../../common/utils/pagination.util';
 import { CheckoutOutcome, PlaceOrderOutcome } from '../constants/outcome.constant';
-import { ORDER_STATUS_EVENT, USER_ID_HEADER } from '../constants/realtime.constant';
+import { ORDER_STATUS_EVENT } from '../constants/realtime.constant';
 import { OrdersRepository } from '../repositories/orders.repository';
-import { ClaimedIdentityService } from '../services/claimed-identity.service';
 import { OrderEventsService } from '../services/order-events.service';
 import { OrderStatusService } from '../services/order-status.service';
 import { PlaceOrderService } from '../services/place-order.service';
@@ -36,19 +38,22 @@ export class OrdersController {
         private readonly orders: OrdersRepository,
         private readonly status: OrderStatusService,
         private readonly orderEvents: OrderEventsService,
-        private readonly identity: ClaimedIdentityService,
     ) {}
 
     @Get('orders')
-    async list(@Query('limit') limit?: string, @Query('cursor') cursor?: string) {
+    async list(
+        @CurrentUser() me: Principal,
+        @Query('limit') limit?: string,
+        @Query('cursor') cursor?: string,
+    ) {
         const offset = readCursor(cursor);
-        const { rows, total } = await this.orders.page(readLimit(limit), offset);
+        const { rows, total } = await this.orders.page(me.userId, readLimit(limit), offset);
 
         return pageOf(rows.map(toApiOrder), offset, total);
     }
 
     @Get('orders/:orderId')
-    async get(@Param('orderId') orderId: string) {
+    async get(@CurrentUser() me: Principal, @Param('orderId') orderId: string) {
         const order = await this.orders.findById(orderId);
 
         if (order === null) {
@@ -60,12 +65,20 @@ export class OrdersController {
             });
         }
 
+        // 403 and not 404. Hiding the existence of a row behind "not found" is a real
+        // technique and the right one where the id itself is a secret; an order id is
+        // handed to its buyer and appears in their own URL bar, so there is nothing to
+        // hide — and answering 404 to a caller who is simply not allowed sends their SDK
+        // looking for a resource that is right there.
+        denyUnlessOwned(order.userId, me, orderId);
+
         return toApiOrder(order);
     }
 
     @Post('orders')
     @HttpCode(201)
     async create(
+        @CurrentUser() me: Principal,
         @Headers('idempotency-key') key: string,
         @Body() body: CreateOrderRequest,
         @Res({ passthrough: true }) res: Response,
@@ -73,7 +86,7 @@ export class OrdersController {
         // One transaction moves the stock, the money, the order, its receipt job and the
         // outbox row that announces it. Every way it can refuse is data, not an exception
         // — see services/place-order.service.ts and types/checkout.types.ts.
-        const placement = await this.placeOrder.place({ key, body });
+        const placement = await this.placeOrder.place({ key, body, userId: me.userId });
 
         if (placement.outcome === PlaceOrderOutcome.Conflict) {
             throw new ProblemError({
@@ -120,12 +133,14 @@ export class OrdersController {
 
     @Patch('orders/:orderId')
     async updateStatus(
+        @CurrentUser() me: Principal,
         @Param('orderId') orderId: string,
         @Body() body: UpdateOrderStatusRequest,
     ): Promise<Order> {
         // The service writes the status and announces it. This route does neither
-        // directly — see services/order-status.service.ts for why the emit lives there.
-        return toApiOrder(await this.status.changeStatus(orderId, body.status));
+        // directly — see services/order-status.service.ts for why the emit lives there,
+        // and for the ownership check that comes with the principal passed in.
+        return toApiOrder(await this.status.changeStatus(orderId, body.status, me));
     }
 
     /**
@@ -140,36 +155,11 @@ export class OrdersController {
      */
     @Get('orders/:orderId/events')
     async events(
+        @CurrentUser() me: Principal,
         @Param('orderId') orderId: string,
         @Res() res: Response,
-        @Headers(USER_ID_HEADER) userId?: string,
         @Headers('last-event-id') lastEventId?: string,
     ): Promise<void> {
-        // The same rule the gateway enforces on `join`. An order's events are its
-        // buyer's: a stream that answered anyone would make the WebSocket check
-        // decorative, since the identical events are one curl away.
-        //
-        // openapi.yaml marks the header required with minLength 1, so the validator
-        // answers 400 before this runs and the branch is unreachable over HTTP. It
-        // answers with the same status for the same reason, so that the day the route
-        // stops being validated — one line in `ignorePaths` — the stream does not quietly
-        // become public.
-        const claimant = this.identity.resolve(userId);
-
-        if (claimant === null) {
-            // Two different refusals wearing one status. Missing header: unreachable,
-            // because openapi.yaml marks it required and the validator answers 400 first
-            // — kept so that the day this route stops being validated the stream does not
-            // quietly become public. Claims not accepted here: reachable, and the reason
-            // the detail says so out loud.
-            throw new ProblemError({
-                status: this.identity.accepted ? 400 : 403,
-                type: this.identity.accepted ? ProblemType.validation : ProblemType.forbidden,
-                title: this.identity.accepted ? 'Request validation failed' : 'Forbidden',
-                detail: this.identity.refusal(),
-            });
-        }
-
         const order = await this.orders.findById(orderId);
 
         if (order === null) {
@@ -181,14 +171,12 @@ export class OrdersController {
             });
         }
 
-        if (order.userId !== claimant) {
-            throw new ProblemError({
-                status: 403,
-                type: ProblemType.forbidden,
-                title: 'Forbidden',
-                detail: `Order ${orderId} does not belong to user ${claimant}.`,
-            });
-        }
+        // The same rule the gateway enforces on `join`, now resting on the same
+        // verification. Until this assignment both transports took the caller's word for
+        // who they were — `X-User-Id` here, `auth: { userId }` there — and a stream that
+        // answered anyone would have made the WebSocket's check decorative, because the
+        // identical events were one curl away. One rule, two transports, one proof.
+        denyUnlessOwned(order.userId, me, orderId);
 
         res.writeHead(200, {
             'content-type': 'text/event-stream',
@@ -252,6 +240,26 @@ function replayFor(
     const parsed = Number(rawLastEventId);
 
     return Number.isInteger(parsed) && parsed >= 0 ? events.since(orderId, parsed) : [];
+}
+
+/**
+ * The ownership check, in one place because it is one rule.
+ *
+ * An admin passes. That is the only thing a role decides here — everything else is "is
+ * this row yours", which no guard can answer without loading the row, which is why this
+ * lives beside the code that already has.
+ */
+function denyUnlessOwned(ownerId: string, actor: Principal, orderId: string): void {
+    if (ownerId === actor.userId || actor.role === Role.Admin) {
+        return;
+    }
+
+    throw new ProblemError({
+        status: 403,
+        type: ProblemType.forbidden,
+        title: 'Forbidden',
+        detail: `Order ${orderId} does not belong to you.`,
+    });
 }
 
 function unprocessable(detail: string): ProblemError {
