@@ -17,8 +17,13 @@ info:
       answer with `{ items, next_cursor }`. A `next_cursor` of `null` means the caller
       has reached the end of the collection.
     - **Errors are RFC 7807 problem documents** served as `application/problem+json`.
+    - **Everything is closed unless it says otherwise.** The default below is a bearer
+      access token; the handful of operations that need none declare `security: []`.
+      A missing, expired, forged or revoked token is `401`; a valid token whose holder
+      may not do this is `403`, and the two are never interchanged.
 
-security: []
+security:
+  - bearerAuth: []
 
 servers:
   - url: https://api.marketplace.local
@@ -28,17 +33,123 @@ servers:
       so every route below sits at the root either way.
 
 tags:
+  - name: Auth
+    description: Signing in, rotating tokens, and signing out
   - name: Products
     description: Product catalogue
   - name: Orders
     description: Customer orders
 
 paths:
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Exchange a password for a token pair
+      description: >
+        Answers with a short-lived access token and a long-lived opaque refresh token. The
+        refresh token is a random string rather than a JWT: there is nothing in it to read,
+        and the server stores only a keyed hash of it.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: The caller is who they said they were.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenPair"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refreshTokens
+      summary: Rotate a refresh token for a new pair
+      description: >
+        Every call issues a new pair and spends the presented token. A token that was
+        already spent is treated as evidence that two parties hold it: the whole family
+        descended from that login is revoked, and this call answers `401`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshRequest"
+      responses:
+        "200":
+          description: A new pair. The presented token no longer works.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenPair"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: End this session
+      description: >
+        Two things happen, against two different stores. The refresh family is revoked, so
+        no further pair can be minted; and the access token's `jti` goes on a denylist for
+        the remainder of its life, so the token already in the caller's hand stops working
+        too. A signature cannot be withdrawn — only refused.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LogoutRequest"
+      responses:
+        "204":
+          description: The session is over.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      operationId: whoAmI
+      summary: Who the presented token says you are
+      responses:
+        "200":
+          description: The authenticated caller.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Identity"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
   /products:
     get:
       tags: [Products]
       operationId: listProducts
       summary: List products
+      security: []
       description: Returns a cursor-paginated page of the product catalogue.
       parameters:
         - name: limit
@@ -75,11 +186,41 @@ paths:
         "429":
           $ref: "#/components/responses/TooManyRequests"
 
+    post:
+      tags: [Products]
+      operationId: createProduct
+      summary: Add a product to the catalogue
+      description: >
+        Writing to the catalogue is for sellers and administrators. A customer holding a
+        perfectly valid token is answered `403`: they are known, and the answer is still no.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateProductRequest"
+      responses:
+        "201":
+          description: The product as stored.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Product"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
   /products/{productId}:
     get:
       tags: [Products]
       operationId: getProduct
       summary: Get a product by id
+      security: []
       description: >
         Returns a single product together with what has been sold of it. The totals are an
         aggregate over every order line that ever named this product, which makes this the
@@ -144,6 +285,8 @@ paths:
                 $ref: "#/components/schemas/OrderPage"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "429":
           $ref: "#/components/responses/TooManyRequests"
 
@@ -192,6 +335,8 @@ paths:
                 $ref: "#/components/schemas/Order"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "422":
           $ref: "#/components/responses/UnprocessableEntity"
         "429":
@@ -220,6 +365,10 @@ paths:
                 $ref: "#/components/schemas/Order"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "429":
@@ -257,6 +406,10 @@ paths:
                 $ref: "#/components/schemas/Order"
         "400":
           $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
         "422":
@@ -273,6 +426,10 @@ paths:
         A Server-Sent Events stream: one `id:` / `event:` / `data:` block per status
         change, for this order only. The response never completes on its own.
 
+        The stream is private to the order's buyer: the access token says who is
+        asking, and anybody else is answered 403 — the same rule the WebSocket gateway
+        applies to a room join.
+
         Every event carries an `id:` that increases within the order. A client that
         reconnects with `Last-Event-ID` receives everything numbered above it before the
         live stream resumes, so a dropped connection costs no events. The buffer lives in
@@ -285,17 +442,6 @@ paths:
           schema:
             type: string
             format: uuid
-        - name: X-User-Id
-          in: header
-          required: true
-          description: >-
-            Who is asking. An order's event stream is private to its buyer, and this
-            header is how the caller says who they are — the same claim the WebSocket
-            gateway takes from its handshake. It is a placeholder until authentication
-            exists: a signed token replaces it, and the checks behind it do not change.
-          schema:
-            type: string
-            minLength: 1
         - name: Last-Event-ID
           in: header
           required: false
@@ -317,6 +463,8 @@ paths:
                   id: 4
                   event: order.status
                   data: {"order_id":"3fa85f64-5717-4562-b3fc-2c963f66afa6","status":"shipped","id":4}
+        "401":
+          $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
@@ -325,6 +473,16 @@ paths:
           $ref: "#/components/responses/TooManyRequests"
 
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        An ES256-signed access token. Verification pins the algorithm explicitly, so a
+        token that nominates its own — `alg: none`, or HS256 against the public key — is
+        refused rather than trusted (RFC 8725 §3.1).
+
   responses:
     BadRequest:
       description: The request does not satisfy this contract.
@@ -335,6 +493,22 @@ components:
 
     Forbidden:
       description: The caller said who they are, and it is not whose this is.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+    Unauthorized:
+      description: >
+        Who the caller is could not be established: no token, an expired one, one this
+        service did not sign, or one that has been revoked. A client should refresh and
+        try again — which is precisely what it must not do with a 403.
+      headers:
+        WWW-Authenticate:
+          description: The scheme this resource expects (RFC 6750 §3).
+          schema:
+            type: string
+            example: Bearer
       content:
         application/problem+json:
           schema:
@@ -421,6 +595,99 @@ components:
           minimum: 0
           description: Units currently available.
           example: 7
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      additionalProperties: false
+      properties:
+        email:
+          type: string
+          format: email
+          example: buyer@marketplace.local
+        password:
+          type: string
+          minLength: 1
+          format: password
+
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      additionalProperties: false
+      properties:
+        refresh_token:
+          type: string
+          minLength: 1
+          description: The opaque string the previous call handed out.
+
+    LogoutRequest:
+      type: object
+      required: [refresh_token]
+      additionalProperties: false
+      properties:
+        refresh_token:
+          type: string
+          minLength: 1
+          description: >
+            Which session to end. Named explicitly rather than inferred from the access
+            token, so that signing out of one device does not sign out of the others.
+
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token, token_type, expires_in]
+      properties:
+        access_token:
+          type: string
+          description: "A signed JWT. Send it as `Authorization: Bearer <token>`."
+        refresh_token:
+          type: string
+          description: >
+            An opaque random string — deliberately not a JWT. Only a keyed hash of it is
+            stored, so a dump of the table is not a dump of live sessions.
+        token_type:
+          type: string
+          enum: [Bearer]
+        expires_in:
+          type: integer
+          minimum: 1
+          description: Seconds the access token remains valid.
+          example: 900
+
+    Identity:
+      type: object
+      required: [id, email, display_name, role]
+      properties:
+        id:
+          type: string
+          example: "1"
+        email:
+          type: string
+          format: email
+        display_name:
+          type: string
+        role:
+          type: string
+          enum: [customer, seller, admin]
+          description: >
+            Read from the database at the moment of the request, not from the token. A
+            role that changed a second ago is already in force here.
+
+    CreateProductRequest:
+      type: object
+      required: [title, price_cents, in_stock]
+      additionalProperties: false
+      properties:
+        title:
+          type: string
+          minLength: 1
+        price_cents:
+          type: integer
+          minimum: 0
+        currency:
+          $ref: "#/components/schemas/Currency"
+        in_stock:
+          type: integer
+          minimum: 0
 
     ProductCard:
       description: >

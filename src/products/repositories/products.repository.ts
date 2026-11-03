@@ -33,7 +33,7 @@ export class ProductsRepository {
      * timestamp to the microsecond, and an unstable sort under OFFSET returns the same
      * product on two pages and drops another entirely.
      */
-    async page(limit: number, offset: number): Promise<{ rows: Product[]; total: number }> {
+    async page(limit: number, offset: number): Promise<ProductPage> {
         const [rows, total] = await this.products.findAndCount({
             order: { createdAt: 'ASC', id: 'ASC' },
             skip: offset,
@@ -41,6 +41,25 @@ export class ProductsRepository {
         });
 
         return { rows, total };
+    }
+
+    /**
+     * Adds a row to the catalogue.
+     *
+     * The only write in this repository, and it exists because `POST /products` is what
+     * makes the role check mean something: a rule that nothing can break is a rule nobody
+     * can be shown. `currency` falls back to the column default rather than to a literal
+     * here — the contract makes it optional and the database already says what it is.
+     */
+    create(input: NewProduct): Promise<Product> {
+        return this.products.save(
+            this.products.create({
+                title: input.title,
+                priceCents: input.priceCents,
+                ...(input.currency === undefined ? {} : { currency: input.currency }),
+                inStock: input.inStock,
+            }),
+        );
     }
 
     findById(id: string): Promise<Product | null> {
@@ -96,6 +115,20 @@ export class ProductsRepository {
             revenueCents: Number(row.revenue_cents),
         };
     }
+}
+
+/** One page of the catalogue, plus what `next_cursor` is computed from. */
+export interface ProductPage {
+    rows: Product[];
+    total: number;
+}
+
+/** What `create` is given. `currency` is optional because the column has a default. */
+export interface NewProduct {
+    title: string;
+    priceCents: number;
+    currency?: Currency;
+    inStock: number;
 }
 
 /** What `cardOf` hands back. Not an entity: two columns are aggregates. */

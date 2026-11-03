@@ -8,7 +8,7 @@ import {
     DEMO_BUYER_BALANCE_CENTS,
     DEMO_BUYER_EMAIL,
     DEMO_BUYER_ID,
-} from '../../src/users/constants/demo-buyer.constant';
+} from '../../src/users/constants/demo-accounts.constant';
 
 /**
  * The same major version the service runs on in docker-compose.yml and the same one the

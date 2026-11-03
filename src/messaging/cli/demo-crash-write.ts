@@ -1,7 +1,7 @@
 import 'reflect-metadata';
 import type { EntityManager } from 'typeorm';
 import { CheckoutService } from '../../orders/services/checkout.service';
-import { DEMO_BUYER_ID } from '../../users/constants/demo-buyer.constant';
+import { DEMO_BUYER_ID } from '../../users/constants/demo-accounts.constant';
 import { DEMO_PRODUCT_ID } from '../constants/demo.constant';
 import { OutboxRepository, type OutboxWriter } from '../repositories/outbox.repository';
 import { OrderPlacedConsumer } from '../services/order-placed-consumer.service';

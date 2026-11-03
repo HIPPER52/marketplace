@@ -1,14 +1,15 @@
 import 'reflect-metadata';
 import type { ExecutionContext } from '@nestjs/common';
 import type { Request } from 'express';
+import { Role } from '../../auth/constants/role.constant';
+import type { TokenSigner } from '../../auth/services/token-signer.service';
+import { ephemeralSigner } from '../../auth/utils/ephemeral-signer.util';
 import { rateLimitKey } from '../../cache/utils/cache-key.util';
-import { defineScript, type Scripted } from '../../cache/utils/script.util';
+import type { Scripted } from '../../cache/utils/script.util';
 import { ProblemError } from '../../common/errors/problem.error';
 import { emit, finish } from '../../common/utils/demo-report.util';
-import { USER_ID_HEADER } from '../../orders/constants/realtime.constant';
 import { createRedis, quitQuietly } from '../../redis/utils/redis.util';
 import { openRedisStand } from '../../redis/utils/redis-stand.util';
-import { SLIDING_WINDOW } from '../constants/lua.constant';
 import { RateLimitGuard } from '../guards/rate-limit.guard';
 import { SlidingWindowLimiter } from '../services/sliding-window.service';
 
@@ -73,12 +74,16 @@ async function main(): Promise<void> {
         console.log(`allowed ${allowed}, refused ${blocked}`);
 
         // ---- what a client actually receives -------------------------------------------
-        const guard = new RateLimitGuard(pods[0] as SlidingWindowLimiter);
+        // A real ES256 pair, generated for this run and never written down. The guard
+        // reads the bucket out of a genuine signature rather than out of a header the
+        // caller could have typed — which is the thing that changed in #24.
+        const signer = ephemeralSigner();
+        const guard = new RateLimitGuard(pods[0] as SlidingWindowLimiter, signer);
         let status = 0;
         let retryAfter = 0;
 
         try {
-            await guard.canActivate(contextFor(CLIENT));
+            await guard.canActivate(contextFor(CLIENT, signer));
         } catch (error: unknown) {
             if (error instanceof ProblemError) {
                 status = error.status;
@@ -134,11 +139,11 @@ async function main(): Promise<void> {
 }
 
 /** The smallest thing the guard needs to decide. */
-function contextFor(client: string): ExecutionContext {
+function contextFor(client: string, signer: TokenSigner): ExecutionContext {
     const request = {
         path: '/products',
         ip: '203.0.113.1',
-        headers: { [USER_ID_HEADER.toLowerCase()]: client },
+        headers: { authorization: `Bearer ${signer.sign(client, Role.Customer).token}` },
     } as unknown as Request;
 
     return {

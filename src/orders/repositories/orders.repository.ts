@@ -21,8 +21,20 @@ export class OrdersRepository {
         this.orders = dataSource.getRepository(Order);
     }
 
-    async page(limit: number, offset: number): Promise<{ rows: Order[]; total: number }> {
+    /**
+     * One customer's orders, never the shop's.
+     *
+     * The filter is in the `WHERE`, not in a `.filter()` after the fact: paginating the
+     * whole table and then dropping other people's rows would return short pages, a
+     * `total` that counts strangers' orders, and — on the first page of a busy shop —
+     * nothing at all.
+     */
+    async page(userId: string, limit: number, offset: number): Promise<OrderPage> {
         const [rows, total] = await this.orders.findAndCount({
+            // Through the relation, not through `userId`: that property is a
+            // `@RelationId`, which TypeORM fills with a second query after the fact and
+            // cannot put in a `WHERE`. See the entity for why it is not a column.
+            where: { user: { id: userId } },
             relations: { items: true },
             relationLoadStrategy: 'query',
             order: { createdAt: 'DESC', id: 'ASC' },
@@ -40,4 +52,10 @@ export class OrdersRepository {
             relationLoadStrategy: 'query',
         });
     }
+}
+
+/** One customer's page of orders, plus what `next_cursor` is computed from. */
+export interface OrderPage {
+    rows: Order[];
+    total: number;
 }

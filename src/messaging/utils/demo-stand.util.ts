@@ -6,7 +6,10 @@ import { Currency } from '../../common/constants/currency.constant';
 export { emit, finish } from '../../common/utils/demo-report.util';
 
 import { AppDataSource } from '../../database/data-source';
-import { DEMO_BUYER_BALANCE_CENTS, DEMO_BUYER_ID } from '../../users/constants/demo-buyer.constant';
+import {
+    DEMO_BUYER_BALANCE_CENTS,
+    DEMO_BUYER_ID,
+} from '../../users/constants/demo-accounts.constant';
 import {
     DEMO_PRODUCT_ID,
     DEMO_PRODUCT_TITLE,

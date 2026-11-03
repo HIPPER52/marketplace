@@ -1,6 +1,7 @@
 import 'reflect-metadata';
 import type { EntityManager } from 'typeorm';
 import { AppDataSource } from '../data-source';
+import type { Queryable } from '../types/queryable.types';
 import { type RetryAttempt, sleep, withRetry } from '../utils/with-retry.util';
 
 /**
@@ -141,10 +142,7 @@ async function main(): Promise<void> {
     }
 }
 
-async function balanceOf(
-    runner: { query: (sql: string, parameters?: unknown[]) => Promise<unknown> },
-    userId: string,
-): Promise<number> {
+async function balanceOf(runner: Queryable, userId: string): Promise<number> {
     const rows = (await runner.query('SELECT balance_cents FROM users WHERE id = $1', [
         userId,
     ])) as { balance_cents: string }[];

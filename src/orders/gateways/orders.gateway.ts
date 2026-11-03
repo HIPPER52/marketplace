@@ -9,6 +9,8 @@ import {
 } from '@nestjs/websockets';
 import type { Subscription } from 'rxjs';
 import type { Server, Socket } from 'socket.io';
+import { Role } from '../../auth/constants/role.constant';
+import { Authenticator } from '../../auth/services/authenticator.service';
 import {
     JOIN_EVENT,
     JoinRefusal,
@@ -16,7 +18,6 @@ import {
     roomOf,
 } from '../constants/realtime.constant';
 import { OrdersRepository } from '../repositories/orders.repository';
-import { ClaimedIdentityService } from '../services/claimed-identity.service';
 import { OrderEventsService } from '../services/order-events.service';
 import { toPayload } from '../types/order-event.types';
 
@@ -31,17 +32,17 @@ import { toPayload } from '../types/order-event.types';
  * belongs to the person asking, and the fan-out below addresses that label. Nothing in
  * the path depends on the client being well behaved.
  *
- * ## Who the client is, until #24
+ * ## Who the client is
  *
- * There is no authentication in this project yet — the contract describes no customer
- * resource and carries no credentials. The identity therefore arrives in the socket.io
- * handshake, `io(url, { auth: { userId } })`, and is checked against the order's owner.
- * A socket with no `userId` is refused, and so is one naming somebody else's order.
+ * The same access token the HTTP routes take, handed over in the socket.io handshake:
+ * `io(url, { auth: { token } })`. It goes through the identical chain — pinned algorithm,
+ * issuer, audience, expiry, denylist, and the role read from the database — because that
+ * chain is a service rather than code inside a guard. Until this assignment the handshake
+ * carried `auth: { userId }`, a claim exactly as strong as the client's honesty; the
+ * refusals below did not move, only what makes them trustworthy.
  *
- * The claim is only accepted where it can do no harm — see
- * services/claimed-identity.service.ts, which refuses every caller outside development
- * and test rather than pretending an unsigned claim is a check. When #24 lands, that one
- * service starts verifying a token and every refusal below keeps working unchanged.
+ * A handshake carries no status code, so a refusal is the `join` acknowledgement's own
+ * shape and `Authenticator.tryIdentify` answers `null` rather than throwing.
  */
 
 /** The answer a client receives in its `join` acknowledgement. */
@@ -59,8 +60,9 @@ interface JoinRequest {
 
 @WebSocketGateway({
     // The browser demo in the README opens two tabs from the filesystem, and a headless
-    // client sends no Origin at all. Nothing here is authenticated, so there is nothing
-    // for an origin check to protect; #24 is where that changes.
+    // client sends no Origin at all. What protects a room is the token in the handshake,
+    // which no other origin has; an origin allowlist would be a second, weaker fence
+    // around the same thing.
     cors: { origin: '*' },
 })
 export class OrdersGateway implements OnGatewayInit, OnModuleDestroy {
@@ -72,7 +74,7 @@ export class OrdersGateway implements OnGatewayInit, OnModuleDestroy {
     constructor(
         private readonly events: OrderEventsService,
         private readonly orders: OrdersRepository,
-        private readonly identity: ClaimedIdentityService,
+        private readonly authenticator: Authenticator,
     ) {}
 
     /**
@@ -94,13 +96,13 @@ export class OrdersGateway implements OnGatewayInit, OnModuleDestroy {
         @ConnectedSocket() socket: Socket,
         @MessageBody() body: JoinRequest,
     ): Promise<JoinAck> {
-        const userId = this.identity.resolve(socket.handshake.auth?.userId);
+        const principal = await this.authenticator.tryIdentify(socket.handshake.auth?.token);
 
-        if (userId === null) {
+        if (principal === null) {
             return {
                 ok: false,
                 error: JoinRefusal.Unauthenticated,
-                detail: this.identity.refusal(),
+                detail: 'Present a valid access token as auth.token in the handshake.',
             };
         }
 
@@ -125,11 +127,11 @@ export class OrdersGateway implements OnGatewayInit, OnModuleDestroy {
         }
 
         // The one check this whole gateway exists for.
-        if (order.userId !== userId) {
+        if (order.userId !== principal.userId && principal.role !== Role.Admin) {
             return {
                 ok: false,
                 error: JoinRefusal.Forbidden,
-                detail: `Order ${orderId} does not belong to user ${userId}.`,
+                detail: `Order ${orderId} does not belong to you.`,
             };
         }
 

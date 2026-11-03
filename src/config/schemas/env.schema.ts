@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { pemProblem } from '../../auth/utils/pem.util';
 import { redisUrlProblem } from '../../redis/utils/redis-url.util';
 import { NODE_ENVS, NodeEnv } from '../constants/node-env.constant';
 import { databaseUrlProblem } from '../utils/database-url.util';
@@ -9,6 +10,25 @@ function redisUrl(label: string) {
         .min(1, label)
         .superRefine((value, ctx) => {
             const problem = redisUrlProblem(value);
+
+            if (problem !== null) {
+                ctx.addIssue({ code: 'custom', message: problem });
+            }
+        });
+}
+
+function pem(kind: 'PRIVATE' | 'PUBLIC') {
+    const required = `required: base64 of the ${kind.toLowerCase()} key PEM — npm run keygen`;
+
+    // `error` as well as `.min()`: the second covers an empty string, the first covers the
+    // variable not being there at all. Without it a missing key reports zod's own
+    // "expected string, received undefined", which tells somebody who forgot to export a
+    // secret nothing about which secret or where to get one.
+    return z
+        .string({ error: required })
+        .min(1, required)
+        .superRefine((value, ctx) => {
+            const problem = pemProblem(value, kind);
 
             if (problem !== null) {
                 ctx.addIssue({ code: 'custom', message: problem });
@@ -44,6 +64,33 @@ export const envSchema = z.object({
      */
     REDIS_URL: redisUrl('required: the cache instance'),
     REDIS_QUEUE_URL: redisUrl('required: the queue instance'),
+
+    /**
+     * The signing key, its public half, the id that names the pair, and the pepper the
+     * refresh-token hashes are keyed with.
+     *
+     * **Four required variables with no defaults, and the absence of a default is the
+     * point.** A default here is a key written into this repository, and a key written
+     * into a repository is the ability to sign a token for anybody — no database access
+     * needed, no password guessed, no network reached. The cost of a leaked DATABASE_URL
+     * is access to a database somebody still has to be inside the network to use; the cost
+     * of a leaked signing key is becoming any user of this service.
+     *
+     * So the service refuses to start without them, by name. That refusal happens here,
+     * while `app.module.ts` is being evaluated — before NestFactory, before the pool, and
+     * therefore before anything can fail with a connection error that says nothing about
+     * the missing secret.
+     */
+    JWT_KID: z
+        .string({ error: 'required: the id of the signing key pair, e.g. dev-2026-10' })
+        .min(1, 'required: the id of the signing key pair, e.g. dev-2026-10'),
+    JWT_PRIVATE_KEY: pem('PRIVATE'),
+    JWT_PUBLIC_KEY: pem('PUBLIC'),
+    REFRESH_TOKEN_PEPPER: z
+        .string({
+            error: 'required: at least 16 characters of secret, used to HMAC refresh tokens',
+        })
+        .min(16, 'required: at least 16 characters of secret, used to HMAC refresh tokens'),
 
     DB_PASSWORD_FILE: z.string().min(1).default('./secrets/db_password'),
 

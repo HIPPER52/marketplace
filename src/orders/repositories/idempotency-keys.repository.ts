@@ -32,6 +32,12 @@ export type KeyClaim =
  * the service should depend on the one operation it performs rather than on a repository
  * with four others.
  */
+/** The reservation as the table holds it: its fingerprint, and what it completed with. */
+interface HeldKeyRow {
+    request_hash: string;
+    order_id: string | null;
+}
+
 export interface IdempotencyCompleter {
     complete(manager: EntityManager, key: string, orderId: string): Promise<void>;
 }
@@ -73,9 +79,10 @@ export class IdempotencyKeysRepository implements IdempotencyCompleter {
                 return { outcome: KeyClaimOutcome.Claimed };
             }
 
-            const rows = await this.dataSource.query<
-                { request_hash: string; order_id: string | null }[]
-            >('SELECT request_hash, order_id FROM idempotency_keys WHERE key = $1', [key]);
+            const rows = await this.dataSource.query<HeldKeyRow[]>(
+                'SELECT request_hash, order_id FROM idempotency_keys WHERE key = $1',
+                [key],
+            );
             const held = rows[0];
 
             if (held === undefined) {

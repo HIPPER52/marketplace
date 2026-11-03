@@ -61,6 +61,12 @@ export async function openRedisStand(): Promise<RedisStand> {
     };
 }
 
+/** What a server answers about its own memory policy, read at runtime. */
+export interface EvictionPolicy {
+    policy: string;
+    maxmemory: number;
+}
+
 /**
  * What a connection says about its own eviction policy.
  *
@@ -68,10 +74,7 @@ export async function openRedisStand(): Promise<RedisStand> {
  * assignment that a configuration file can lie about: the demos print what the server
  * actually answers.
  */
-export async function evictionPolicy(client: Scripted): Promise<{
-    policy: string;
-    maxmemory: number;
-}> {
+export async function evictionPolicy(client: Scripted): Promise<EvictionPolicy> {
     // CONFIG GET answers with a flat [name, value, …] array, which ioredis types as
     // `unknown` because the shape depends on the subcommand.
     const policy = (await client.config('GET', 'maxmemory-policy')) as string[];
