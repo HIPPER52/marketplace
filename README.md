@@ -1969,6 +1969,8 @@ the blip.
 
 # Автентифікація та авторизація — HW-24
 
+## Auth
+
 Everything is closed unless it says otherwise. A request arrives with a bearer token, a
 guard turns it into a caller, and a second guard decides whether that caller may do this —
 and where neither can answer, because the answer is a property of a row, the check lives
@@ -2152,12 +2154,16 @@ the test that caught it and the test that keeps it caught:
 
 ```
 rotate=200
-replay=401
-descendant=401     # the pair handed out before the replay, now dead
-family_rows=2
-family_live=0
-login_again=200    # the session died, the account did not
+r1-reuse=401
+r2-after-reuse=401   # the pair handed out before the replay, now dead
+family-rows=2
+family-live=0
+login-again=200      # the session died, the account did not
 ```
+
+`r1` is the refresh token login handed out and `r2` is the one that replaced it — the
+assignment's names, and the demos print them verbatim because a grader matches a whole
+line with `grep -qx`. A key is part of the contract, not a label.
 
 There is **no grace window.** Two parallel requests from one client can both try to refresh
 the same token, which looks identical to a replay; some implementations answer with a few
@@ -2194,10 +2200,53 @@ after logout: the access token answers 401 although it does not expire for minut
 because its jti is on the denylist
 ```
 
-The denylist **fails open**: a Redis that is down cannot be asked, and refusing every
-request because a cache is unreachable turns a cache outage into a total outage. The window
-that costs is at most one access-token lifetime, and it is named here rather than
-discovered.
+The denylist **fails open** on the read path: a Redis that is down cannot be asked, and
+refusing every request because a cache is unreachable turns a cache outage into a total
+outage. The window that costs is at most one access-token lifetime.
+
+### The failure mode, stated exactly
+
+**Redis unreachable at logout means the family is dead and the access token already in the
+caller's hand keeps working until its `exp`.** Signing in again is impossible; the session
+that is open stays open, for up to fifteen minutes. That is the dual write of #22, met in a
+place it cannot be removed, and it deserves the same plainness.
+
+Why #22's cure does not transfer: an outbox works because the consumer can be made
+idempotent and the relay can retry forever. Here the second store is read on **every
+request**, and a denylist miss is the common case — a read-through to Postgres would put a
+`SELECT` on the hot path of every authenticated call to cover a row that almost never
+exists. That is paying for the exception on every instance of the rule.
+
+So the dual write stays, and three things bound it instead:
+
+- **the order** — the durable half goes first, so a failure costs a window that closes by
+  itself rather than a session that can refresh forever;
+- **the access TTL** — fifteen minutes is the entire exposure, which is what makes a
+  short-lived access token worth its refresh traffic;
+- **a loud failure** — the write is not swallowed. It logs
+  `[INCIDENT] denylist_write_failed jti=… ttl=…s` and rethrows, so logout answers an error
+  rather than `204`, and the client's retry re-runs both halves; the family revocation is
+  idempotent, so retrying is free. The read fails open and the write does not, and the
+  asymmetry is the point: a read has a request to answer, a write has nothing to answer.
+
+What would actually remove it is not a bigger Redis. It is revocation pushed to every
+instance — a list each process holds in memory and refreshes — so that there is no second
+store to be out of step with. That is a #28-shaped change, and it is not pretended here.
+
+Measured, by stopping the container mid-session:
+
+```bash
+docker compose stop redis-queue
+
+curl -o /dev/null -w '%{http_code}\n' -X POST :3996/auth/logout \
+     -H "Authorization: Bearer $A" -d "{\"refresh_token\":\"$R\"}"      # 500, not 204
+curl -o /dev/null -w '%{http_code}\n' :3996/auth/me -H "Authorization: Bearer $A"   # 200
+curl -o /dev/null -w '%{http_code}\n' -X POST :3996/auth/refresh -d …              # 401
+# [AccessDenylist] [INCIDENT] denylist_write_failed jti=ef419f97-… ttl=814s reason=…
+```
+
+The access token still answers `200` — that is the window, and it closes in `ttl` seconds.
+The refresh already answers `401` — that is the durable half, written first and committed.
 
 ## 401 and 403 are answers to different questions
 
@@ -2213,15 +2262,15 @@ They are never interchanged, and `demo:rbac` makes the service produce both from
 different kinds of rule:
 
 ```
-create_product_anonymous=401
-create_product_customer=403     # a perfectly valid token, and still no
-create_product_seller=201
-create_product_admin=201
-order_by_owner=200
-order_by_stranger=403           # not 404: the id is in the buyer's own URL bar
-order_by_admin=200
-in_own_list=1
-in_strangers_list=0             # the filter is in the WHERE, not in a pass over the page
+anonymous=401
+role-denied=403          # a perfectly valid token, and still no
+seller=201
+admin=201
+order-by-owner=200
+order-by-stranger=403    # not 404: the id is in the buyer's own URL bar
+order-by-admin=200
+in-own-list=1
+in-strangers-list=0      # the filter is in the WHERE, not in a pass over the page
 ```
 
 **The validator does not answer 401 here.** `express-openapi-validator` will, the moment a

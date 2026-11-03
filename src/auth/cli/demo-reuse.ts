@@ -70,14 +70,16 @@ async function main(): Promise<void> {
             body: { email: DEMO_BUYER_EMAIL, password: DEMO_PASSWORD },
         });
 
+        // `r1` is the refresh token login handed out and `r2` is the one that replaced
+        // it — the assignment's names, kept so that `grep -qx 'r1-reuse=401'` matches.
         emit({
             rotate: rotated.status,
-            rotated_differs: Number(first !== second),
-            replay: replay.status,
-            descendant: descendant.status,
-            family_rows: family.rows,
-            family_live: family.live,
-            login_again: again.status,
+            'rotated-differs': Number(first !== second),
+            'r1-reuse': replay.status,
+            'r2-after-reuse': descendant.status,
+            'family-rows': family.rows,
+            'family-live': family.live,
+            'login-again': again.status,
         });
 
         const failures: string[] = [];

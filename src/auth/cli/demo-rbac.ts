@@ -98,16 +98,18 @@ async function main(): Promise<void> {
                 `the other account's (${String(theirs)})`,
         );
 
+        // `role-denied` is the assignment's name for the one line this demo exists to
+        // print: a valid token, a known caller, and 403 anyway.
         emit({
-            create_product_anonymous: anonymous.status,
-            create_product_customer: asCustomer.status,
-            create_product_seller: asSeller.status,
-            create_product_admin: asAdmin.status,
-            order_by_owner: byOwner.status,
-            order_by_stranger: byStranger.status,
-            order_by_admin: byAdmin.status,
-            in_own_list: Number(mine),
-            in_strangers_list: Number(theirs),
+            anonymous: anonymous.status,
+            'role-denied': asCustomer.status,
+            seller: asSeller.status,
+            admin: asAdmin.status,
+            'order-by-owner': byOwner.status,
+            'order-by-stranger': byStranger.status,
+            'order-by-admin': byAdmin.status,
+            'in-own-list': Number(mine),
+            'in-strangers-list': Number(theirs),
         });
 
         const failures: string[] = [];
