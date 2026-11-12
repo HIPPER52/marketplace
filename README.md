@@ -4,20 +4,21 @@ Contract-first API for a small marketplace. The OpenAPI document in
 [`openapi/openapi.yaml`](openapi/openapi.yaml) is the source of truth; the service is a
 thin layer behind a validator that enforces it.
 
-| Assignment | What it added                                                                   |
-| ---------- | ------------------------------------------------------------------------------- |
-| HW-09      | the OpenAPI contract and runtime validation at the boundary                     |
-| HW-11      | NestJS, a validated environment schema, and password rotation without a restart |
-| HW-12      | the data layer: schema, seed, indexes, and EXPLAIN evidence                     |
-| HW-13      | TypeORM over that schema: entities, relations, migrations, N+1                  |
-| HW-14      | concurrency: a transactional checkout, a SKIP LOCKED worker pool, retries       |
-| HW-15      | operations: PgBouncer, a nightly backup, and a restore drill that proves it     |
-| HW-16      | integration, E2E and contract tests; the HTTP layer wired to the database       |
-| HW-18      | realtime: a WebSocket room per order, the same stream over SSE                  |
-| HW-19      | async events over RabbitMQ: at-least-once delivery, an idempotent effect        |
-| HW-22      | the transactional outbox, a relay that may die, and three levels of idempotency |
-| HW-23      | Redis: a cache, a single flight, sessions, a sliding window, and a queue        |
-| **HW-24**  | **authentication and authorisation: ES256 tokens, rotation, roles** — below     |
+| Assignment | What it added                                                                         |
+| ---------- | ------------------------------------------------------------------------------------- |
+| HW-09      | the OpenAPI contract and runtime validation at the boundary                           |
+| HW-11      | NestJS, a validated environment schema, and password rotation without a restart       |
+| HW-12      | the data layer: schema, seed, indexes, and EXPLAIN evidence                           |
+| HW-13      | TypeORM over that schema: entities, relations, migrations, N+1                        |
+| HW-14      | concurrency: a transactional checkout, a SKIP LOCKED worker pool, retries             |
+| HW-15      | operations: PgBouncer, a nightly backup, and a restore drill that proves it           |
+| HW-16      | integration, E2E and contract tests; the HTTP layer wired to the database             |
+| HW-18      | realtime: a WebSocket room per order, the same stream over SSE                        |
+| HW-19      | async events over RabbitMQ: at-least-once delivery, an idempotent effect              |
+| HW-22      | the transactional outbox, a relay that may die, and three levels of idempotency       |
+| HW-23      | Redis: a cache, a single flight, sessions, a sliding window, and a queue              |
+| HW-24      | authentication and authorisation: ES256 tokens, rotation, roles                       |
+| **HW-26**  | **files: presigned uploads, multipart recovery, a CDN with no invalidations** — below |
 
 ---
 
@@ -54,7 +55,7 @@ alias psql='docker compose exec -T db psql -U postgres -d marketplace'
 psql -Atc "SELECT 1"        # 1
 ```
 
-## Files
+## The SQL files
 
 | File                                         | Purpose                                                                 |
 | -------------------------------------------- | ----------------------------------------------------------------------- |
@@ -180,6 +181,15 @@ export DB_HOST=127.0.0.1 DB_PORT=26432 DB_USER=marketplace_app DB_PASSWORD=local
 export BROKER_URL=amqp://marketplace_app:local_dev_password@127.0.0.1:25672
 export REDIS_URL=redis://127.0.0.1:26379         # the cache instance: allkeys-lru
 export REDIS_QUEUE_URL=redis://127.0.0.1:26380   # the queue instance: noeviction
+
+# HW-26: the object store. STORAGE_ENDPOINT empty would mean real AWS S3; these are the
+# dev credentials of the local MinIO, which live in docker-compose.yml on purpose.
+export STORAGE_ENDPOINT=http://127.0.0.1:29000
+export STORAGE_REGION=us-east-1
+export STORAGE_ACCESS_KEY=marketplace_storage
+export STORAGE_SECRET_KEY=local_dev_password
+export STORAGE_BUCKET=marketplace-files
+
 export SKIP_VAULT=1   # no access to the store: the values are already in the environment
 
 # HW-24: a signing pair for this run. Generated here rather than written down — a default
@@ -193,6 +203,14 @@ npm ci
 `npm run keygen` prints three `KEY=value` lines and a comment carrying the fingerprint; the
 `eval` above turns them into exports. It writes no file, which is deliberate — a tool that
 created a key file would be a tool that teaches people to commit one.
+
+Port **29000 is the object store's S3 API** and 29001 is its console, which nothing in
+`src/` and nothing in the demos talks to. The image is `bitnamilegacy/minio` rather than
+`minio/minio`, and that needs a sentence: the upstream repository now refuses an anonymous
+pull, so a grader on a fresh clone could not get it. It is the same MinIO binary.
+LocalStack and S3Mock pull freely and were rejected for a different reason — neither
+enforces access on an anonymous `GET`, and `demo:cdn` proves a closed bucket by getting
+`403` from one.
 
 `--wait` matters more for RabbitMQ than it does for Postgres: between the TCP port opening
 and the Erlang node accepting `basic.publish` there is a window in which a client gets
@@ -272,12 +290,20 @@ npm run demo:queue       # HW-23: retries, deduplicates, and schedules itself
 npm run demo:auth        # HW-24: login, a protected read, three forgeries, a logout that lands
 npm run demo:reuse       # HW-24: rotation, and a replayed refresh token that kills the family
 npm run demo:rbac        # HW-24: 401 vs 403, and an ownership check a role cannot make
+
+npm run demo:upload      # HW-26: bytes reach the store while the application is stopped
+npm run demo:multipart   # HW-26: a process dies after two parts of three; one is topped up
+npm run demo:cdn         # HW-26: the bucket refuses the public, and an update costs no invalidation
 ```
+
+The bucket is created by the demos themselves — each one calls `ensureBucket` on the way
+in, because an init container that creates a bucket races the store's own readiness. There
+is nothing to run before them.
 
 The last three raise the application themselves and need nothing started first; they build
 before they run, because Nest's DI needs metadata `tsx` does not emit.
 
-Each of the eighteen demos checks its own invariant and exits non-zero when it breaks, so
+Each of the twenty-one demos checks its own invariant and exits non-zero when it breaks, so
 there is nothing to read carefully — a green exit code is the result.
 
 Port **25432**, not 5432: the stand must not collide with a Postgres already running on
@@ -2364,6 +2390,301 @@ control run (`-- --same-room`) still proves the isolation is the room rather tha
 | [`src/auth/constants/auth.constant.ts`](src/auth/constants/auth.constant.ts)                               | the algorithm allowlist, the two TTLs, issuer and audience             |
 | [`src/auth/cli/keygen.ts`](src/auth/cli/keygen.ts)                                                         | prints a pair; writes nothing, on purpose                              |
 | [`src/orders/controllers/orders.controller.ts`](src/orders/controllers/orders.controller.ts)               | where ownership is checked, and why it is not in a guard               |
+
+---
+
+# Файли: S3, CloudFront і CDN — HW-26
+
+## Files
+
+A file's whole path — accepted, stored, served — and at every step a choice about what it
+costs. Three claims, each with a half it is easy to be mistaken for:
+
+| Claim                               | The half it is not                                  | What proves it                    |
+| ----------------------------------- | --------------------------------------------------- | --------------------------------- |
+| the bytes go **past** this service  | "there is an upload endpoint" — a proxy has one too | `api-alive=0` + `put-offline=200` |
+| multipart is **recovery**           | "large files are supported" — so is starting over   | `resumed-parts=1`                 |
+| an update needs **no invalidation** | "there is a CDN" — a public bucket can have one     | `new-name=1` + `direct=403`       |
+
+### The commands
+
+```bash
+npm run demo:upload      # bytes arrive while the application is switched off
+npm run demo:multipart   # a process dies after two parts of three; one is topped up
+npm run demo:cdn         # the bucket refuses the public, the cache serves it, zero invalidations
+
+npm run start:edge       # the cache layer, as a long-running process
+npm run start:reaper     # sweeps uploads nobody finished
+```
+
+Each demo brings the stand to clean before it starts **and** after it finishes, takes its
+own port, and exits non-zero when its invariant breaks. That is a requirement rather than
+a courtesy: `demo:multipart` is run twice in a row, and a demo that left its object behind
+would answer `head-before-complete=200` the second time.
+
+### Variables
+
+| Variable             | What                                                  | Джерело (source)                                                     |
+| -------------------- | ----------------------------------------------------- | -------------------------------------------------------------------- |
+| `STORAGE_ENDPOINT`   | where the store answers; **empty means real AWS S3**  | сховище (the store) — `.env` locally, a secret manager in deployment |
+| `STORAGE_REGION`     | the region the SDK signs for                          | сховище; optional, `us-east-1` by default                            |
+| `STORAGE_ACCESS_KEY` | the key id everything is signed with                  | сховище — never a file in this repository, never an image layer      |
+| `STORAGE_SECRET_KEY` | its secret half                                       | сховище — the right to read and write every file there is            |
+| `STORAGE_BUCKET`     | the one bucket; prefixes separate uploads from assets | сховище; not a secret, and still not a default                       |
+
+`STORAGE_ENDPOINT` being optional **is** the portability story: empty, the SDK resolves
+real S3 from the region; set, it is MinIO, LocalStack or R2. `forcePathStyle` follows it
+automatically — virtual-host addressing puts the bucket in the hostname, which nothing on
+`127.0.0.1` can answer. One line, and nothing else in `src/` knows which it is talking to.
+
+The three required ones carry **no defaults**, for the reason the signing key of #24 has
+none: an access key to the store is the right to read and write every file in it, and a
+default is that right committed to this repository. The price of a leak differs from
+`DATABASE_URL`'s — a database still has to be reached across a network; an object store
+key is usable from anywhere with a laptop.
+
+### `npm run demo:upload` — the bytes never touch this service
+
+```
+intent=200
+key-from-server=1
+api-alive=0
+put-offline=200
+commit=200
+commit-without-bytes=409
+tampered=403
+expired=403
+```
+
+The pair in the middle is the demo. Before a byte moves, **the application is stopped** —
+checked with a raw TCP connect, not a `fetch` — and the PUT is made by a forked process
+whose environment holds `PATH` and nothing else: no access key, no secret, no endpoint.
+Everything it can do is in the URL it was handed. A solution that proxies the file through
+the backend prints `put-offline=0` here and cannot be made to print anything else.
+
+**The key is composed by the server.** `uploads/{ownerId}/{uuid}.{ext}` — the owner from a
+verified token, the uuid ours, the extension from the content-type allowlist. The demo
+sends `../../etc/passwd` as the filename on purpose; `key-from-server=1` says none of it
+arrived. A client with any say over the key has been handed the right to write anywhere in
+the bucket, which is not a validation bug but a design one.
+
+**`commit` asks the store, not the client.** `HeadObject`, and for a multipart upload
+`ListParts` and `CompleteMultipartUpload` first. Without that step a client can commit what
+it never uploaded: `commit-without-bytes` is `409` here and `200` in a solution that
+believes the caller. The row and the object are then in step, which is the whole purpose of
+having two steps at all.
+
+The last two lines are properties of the signature. Swap the object key inside the URL and
+the store answers `403 SignatureDoesNotMatch` — the signature covers the method, the host,
+the path and the signed headers. Wait past the expiry and it answers `403` as well.
+
+### Why the expiry is five minutes
+
+A presigned URL **cannot be revoked**. It has no `jti`, there is no registry, and the party
+that checks it is the store — which does not ask us. Of the four revocation strategies #24
+built, three are not merely unimplemented here but inapplicable:
+
+| Strategy from #24  | Why not                                                      |
+| ------------------ | ------------------------------------------------------------ |
+| denylist by `jti`  | there is no `jti`; there is nothing to put on a list         |
+| introspection      | the store verifies the signature and never calls us          |
+| status list        | no identifier, and no reader to consult one                  |
+| rotate credentials | kills **every** URL those keys signed — a switch for the lot |
+| short expiry + 302 | the one that works                                           |
+
+So the expiry is the only thing bounding a leak, and it is a decision rather than a
+maximum. SigV4 permits seven days; seven days is what people write because it is allowed.
+The scenario here is a person choosing a file in a form and the browser starting the PUT
+immediately, so the window that needs covering is one slow upload — five minutes covers a
+10 MiB avatar on a 300 kbit/s line and makes a URL pasted into a chat worthless before
+anybody opens it. A leak is expensive precisely because a presigned URL is **not**
+single-use: the same string works as often as you like until it expires.
+
+And because it cannot be withdrawn, downloads do not hand one out at all.
+`GET /files/{id}` answers `302` to a URL that lives for a minute, so the guard runs on
+every request and the service stays in the **authorisation** path while staying out of the
+**data** path — the bytes still travel from the store straight to the client.
+
+### `npm run demo:multipart` — a protocol for finishing, not for size
+
+```
+head-before-complete=404
+resumed-parts=1
+complete=200
+size-match=1
+etag-multipart=1
+part-size=5242880
+parts=3
+```
+
+A forked uploader PUTs two parts of three and **SIGKILLs itself** — no `finally`, no
+`AbortMultipartUpload`, which is what losing power looks like and what a `try/catch` never
+reproduces. Then a different process asks `ListParts`, finds `#1 #2`, and sends exactly
+one. The state was never in the dead process; it was in the store, which is the difference
+between a recovery protocol and a loop that starts again.
+
+Three facts fall out and are printed:
+
+- **before `Complete` there is no object.** The parts are stored and billed, `ListParts`
+  sees them, `HeadObject` answers 404. Complete is an atomic switch.
+- **the part size is computed.** `max(5 MiB, ceil(size / 10 000))` — 10 000 parts is the
+  ceiling, so a hard-coded 5 MiB fails on anything past 50 GB, and fails at the end. The
+  5 MiB floor applies to every part except the last; a short part in the middle is how
+  `CompleteMultipartUpload` comes back `EntityTooSmall`.
+- **the ETag is not an MD5.** `…-3` counts the parts. Code that compares an ETag with a
+  local checksum breaks here silently.
+
+The threshold is 8 MiB: below it a failed upload costs a few seconds to redo, which is
+cheaper than three extra round trips.
+
+### `npm run demo:cdn` — closed store, cache in front, no invalidation
+
+```
+direct=403
+edge-miss=200
+edge-hit=200
+cache-hit=1
+new-name=1
+new-url=200
+content-changed=1
+invalidations=0
+```
+
+**The form chosen: a local edge process.** `npm run start:edge` is ~40 lines that fetch the
+object from the store **with their own credentials**, keep it, and answer with
+`X-Cache: HIT | MISS`. That is what origin access control _is_ — the public never reaches
+the bucket, the cache does, and the bucket's only reader is an identity the public does not
+have. It is a process of its own rather than a route in the API because a CDN sits _in
+front of_ the origin; folding it inside would make "the bucket is closed and the cache is
+its only reader" a sentence about two halves of the same process.
+
+The AWS form is the same sentence with a bucket policy instead of a process:
+
+```json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "AllowOnlyThisDistribution",
+            "Effect": "Allow",
+            "Principal": { "Service": "cloudfront.amazonaws.com" },
+            "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::marketplace-files/*",
+            "Condition": {
+                "StringEquals": {
+                    "AWS:SourceArn": "arn:aws:cloudfront::111122223333:distribution/E1234567890ABC"
+                }
+            }
+        }
+    ]
+}
+```
+
+**The `Condition` is the whole policy.** `cloudfront.amazonaws.com` is one principal shared
+by every AWS account, so without `AWS:SourceArn` that document grants read access to any
+CloudFront distribution in the world — somebody else's included. With OAC rather than the
+legacy OAI, which the documentation marks "not recommended"; OAC is what works in opt-in
+regions, with SSE-KMS, and for `PUT`/`DELETE`. `Object Ownership` must be
+`Bucket owner enforced`, and the origin must be the REST endpoint rather than the website
+endpoint, which does not speak OAC at all.
+
+What breaks under that policy is direct links to the bucket. What does **not** break is a
+presigned URL: it carries the signature of an IAM principal, and the store honours it
+whether or not a distribution stands in front.
+
+**Updating without invalidating.** The asset's name contains a hash of its content —
+`assets/app.15c42ab7.css` — and the object is stored with
+`Cache-Control: public, max-age=31536000, immutable`. New bytes hash differently, land on a
+different key, and arrive under a different URL; the old entry stays valid and bothers
+nobody. The demo prints the old URL still serving the old body, from cache, after the
+"deploy".
+
+That is not a cheaper invalidation, it is a different thing. An invalidation is paid past
+1 000 paths a month (and the allowance is per _account_, not per distribution), cannot be
+cancelled once submitted, is rate-limited to 150 paths a second — and none of that is the
+worst of it. **It does not reach the browser cache or a corporate proxy.** CloudFront's own
+documentation says so and recommends versioning instead: "If you want to update your files
+frequently, we recommend that you primarily use file versioning." A content-addressed name
+reaches every cache there is, because it is a different URL. It also makes a deploy atomic —
+one HTML file changes rather than hundreds of nodes being asked to forget — and makes
+rollback a link to a hash that is still cached.
+
+⚠️ **`cache-hit=0` almost always means the object has no `Cache-Control`.** A shared cache
+stores what the origin permits and nothing else, so the header goes on the object **at
+upload time**; an edge cannot invent it. `EdgeCache` reads `s-maxage` before `max-age` and
+refuses to store anything marked `private` or `no-store`, which is RFC 9111 and the reason
+a personal response never ends up in a cache everybody reads.
+
+### Cleaning up after a contract with two steps
+
+Between `intent` and `commit` sits a client that can close the tab. What it leaves is a
+`pending` row, sometimes bytes, sometimes an unfinished multipart upload — none of it an
+error, all of it billed. Two things sweep it:
+
+- **a lifecycle rule**, `AbortIncompleteMultipartUpload` after 7 days, the minimum hygiene
+  of any bucket anybody writes to. It is a _different action_ from expiring old objects: an
+  expiry rule does not touch these tails, and they are invisible in every listing of
+  objects while being charged for.
+- **`npm run start:reaper`**, a BullMQ scheduler that every 15 minutes takes `pending` rows
+  older than a day and does `AbortMultipartUpload` → `DeleteObject` → delete the row, in
+  that order. The row goes **last**, because the row is the only record of what to clean.
+
+The second is not belt-and-braces. A bucket rule never touches the row, so without it the
+database would keep reservations for objects that no longer exist. And on this stand the
+rule does not work at all: **MinIO answers `InvalidArgument` to a lifecycle rule whose only
+action is `AbortIncompleteMultipartUpload`, and if a second action is added to get past
+that, it accepts the document and silently drops the abort.** `installLifecycle` writes the
+rule and then reads it back, so what it reports is what the store kept rather than what it
+was told.
+
+The file list itself lives in Postgres, which is why the demos clean up by selecting rows
+rather than by listing the bucket. A listing is paid, paginated at a thousand keys and
+slow; "show me this user's files" through `ListObjectsV2` is an anti-pattern that shows up
+in the bill rather than in a test. The one listing this project does use is
+`ListMultipartUploads`, for exactly the tails no row remembers.
+
+### What this edge is not
+
+It is a `Map` in one process. It does not survive a restart, it is not shared between
+instances, and there is one of it — so none of the things a real CDN is for (geography,
+hundreds of PoPs, absorbing a flood) are demonstrated here, and neither is a CloudFront
+signature or OAC in force. What _is_ demonstrated is the one property the assignment is
+about, and it is the one that does not need a continent: **the copy is somewhere you cannot
+reach**, so an update has to be a new name rather than a request that somebody forget.
+
+Signed URLs and signed cookies are the other half of that, left as a plan: CloudFront
+verifies its own signature at the edge (a presigned S3 URL will not do — the request the
+bucket sees comes from CloudFront), key groups rather than the legacy account-wide pair, a
+canned policy for `DateLessThan` alone and a custom one when `DateGreaterThan` or an IP is
+wanted. Signed cookies cover a set of files where a signed URL covers one.
+
+### The backup from #15, and where it is going
+
+The dump still goes to `backups/` on disk, and that is this assignment's one deliberate
+omission. The destination an object store gives it is better in every way — durable, off
+the machine, and cheap once a lifecycle rule moves it to colder classes — but
+`scripts/backup.sh` and `scripts/restore-drill.sh` are measured, graded and working, and
+the seven criteria here do not touch them. Rewriting them on deadline day to earn nothing
+is how a verified restore stops being verified.
+
+Two things to say honestly when that move happens. **Glacier breaks RTO**: an object there
+has to be restored before it can be read, which turns minutes into hours, and the number in
+`RESTORE-DRILL.md` would have to be re-measured rather than re-used. And **a lifecycle rule
+does not make a backup verified** — it makes it cheap. The drill is what makes it a backup,
+and it does not go away.
+
+### Where things are
+
+| Path                                                                                             | What                                                                       |
+| ------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------- |
+| [`src/storage/services/presigner.service.ts`](src/storage/services/presigner.service.ts)         | the grant: what the signature covers and what it does not                  |
+| [`src/storage/services/uploads.service.ts`](src/storage/services/uploads.service.ts)             | intent and commit, and why there are two of them                           |
+| [`src/storage/services/object-store.service.ts`](src/storage/services/object-store.service.ts)   | the five multipart commands, and the lifecycle rule that reads itself back |
+| [`src/storage/utils/object-key.util.ts`](src/storage/utils/object-key.util.ts)                   | the key the server composes                                                |
+| [`src/storage/utils/asset.util.ts`](src/storage/utils/asset.util.ts)                             | content-addressed names, and `Cache-Control` at upload time                |
+| [`src/storage/services/upload-reaper.service.ts`](src/storage/services/upload-reaper.service.ts) | abort → delete object → delete row, in that order                          |
+| [`src/cdn/services/edge-cache.service.ts`](src/cdn/services/edge-cache.service.ts)               | the shared cache, and why it has no invalidation endpoint                  |
+| [`src/storage/constants/storage.constant.ts`](src/storage/constants/storage.constant.ts)         | the expiry, the threshold, and the computed part size                      |
 
 ---
 

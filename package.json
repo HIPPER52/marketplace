@@ -51,11 +51,18 @@
         "prepare": "npm run build",
         "demo:auth": "npm run build && bash scripts/with-secrets.sh dev node dist/auth/cli/demo-auth.js",
         "demo:reuse": "npm run build && bash scripts/with-secrets.sh dev node dist/auth/cli/demo-reuse.js",
-        "demo:rbac": "npm run build && bash scripts/with-secrets.sh dev node dist/auth/cli/demo-rbac.js"
+        "demo:rbac": "npm run build && bash scripts/with-secrets.sh dev node dist/auth/cli/demo-rbac.js",
+        "start:edge": "npm run build && bash scripts/with-secrets.sh dev node dist/cdn/cli/edge.js",
+        "demo:cdn": "npm run build && bash scripts/with-secrets.sh dev node dist/cdn/cli/demo-cdn.js",
+        "demo:multipart": "npm run build && bash scripts/with-secrets.sh dev node dist/storage/cli/demo-multipart.js",
+        "demo:upload": "npm run build && bash scripts/with-secrets.sh dev node dist/storage/cli/demo-upload.js",
+        "start:reaper": "npm run build && bash scripts/with-secrets.sh dev node dist/storage/cli/reaper.js"
     },
     "author": "Dmitry Avtenev",
     "license": "ISC",
     "dependencies": {
+        "@aws-sdk/client-s3": "^3.1167.0",
+        "@aws-sdk/s3-request-presigner": "^3.1167.0",
         "@nestjs/common": "^11.2.3",
         "@nestjs/config": "^4.0.4",
         "@nestjs/core": "^11.2.3",

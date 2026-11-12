@@ -58,9 +58,7 @@ export interface DemoApp {
  * a demo that created a key file would be a demo that teaches people to commit one.
  */
 export async function openDemoApp(): Promise<DemoApp> {
-    const secrets = mkdtempSync(join(tmpdir(), 'marketplace-demo-'));
-
-    prepareDatabaseEnv(secrets);
+    prepareDatabaseEnv();
     prepareSigningEnv();
 
     // Imported after the environment is settled: `app.module.ts` validates on evaluation.
@@ -84,21 +82,41 @@ export async function openDemoApp(): Promise<DemoApp> {
         baseUrl: url.replace('[::1]', '127.0.0.1').replace('0.0.0.0', '127.0.0.1'),
         app,
         dataSource,
-        close: async () => {
-            await app.close();
-            rmSync(secrets, { recursive: true, force: true });
-        },
+        // Closes the application and nothing else. The secrets directory belongs to the
+        // process rather than to one instance — see `prepareDatabaseEnv`.
+        close: () => app.close(),
     };
 }
 
-function prepareDatabaseEnv(secrets: string): void {
+/**
+ * The password file, written **once per process** and removed when the process ends.
+ *
+ * Once, and not once per application, because `demo:upload` raises the service twice —
+ * and `@nestjs/config` reads the environment while `app.module.ts` is first evaluated and
+ * caches it. A second instance therefore keeps the first one's `DB_PASSWORD_FILE`
+ * whatever this function writes afterwards, so deleting that file when the first app
+ * closes kills the second at boot with an `ENOENT` a long way from its cause. Measured.
+ */
+let secretsDir: string | null = null;
+
+function prepareDatabaseEnv(): void {
+    if (secretsDir !== null) {
+        return;
+    }
+
     const db = readDatasourceEnv(process.env);
-    const passwordFile = join(secrets, 'db_password');
+
+    secretsDir = mkdtempSync(join(tmpdir(), 'marketplace-demo-'));
+
+    const passwordFile = join(secretsDir, 'db_password');
+    const directory = secretsDir;
 
     writeFileSync(passwordFile, db.DB_PASSWORD, { mode: 0o600 });
 
     process.env.DATABASE_URL = `postgres://${encodeURIComponent(db.DB_USER)}@${db.DB_HOST}:${db.DB_PORT}/${encodeURIComponent(db.DB_NAME)}`;
     process.env.DB_PASSWORD_FILE = passwordFile;
+
+    process.once('exit', () => rmSync(directory, { recursive: true, force: true }));
 }
 
 function prepareSigningEnv(): void {

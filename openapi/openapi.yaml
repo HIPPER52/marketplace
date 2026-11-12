@@ -39,6 +39,8 @@ tags:
     description: Product catalogue
   - name: Orders
     description: Customer orders
+  - name: Uploads
+    description: Putting bytes in the object store, and getting them back
 
 paths:
   /auth/login:
@@ -141,6 +143,137 @@ paths:
                 $ref: "#/components/schemas/Identity"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /uploads/intent:
+    post:
+      tags: [Uploads]
+      operationId: createUploadIntent
+      summary: Ask for the right to write one object
+      description: >
+        Answers with everything a client needs to put bytes in the store **without them
+        passing through this service**: an object key the server composed, and a presigned
+        URL (or one per part) that the store itself will check.
+
+
+        The key is composed here, from the token's subject and a uuid, with the extension
+        taken from the content-type allowlist. Nothing the client sends reaches it — a
+        filename is a string somebody wrote, and a client with any say over the key has
+        been handed the right to write anywhere in the bucket.
+
+
+        The grant is narrow on purpose: one method, one key, one content type, and a few
+        minutes. A presigned URL cannot be revoked, so the expiry is the only thing
+        bounding the damage of a leak.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateUploadIntentRequest"
+      responses:
+        "200":
+          description: The grant, and the row that records it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadIntent"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /uploads/commit:
+    post:
+      tags: [Uploads]
+      operationId: commitUpload
+      summary: Confirm that the bytes actually arrived
+      description: >
+        The second half of the contract, and not a formality. The service never saw the
+        bytes, so the only way it can know an object exists is to ask the store —
+        `HeadObject`, and for a multipart upload `ListParts` and the atomic
+        `CompleteMultipartUpload` first.
+
+
+        Without this step a client can "commit" what it never uploaded, and the database
+        fills with rows pointing at nothing while the bucket fills with objects nothing
+        points at. A commit over an object that is not there is `409`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CommitUploadRequest"
+      responses:
+        "200":
+          description: The object is there, and the row now says so.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StoredFile"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: >
+            The reservation exists and the object does not. Nothing was uploaded, or the
+            upload failed, or a multipart was never completed — all of them mean the same
+            thing to this operation, and all of them are the client's to retry.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /files/{fileId}:
+    get:
+      tags: [Uploads]
+      operationId: getFile
+      summary: Follow a redirect to a short-lived download URL
+      description: >
+        Answers `302` to a presigned `GET` that lives for a minute.
+
+
+        This is the one revocation strategy that survives contact with a presigned URL.
+        There is no `jti` to deny, no registry to mark and nobody to introspect — so
+        instead of handing out a long-lived link that can never be taken back, the service
+        stays in the **authorisation** path and out of the **data** path: the guard runs on
+        every request, and the bytes still travel from the store straight to the client.
+      parameters:
+        - name: fileId
+          in: path
+          required: true
+          description: Identifier of the stored file.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "302":
+          description: Where to get the bytes. The URL expires in a minute.
+          headers:
+            Location:
+              description: A presigned URL for this object.
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "429":
           $ref: "#/components/responses/TooManyRequests"
 
@@ -595,6 +728,121 @@ components:
           minimum: 0
           description: Units currently available.
           example: 7
+
+    CreateUploadIntentRequest:
+      type: object
+      required: [content_type, size_bytes]
+      additionalProperties: false
+      properties:
+        content_type:
+          type: string
+          description: >
+            What is being uploaded, from the allowlist. It decides the key's extension and
+            is signed into the grant, so the upload must send exactly this type. It is
+            still the client's own word about the bytes — a lie inside the allowlist is
+            caught by reading the file, which is a different assignment.
+          enum: [image/png, image/jpeg, image/webp, application/pdf, text/css]
+        size_bytes:
+          type: integer
+          minimum: 1
+          description: >
+            How big it is going to be. Declared rather than discovered, because the choice
+            between one PUT and the multipart protocol has to be made before a byte moves
+            — and because the part size is computed from it. `commit` reads the real size
+            back from the store, so a number that was wrong is caught there.
+        filename:
+          type: string
+          maxLength: 255
+          description: >
+            What the client calls the file, kept for display only. **It does not reach the
+            object key**, and `demo:upload` sends a path traversal here on purpose to show
+            that it does not.
+      example:
+        content_type: image/png
+        size_bytes: 102400
+        filename: avatar.png
+
+    UploadIntent:
+      type: object
+      required: [file_id, object_key, mode, expires_in]
+      properties:
+        file_id:
+          type: string
+          format: uuid
+          description: What `commit` and `GET /files/{fileId}` name this upload by.
+        object_key:
+          type: string
+          description: Where it will live in the bucket. Composed by the server.
+        mode:
+          type: string
+          enum: [single, multipart]
+          description: >
+            `single` for one PUT, `multipart` above the threshold. The threshold and the
+            part size are computed, not constants — see README, "Files".
+        expires_in:
+          type: integer
+          minimum: 1
+          description: Seconds the grant below is good for.
+        url:
+          type: string
+          nullable: true
+          description: The presigned PUT, for `single`. Null otherwise.
+        upload_id:
+          type: string
+          nullable: true
+          description: The multipart handle, for `multipart`. Null otherwise.
+        part_size_bytes:
+          type: integer
+          nullable: true
+          minimum: 1
+          description: How large every part but the last must be. Null for `single`.
+        parts:
+          type: array
+          nullable: true
+          description: One presigned URL per part, in order. Null for `single`.
+          items:
+            $ref: "#/components/schemas/UploadPart"
+
+    UploadPart:
+      type: object
+      required: [part_number, url]
+      properties:
+        part_number:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        url:
+          type: string
+
+    CommitUploadRequest:
+      type: object
+      required: [file_id]
+      additionalProperties: false
+      properties:
+        file_id:
+          type: string
+          format: uuid
+      example:
+        file_id: 3fa85f64-5717-4562-b3fc-2c963f66afa6
+
+    StoredFile:
+      type: object
+      required: [id, object_key, content_type, status, size_bytes]
+      properties:
+        id:
+          type: string
+          format: uuid
+        object_key:
+          type: string
+        content_type:
+          type: string
+        status:
+          type: string
+          enum: [pending, completed]
+        size_bytes:
+          type: integer
+          minimum: 0
+          description: Read back from the store, never taken from the client.
 
     LoginRequest:
       type: object

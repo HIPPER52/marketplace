@@ -92,6 +92,29 @@ export const envSchema = z.object({
         })
         .min(16, 'required: at least 16 characters of secret, used to HMAC refresh tokens'),
 
+    /**
+     * The object store.
+     *
+     * `STORAGE_ENDPOINT` is **optional, and that is the portability story**: empty means
+     * the SDK resolves real AWS S3 from the region, set means an emulator. Nothing else
+     * in this project changes between MinIO, LocalStack, Cloudflare R2 and AWS.
+     *
+     * The other three are required and carry no defaults, for the same reason the signing
+     * key does not: an access key to the store is the right to read and write every file
+     * there is, and a default would be that right committed to this repository.
+     */
+    STORAGE_ENDPOINT: z.string().url().optional(),
+    STORAGE_REGION: z.string().min(1).default('us-east-1'),
+    STORAGE_ACCESS_KEY: z
+        .string({ error: 'required: the object store access key id' })
+        .min(1, 'required: the object store access key id'),
+    STORAGE_SECRET_KEY: z
+        .string({ error: 'required: the object store secret key' })
+        .min(1, 'required: the object store secret key'),
+    STORAGE_BUCKET: z
+        .string({ error: 'required: the bucket everything is written to' })
+        .min(1, 'required: the bucket everything is written to'),
+
     DB_PASSWORD_FILE: z.string().min(1).default('./secrets/db_password'),
 
     DB_POOL_MAX: z.coerce.number().int().positive().max(100).default(10),

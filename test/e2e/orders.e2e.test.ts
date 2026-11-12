@@ -11,6 +11,7 @@ import { seatAccounts, seedSigningEnv } from '../testkit/auth';
 import { aProduct } from '../testkit/builders';
 import { type PgHandle, startPg, truncateAll } from '../testkit/pg-container';
 import { type RedisHandle, startRedis } from '../testkit/redis-container';
+import { seedStorageEnv } from '../testkit/storage';
 
 /**
  * The whole application, assembled the way main.ts assembles it, over a Postgres that
@@ -47,6 +48,7 @@ beforeAll(async () => {
     // Four required variables with no defaults — see env.schema.ts. The suite generates a
     // pair rather than carrying one, because a key in a test fixture is a key in git.
     seedSigningEnv();
+    seedStorageEnv();
 
     // No broker variable here, and none needed. Since #22 the application does not talk to
     // a broker at all: placing an order writes an `outbox` row in the same transaction, and

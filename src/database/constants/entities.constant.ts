@@ -7,6 +7,7 @@ import { Order } from '../../orders/entities/order.entity';
 import { OrderItem } from '../../orders/entities/order-item.entity';
 import { OrderReceipt } from '../../orders/entities/order-receipt.entity';
 import { Product } from '../../products/entities/product.entity';
+import { StoredFile } from '../../storage/entities/stored-file.entity';
 import { User } from '../../users/entities/user.entity';
 
 /**
@@ -26,4 +27,5 @@ export const ENTITIES = [
     Job,
     OutboxRecord,
     ProcessedMessage,
+    StoredFile,
 ];
