@@ -163,6 +163,41 @@ services:
   # business. The consumer publishes to it, provider verification reads from it and
   # publishes its result back, and can-i-deploy asks it the one question a deploy gate
   # needs answered — "has anything verified this pair?".
+  # The object store: MinIO, which is what the lecture ran and what real S3 is swapped
+  # for by changing one variable.
+  #
+  # The image is **bitnamilegacy/**, and that needs a sentence. `minio/minio` on Docker
+  # Hub now answers an anonymous pull with "repository does not exist or may require
+  # docker login", and `quay.io/minio/minio` answers 401 — so the upstream image cannot
+  # be pulled by a grader on a fresh clone, which is the one thing this file has to
+  # guarantee. Bitnami's build is the same MinIO binary (DEVELOPMENT.2025-05-24) and is
+  # still public. LocalStack and S3Mock pull freely and were rejected for a different
+  # reason: neither enforces access on an anonymous GET, and `demo:cdn` proves a closed
+  # bucket by getting 403 from one.
+  storage:
+    image: bitnamilegacy/minio:2025.5.24
+    environment:
+      # Dev credentials of a local stand, in this file on purpose and exactly as much a
+      # secret as the Postgres password in init.sql — which is to say not one. The real
+      # ones never enter git; see README, "Where the credentials come from".
+      MINIO_ROOT_USER: marketplace_storage
+      MINIO_ROOT_PASSWORD: local_dev_password
+    ports:
+      # 9000 -> 29000 and 9001 -> 29001, the same prefix rule as 5432 -> 25432 and
+      # 9292 -> 29292. The console is published so a human can look; nothing in src/ and
+      # nothing in the demos knows that port exists.
+      - "29000:9000"
+      - "29001:9001"
+    volumes:
+      - storagedata:/bitnami/minio/data
+    healthcheck:
+      # The liveness probe MinIO documents, not "does a port answer". `--wait` is only
+      # worth writing when the healthcheck means readiness.
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/live"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
   pact-broker:
     image: pactfoundation/pact-broker:latest
     environment:
@@ -227,3 +262,4 @@ volumes:
   pactbrokerdata:
   rabbitmqdata:
   redisqueuedata:
+  storagedata:

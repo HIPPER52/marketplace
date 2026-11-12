@@ -7,6 +7,7 @@ export const ProblemType = {
     unauthenticated: `${BASE}/unauthenticated`,
     forbidden: `${BASE}/forbidden`,
     notFound: `${BASE}/not-found`,
+    conflict: `${BASE}/conflict`,
     unprocessable: `${BASE}/unprocessable-entity`,
     idempotencyConflict: `${BASE}/idempotency-key-conflict`,
     idempotencyInFlight: `${BASE}/idempotency-key-in-flight`,
@@ -52,6 +53,7 @@ export const TITLE_BY_STATUS: Record<number, { title: string; type: string }> = 
     401: { title: 'Not authenticated', type: ProblemType.unauthenticated },
     403: { title: 'Forbidden', type: ProblemType.forbidden },
     404: { title: 'Resource not found', type: ProblemType.notFound },
+    409: { title: 'Conflict', type: ProblemType.conflict },
     422: { title: 'Unprocessable entity', type: ProblemType.unprocessable },
     429: { title: 'Too many requests', type: ProblemType.rateLimited },
 };

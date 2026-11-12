@@ -11,6 +11,7 @@ import { RateLimitModule } from './ratelimit/rate-limit.module';
 import { RedisModule } from './redis/redis.module';
 import { SessionMiddleware } from './sessions/middleware/session.middleware';
 import { SessionsModule } from './sessions/sessions.module';
+import { StorageModule } from './storage/storage.module';
 import { UsersModule } from './users/users.module';
 
 @Module({
@@ -31,6 +32,7 @@ import { UsersModule } from './users/users.module';
         RateLimitModule,
         UsersModule,
         AuthModule,
+        StorageModule,
         ProductsModule,
         OrdersModule,
         QueueModule,

@@ -7,6 +7,7 @@ import { configureApp } from '../../src/common/utils/configure-app.util';
 import { seedSigningEnv } from '../testkit/auth';
 import { type PgHandle, seatDemoBuyer, startPg, truncateAll } from '../testkit/pg-container';
 import { type RedisHandle, startRedis } from '../testkit/redis-container';
+import { seedStorageEnv } from '../testkit/storage';
 import {
     KNOWN_PRODUCT_ID,
     MISSING_PRODUCT_ID,
@@ -51,6 +52,7 @@ beforeAll(async () => {
     // catalogue reads, which are `security: []` — but the service still refuses to start
     // without a pair, and that refusal is the subject of its own criterion.
     seedSigningEnv();
+    seedStorageEnv();
 
     // No broker variable here, and none needed. Since #22 the application does not talk to
     // a broker at all: placing an order writes an `outbox` row in the same transaction, and

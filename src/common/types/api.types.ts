@@ -13,3 +13,7 @@ export type RefreshRequest = components['schemas']['RefreshRequest'];
 export type LogoutRequest = components['schemas']['LogoutRequest'];
 export type TokenPairResponse = components['schemas']['TokenPair'];
 export type Identity = components['schemas']['Identity'];
+export type CreateUploadIntentRequest = components['schemas']['CreateUploadIntentRequest'];
+export type UploadIntent = components['schemas']['UploadIntent'];
+export type CommitUploadRequest = components['schemas']['CommitUploadRequest'];
+export type StoredFileResponse = components['schemas']['StoredFile'];
