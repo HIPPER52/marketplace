@@ -2,7 +2,7 @@ import 'reflect-metadata';
 import { randomUUID } from 'node:crypto';
 import type { GetMessage } from 'amqplib';
 import { Currency } from '../../common/constants/currency.constant';
-import { DEMO_BUYER_ID } from '../../users/constants/demo-buyer.constant';
+import { DEMO_BUYER_ID } from '../../users/constants/demo-accounts.constant';
 import {
     DELIVERY_LIMIT,
     ORDER_PLACED_DLQ,

@@ -1,3 +1,4 @@
+import { RefreshToken } from '../../auth/entities/refresh-token.entity';
 import { Job } from '../../jobs/entities/job.entity';
 import { OutboxRecord } from '../../messaging/entities/outbox-record.entity';
 import { ProcessedMessage } from '../../messaging/entities/processed-message.entity';
@@ -16,6 +17,7 @@ import { User } from '../../users/entities/user.entity';
  */
 export const ENTITIES = [
     User,
+    RefreshToken,
     Product,
     Order,
     OrderItem,

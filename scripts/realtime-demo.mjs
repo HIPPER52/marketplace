@@ -17,8 +17,17 @@
 import { io } from 'socket.io-client';
 
 const BASE_URL = process.env.BASE_URL ?? 'http://localhost:3000';
-/** Who the sockets claim to be. Until #24 this is a claim; see the gateway. */
-const USER_ID = process.env.DEMO_USER_ID ?? '1';
+
+/**
+ * Who the sockets are. Since #24 this is proved rather than claimed: the demo signs in
+ * and hands the access token to the handshake, and the gateway runs it through the same
+ * verification the HTTP guard does. Until then it was `auth: { userId }` — a number
+ * anybody could type.
+ */
+const EMAIL = process.env.DEMO_EMAIL ?? 'buyer@marketplace.local';
+const PASSWORD = process.env.DEMO_PASSWORD ?? 'demo-password';
+
+let token = '';
 
 const SAME_ROOM = process.argv.includes('--same-room');
 const SETTLE_MS = 1500;
@@ -29,7 +38,13 @@ function fail(message) {
 }
 
 async function api(path, init) {
-    const response = await fetch(`${BASE_URL}${path}`, init);
+    const response = await fetch(`${BASE_URL}${path}`, {
+        ...init,
+        headers: {
+            ...init?.headers,
+            ...(token === '' ? {} : { authorization: `Bearer ${token}` }),
+        },
+    });
 
     if (!response.ok) {
         const body = await response.text();
@@ -37,6 +52,30 @@ async function api(path, init) {
     }
 
     return response.json();
+}
+
+/**
+ * Signs in. The accounts come from `npm run demo:auth` (or any of the three auth demos),
+ * which seed them with a password; a stand where they have never run has a buyer with no
+ * password and this will say so.
+ */
+async function signIn() {
+    const response = await fetch(`${BASE_URL}/auth/login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ email: EMAIL, password: PASSWORD }),
+    });
+
+    if (!response.ok) {
+        fail(
+            `could not sign in as ${EMAIL} (${response.status}). The demo accounts are ` +
+                'created by `npm run demo:auth` — run it once against this stand.',
+        );
+    }
+
+    const pair = await response.json();
+
+    return pair.access_token;
 }
 
 /** A product with something on the shelf — checkout debits stock for real. */
@@ -70,7 +109,7 @@ async function placeOrder(productId, label) {
 function watch(orderId) {
     return new Promise((resolve, reject) => {
         const socket = io(BASE_URL, {
-            auth: { userId: USER_ID },
+            auth: { token },
             transports: ['websocket', 'polling'],
         });
         const received = [];
@@ -93,6 +132,8 @@ function watch(orderId) {
         });
     });
 }
+
+token = await signIn();
 
 const product = await pickProduct();
 

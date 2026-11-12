@@ -69,7 +69,7 @@ describe('OrdersRepository', () => {
             .withStatus(OrderStatus.Paid)
             .insertVia(dataSource.manager);
 
-        const { rows, total } = await repository.page(10, 0);
+        const { rows, total } = await repository.page(buyer.id, 10, 0);
 
         expect(total).toBe(2);
         expect(rows.map((row) => row.id)).toEqual([newer.id, older.id]);

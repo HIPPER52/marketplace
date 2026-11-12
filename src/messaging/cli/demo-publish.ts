@@ -1,7 +1,7 @@
 import 'reflect-metadata';
 import { CheckoutOutcome } from '../../orders/constants/outcome.constant';
 import { CheckoutService } from '../../orders/services/checkout.service';
-import { DEMO_BUYER_ID } from '../../users/constants/demo-buyer.constant';
+import { DEMO_BUYER_ID } from '../../users/constants/demo-accounts.constant';
 import { DEMO_PRODUCT_ID } from '../constants/demo.constant';
 import { OutboxRepository } from '../repositories/outbox.repository';
 import { OrderPlacedConsumer } from '../services/order-placed-consumer.service';

@@ -144,7 +144,16 @@ const USERS: UserSeed[] = [
 ];
 
 /** Which customer bought what. Index into USERS, then slugs with quantities. */
-const ORDERS: { slug: string; buyer: number; status: OrderStatus; lines: [string, number][] }[] = [
+/** One seeded order: whose it is, where it got to, and what is in it. */
+interface SeedOrder {
+    slug: string;
+    buyer: number;
+    status: OrderStatus;
+    /** `[product slug, quantity]` — positional because a seed line reads better that way. */
+    lines: [string, number][];
+}
+
+const ORDERS: SeedOrder[] = [
     {
         slug: 'order-1',
         buyer: 0,

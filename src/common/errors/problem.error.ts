@@ -4,6 +4,7 @@ const BASE = 'https://api.marketplace.local/problems';
 
 export const ProblemType = {
     validation: `${BASE}/validation-error`,
+    unauthenticated: `${BASE}/unauthenticated`,
     forbidden: `${BASE}/forbidden`,
     notFound: `${BASE}/not-found`,
     unprocessable: `${BASE}/unprocessable-entity`,
@@ -12,6 +13,16 @@ export const ProblemType = {
     rateLimited: `${BASE}/too-many-requests`,
     internal: `${BASE}/internal-error`,
 } as const;
+
+/** Everything needed to build one RFC 7807 document. */
+export interface ProblemInit {
+    status: number;
+    type: string;
+    title: string;
+    detail: string;
+    /** See `ProblemError.headers`. */
+    headers?: Record<string, string>;
+}
 
 export class ProblemError extends Error {
     readonly status: number;
@@ -26,13 +37,7 @@ export class ProblemError extends Error {
      */
     readonly headers: Record<string, string>;
 
-    constructor(args: {
-        status: number;
-        type: string;
-        title: string;
-        detail: string;
-        headers?: Record<string, string>;
-    }) {
+    constructor(args: ProblemInit) {
         super(args.detail);
         this.name = 'ProblemError';
         this.status = args.status;
@@ -44,6 +49,7 @@ export class ProblemError extends Error {
 
 export const TITLE_BY_STATUS: Record<number, { title: string; type: string }> = {
     400: { title: 'Request validation failed', type: ProblemType.validation },
+    401: { title: 'Not authenticated', type: ProblemType.unauthenticated },
     403: { title: 'Forbidden', type: ProblemType.forbidden },
     404: { title: 'Resource not found', type: ProblemType.notFound },
     422: { title: 'Unprocessable entity', type: ProblemType.unprocessable },

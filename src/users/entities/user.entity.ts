@@ -1,4 +1,5 @@
 import { Check, Column, Entity, Index, OneToMany, PrimaryGeneratedColumn } from 'typeorm';
+import { ROLES, Role } from '../../auth/constants/role.constant';
 import { bigintCents } from '../../common/utils/money.util';
 import { Order } from '../../orders/entities/order.entity';
 
@@ -12,6 +13,7 @@ import { Order } from '../../orders/entities/order.entity';
 @Check('users_email_shaped', `position('@' IN email) > 1`)
 @Check('users_display_name_not_blank', 'length(btrim(display_name)) > 0')
 @Check('users_balance_cents_nonnegative', 'balance_cents >= 0')
+@Check('users_role_known', `role IN (${ROLES.map((role) => `'${role}'`).join(', ')})`)
 // Uniqueness is over lower(email), not over email: 'A@x.com' and 'a@x.com' are one
 // account. Postgres has no UNIQUE constraint over an expression, only a unique index, and
 // TypeORM's decorators cannot express one — so the migration creates it by hand and
@@ -41,6 +43,23 @@ export class User {
      */
     @Column({ name: 'balance_cents', type: 'bigint', default: 0, transformer: bigintCents })
     balanceCents!: number;
+
+    /**
+     * argon2id, with the library's own OWASP-aligned parameters. Nullable because the
+     * rows that predate authentication have no password and must not be given one by a
+     * migration — an account nobody can sign into is safer than an account whose password
+     * is written in a file in this repository.
+     */
+    @Column({ name: 'password_hash', type: 'text', nullable: true })
+    passwordHash!: string | null;
+
+    /**
+     * What kind of actor this is. **The source of truth** — the copy inside an access
+     * token is a cache that can be up to one token lifetime stale, and every decision
+     * reads this column instead.
+     */
+    @Column({ name: 'role', type: 'text', default: Role.Customer })
+    role!: Role;
 
     @Column({ name: 'created_at', type: 'timestamptz', default: () => 'now()' })
     createdAt!: Date;

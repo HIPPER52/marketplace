@@ -1,7 +1,8 @@
 import { type CanActivate, type ExecutionContext, Inject, Injectable } from '@nestjs/common';
 import type { Request } from 'express';
+import { BEARER_PREFIX } from '../../auth/constants/auth.constant';
+import { TokenSigner } from '../../auth/services/token-signer.service';
 import { ProblemError, ProblemType } from '../../common/errors/problem.error';
-import { USER_ID_HEADER } from '../../orders/constants/realtime.constant';
 import { RATE_LIMIT_EXEMPT } from '../constants/rate-limit.constant';
 import { RATE_LIMITER } from '../constants/rate-limit.token';
 import type { SlidingWindowLimiter } from '../services/sliding-window.service';
@@ -17,7 +18,10 @@ import type { SlidingWindowLimiter } from '../services/sliding-window.service';
  */
 @Injectable()
 export class RateLimitGuard implements CanActivate {
-    constructor(@Inject(RATE_LIMITER) private readonly limiter: SlidingWindowLimiter) {}
+    constructor(
+        @Inject(RATE_LIMITER) private readonly limiter: SlidingWindowLimiter,
+        private readonly signer: TokenSigner,
+    ) {}
 
     async canActivate(context: ExecutionContext): Promise<boolean> {
         const request = context.switchToHttp().getRequest<Request>();
@@ -26,7 +30,7 @@ export class RateLimitGuard implements CanActivate {
             return true;
         }
 
-        const decision = await this.limiter.take(clientOf(request));
+        const decision = await this.limiter.take(clientOf(request, this.signer));
 
         if (decision.allowed) {
             return true;
@@ -49,20 +53,29 @@ export class RateLimitGuard implements CanActivate {
 /**
  * Who is being limited.
  *
- * The claimed identity when there is one, the address otherwise. Both are as trustworthy
- * as the client is honest — the same caveat `ClaimedIdentityService` carries — and that is
- * acceptable for a limit in a way it would not be for an ownership check: the worst a liar
- * achieves is a larger allowance, not somebody else's data.
+ * The token's subject when the signature holds, the address otherwise. Until #24 this
+ * read `X-User-Id` — a bucket a client could change by typing a different number, which
+ * made the limit opt-in. A signature cannot be typed, so the only way to get a fresh
+ * allowance now is to present no token at all, and that falls to the address.
+ *
+ * Signature only: no denylist lookup and no `SELECT`. This runs ahead of authentication
+ * on every request, and a limiter that costs a Redis round trip and a database read to
+ * decide which counter to increment costs more than most of the work it protects. A
+ * revoked token still names the person it was issued to, which is all a bucket needs.
  *
  * `req.ip` is only meaningful behind a proxy when Express is told to trust one. This stand
  * has no proxy; the day it does, `trust proxy` is the line that stops every request
  * looking like it came from the load balancer.
  */
-function clientOf(request: Request): string {
-    const claimed = request.headers[USER_ID_HEADER.toLowerCase()];
+function clientOf(request: Request, signer: TokenSigner): string {
+    const header = request.headers.authorization;
+    const token =
+        typeof header === 'string' && header.startsWith(BEARER_PREFIX)
+            ? signer.subjectOf(header.slice(BEARER_PREFIX.length))
+            : null;
 
-    if (typeof claimed === 'string' && claimed.trim() !== '') {
-        return `user:${claimed.trim()}`;
+    if (token !== null) {
+        return `user:${token}`;
     }
 
     return `ip:${request.ip ?? 'unknown'}`;

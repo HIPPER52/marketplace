@@ -3,7 +3,7 @@ import {
     DEMO_BUYER_BALANCE_CENTS,
     DEMO_BUYER_EMAIL,
     DEMO_BUYER_ID,
-} from '../users/constants/demo-buyer.constant';
+} from '../users/constants/demo-accounts.constant';
 
 /**
  * The account `POST /orders` debits until authentication exists.

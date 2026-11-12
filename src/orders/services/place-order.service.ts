@@ -4,11 +4,22 @@ import {
     CARD_REFRESH_QUEUE,
     type CardRefreshQueue,
 } from '../../queue/types/card-refresh-queue.types';
-import { DEMO_BUYER_ID } from '../../users/constants/demo-buyer.constant';
 import { CheckoutOutcome, KeyClaimOutcome, PlaceOrderOutcome } from '../constants/outcome.constant';
 import type { CheckoutResult } from '../types/checkout.types';
 import { CheckoutService } from './checkout.service';
 import { IdempotencyRegistry } from './idempotency.service';
+
+/** One request to place an order, as the route and the demos both describe it. */
+export interface PlaceOrderInput {
+    key: string;
+    body: CreateOrderRequest;
+    /**
+     * Who pays. Comes from a verified token over HTTP and from `DEMO_BUYER_ID` in the CLI
+     * demos, which run below the layer that knows about tokens — never from the request
+     * body, which the buyer writes.
+     */
+    userId: string;
+}
 
 /**
  * The union; `PlaceOrderOutcome` is the vocabulary of its tags. Two names because they are
@@ -46,7 +57,7 @@ export class PlaceOrderService {
         @Inject(CARD_REFRESH_QUEUE) private readonly cards: CardRefreshQueue,
     ) {}
 
-    async place(input: { key: string; body: CreateOrderRequest }): Promise<PlaceOrderResult> {
+    async place(input: PlaceOrderInput): Promise<PlaceOrderResult> {
         const requestHash = this.idempotency.fingerprint(input.body);
         const claim = await this.idempotency.claim(input.key, requestHash);
 
@@ -65,7 +76,7 @@ export class PlaceOrderService {
         // The key is held from here on, and the transaction below is what completes it.
         try {
             const result = await this.checkout.checkout({
-                userId: DEMO_BUYER_ID,
+                userId: input.userId,
                 lines: input.body.items.map((line) => ({
                     productId: line.product_id,
                     quantity: line.quantity,
