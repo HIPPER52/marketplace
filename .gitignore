@@ -152,3 +152,10 @@ src/generated/
 /secrets/
 
 backups/
+
+# The build-stage registry token. It reaches the build through --mount=type=secret
+# and never through a COPY, and it has no business in history either.
+.npm_token
+
+# Pulumi's local file backend: the stack state, which is generated and holds secrets.
+/.pulumi/

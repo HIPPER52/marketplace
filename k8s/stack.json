@@ -1,0 +1,8 @@
+{
+    "cluster": "marketplace-hw28",
+    "namespace": "marketplace",
+    "image": "marketplace",
+    "tag": "hw28",
+    "nodePort": 30080,
+    "containerPort": 3000
+}

@@ -5,7 +5,7 @@ services:
     profiles: ["app"]
     build:
       context: ./
-      dockerfile: Dockerfile
+      dockerfile: docker/Dockerfile
       target: dev
     environment:
       NODE_ENV: development
