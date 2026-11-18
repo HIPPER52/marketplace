@@ -40,6 +40,23 @@ export const envSchema = z.object({
     NODE_ENV: z.enum(NODE_ENVS).default(NodeEnv.Development),
     PORT: z.coerce.number().int().positive().max(65535).default(3000),
 
+    /**
+     * The two halves of "this process is not always available, and says so".
+     *
+     * `WARMUP_MS` is waited out **before** the socket opens, so for its duration there is
+     * nothing listening and a readiness probe gets a refused connection. It stands in for
+     * what a real deployment does between starting and being useful — filling a pool,
+     * checking migrations, warming a cache — and it is zero by default because only a
+     * deployment with a probe to notice has any business asking for it.
+     *
+     * `DRAIN_MS` is waited out **after** SIGTERM and **before** the socket closes, with
+     * readiness already red. It is the window in which a load balancer notices this pod
+     * is gone; `terminationGracePeriodSeconds` in the cluster has to be larger than it, or
+     * SIGKILL lands in the middle of the drain and cuts the connections it exists to save.
+     */
+    WARMUP_MS: z.coerce.number().int().nonnegative().max(60_000).default(0),
+    DRAIN_MS: z.coerce.number().int().nonnegative().max(60_000).default(5_000),
+
     DATABASE_URL: z
         .string()
         .min(1, 'required: postgres connection string')

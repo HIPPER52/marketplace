@@ -296,6 +296,58 @@ npm run demo:multipart   # HW-26: a process dies after two parts of three; one i
 npm run demo:cdn         # HW-26: the bucket refuses the public, and an update costs no invalidation
 ```
 
+### HW-28: the image, the cluster and the rollout
+
+Nothing above is replaced. The Pulumi program needs eleven values and nine of them are
+already exported — the four signing variables of #24, the five object-store variables of
+#26 — so this adds two and one file:
+
+```bash
+export PULUMI_BACKEND_URL="file://$PWD/.pulumi"   # never the hosted service
+export PULUMI_CONFIG_PASSPHRASE=hw28-grading      # see the note below: this exact value
+
+npm --prefix infra ci
+printf 'dummy-npm-token' > .npm_token   # the build-stage secret; git-ignored by design
+
+npm run image:build     # docker/Dockerfile -> marketplace:hw28, secret mounted not copied
+npm run cluster:up      # kind create cluster + kind load docker-image
+npm run up              # pulumi up: namespace, data layer, migrations, Deployment, PDB, HPA
+
+npm run demo:image      # stages=4 shell-inside=0 runtime-uid=65532, three zeros, a control
+npm run scan            # found=19 max-allowed=19 gate=pass
+npm run demo:rollout    # failed=0 at ~9 800 requests
+npm run demo:pdb        # evict-1=201 evict-2=429
+
+npm run destroy && npm run cluster:down
+```
+
+The names the cluster checks ask for: namespace **`marketplace`**, and the Deployment, the
+Service, the PodDisruptionBudget and the HorizontalPodAutoscaler are all
+**`marketplace-api`**.
+
+`PULUMI_CONFIG_PASSPHRASE` has no default anywhere in this repository — the Kubernetes
+provider marks Secret data as secret, so the state file is encrypted, and a passphrase
+baked into a script is the same mistake as a signing key in a repository. The committed
+`infra/Pulumi.dev.yaml` carries **no `encryptionsalt`**: the first `npm run up` generates
+one for whatever passphrase is in the environment, so any value works on a fresh clone and
+the file shows up as modified afterwards. Changing the passphrase after that point needs
+`cd infra && pulumi stack rm dev --force` first.
+
+`npm --prefix infra ci` is the Pulumi program's own dependency tree and is separate from
+the service's on purpose — the deployment tool and the thing being deployed have no
+business sharing a `node_modules`. It is also the first criterion, together with
+`npx tsc --noEmit` in that directory.
+
+**kind and pulumi have to be on the machine**; `kubectl` and Docker are assumed. On macOS:
+`brew install kind pulumi`. Everything else runs in a container — trivy included, which is
+why there is no `brew install trivy` here.
+
+A rollout measurement takes about a minute of wall clock, most of it deliberate: the
+correct profile waits for each new pod to say it is ready and drains each old one.
+`npm run demo:rollout -- --broken` is the control run, and it leaves the cluster back in
+the correct profile on the way out, because criterion 7 reads that profile out of the
+cluster afterwards.
+
 The bucket is created by the demos themselves — each one calls `ensureBucket` on the way
 in, because an init container that creates a bucket races the store's own readiness. There
 is nothing to run before them.
@@ -303,7 +355,7 @@ is nothing to run before them.
 The last three raise the application themselves and need nothing started first; they build
 before they run, because Nest's DI needs metadata `tsx` does not emit.
 
-Each of the twenty-one demos checks its own invariant and exits non-zero when it breaks, so
+Each of the twenty-four demos checks its own invariant and exits non-zero when it breaks, so
 there is nothing to read carefully — a green exit code is the result.
 
 Port **25432**, not 5432: the stand must not collide with a Postgres already running on
@@ -2985,6 +3037,427 @@ docker run --rm myapp ls -a /app                  # .env.example yes; .env and s
 docker run --rm myapp sh -c 'cat /app/.env' 2>&1  # No such file or directory
 docker inspect --format '{{.Config.Env}}' myapp   # base image variables only
 docker history --no-trunc myapp | grep -i password  # empty
+```
+
+---
+
+# Kubernetes: образ, кластер і викочування — HW-28
+
+Up to #26 the question about this image was whether it starts. This one asks whether it
+**survives an update while people are using it**, and the only honest answer to that is a
+number: `failed=0` out of 9 821 requests, counted from a file the load generator wrote.
+Not "we use Kubernetes" — a count, and a control run proving the count can come out
+otherwise.
+
+## The commands
+
+```bash
+npm run image:build     # docker/Dockerfile -> marketplace:hw28, with the BuildKit secret
+npm run scan            # trivy, and a threshold that is computed rather than printed
+npm run cluster:up      # kind create cluster + kind load docker-image
+npm run up              # pulumi up: namespace, data layer, migrations, Deployment, PDB, HPA
+
+npm run demo:image      # stages, no shell, not root, and three places the token is not
+npm run demo:rollout    # a release under load: zero responses lost
+npm run demo:pdb        # one eviction allowed, the next refused
+
+npm run destroy         # pulumi destroy
+npm run cluster:down    # kind delete cluster
+```
+
+`demo:rollout` takes a flag, and that flag is the point:
+
+```bash
+npm run demo:rollout -- --broken   # the same code path with the defaults left alone
+```
+
+## The image: what a build needs and a run does not
+
+`docker/Dockerfile` has four stages and the final one installs nothing at all. `build`
+compiles, `deps` resolves the runtime dependency tree from scratch, `dev` is the watcher
+the compose override runs, and `runtime` copies two directories into a distroless base.
+
+`deps` is a separate `npm ci --omit=dev` rather than a prune of `build`'s tree, and the
+reason is layers: pruning leaves the layer that held the dev dependencies underneath the
+one that deleted them, and that layer travels inside the image whether or not the final
+filesystem shows it. The same fact is why a secret deleted in a later layer is still in
+the image.
+
+**Distroless is not a size decision.** The result is 68 MB against roughly 190 MB for the
+same application on `node:22-slim` — real, and not the reason. The reason is on the other
+side: there is no `sh` in the final image, so a remote code execution that reaches for
+`sh -c` has nothing to execute. Not "harder" — nothing. What it costs is named rather than
+hidden: the command is a path (`CMD ["dist/main.js"]`) because node is the entrypoint,
+there is no shell for a compose `HEALTHCHECK` to resolve a bare name with (hence the
+absolute `/nodejs/bin/node`), and debugging means `kubectl debug` or the `:debug` tag
+rather than `kubectl exec … sh`.
+
+`USER 65532`, numerically, and not the base image's own `nonroot`. The kubelet verifies
+`runAsNonRoot: true` **before** the container starts and cannot resolve names, so a
+non-numeric user is `CreateContainerConfigError: image has non-numeric user (nonroot),
+cannot verify user is non-root`.
+
+## The build-stage secret, and three places to look for it
+
+A registry token is needed by `npm ci` and by nothing afterwards. There are two careless
+ways to give it to a build and they leak into two different places:
+
+| How it is passed               | Where it ends up                                                 |
+| ------------------------------ | ---------------------------------------------------------------- |
+| `ARG` + `rm` in the same `RUN` | substituted into the **text** of the command: history and config |
+| a file copied in + `rm` next   | the **bytes** are in a layer; `rm` only adds a whiteout above it |
+| `RUN --mount=type=secret`      | mounted for the length of one `RUN`; in no layer and no metadata |
+
+Docker's own documentation says it in one sentence: build arguments and environment
+variables "persist in the final image". The emphasis belongs on _persist_ — not "are
+visible", not "are easy to find".
+
+`npm run demo:image` looks in all three places, because **no single tool sees both
+leaks**: `docker history` finds a value substituted into a command and is blind to a file
+in a layer, and unpacking the layers is blind the other way round.
+
+```
+stages=4
+shell-inside=0
+runtime-uid=65532
+token-in-history=0
+token-in-config=0
+token-in-layers=0
+leak-token-in-history=3
+leak-token-in-config=3
+leak-token-in-layers=1
+```
+
+The last three lines are the control image. `docker/leak.Dockerfile` is four lines that
+pass the same token the careless way, and the demo runs the identical searches over it. A
+search that finds nothing proves nothing; these say the searches work, and only then do
+the three zeros above them mean anything. If the control ever comes back clean the demo
+fails the process and says so.
+
+Two things in that measurement are worth keeping:
+
+- **`shell-inside` is answered by running a shell, not by reading the Dockerfile.** A base
+  image inherited from somebody else can grow a shell without anybody here deciding to.
+- **Layer blobs in a saved image are gzip.** `grep -r` over the unpacked archive finds
+  nothing and reports a clean image — the most dangerous answer a security check can give,
+  because it is indistinguishable from the true one. `demo/image.mjs` decompresses every
+  blob before searching it.
+
+There is no private registry behind this project, so the token is a decoy with a random
+string in it, written to `.npm_token` (git-ignored) by `image:build` when it is absent.
+That is the shape of the exercise rather than a weakness in it: whatever the value is, the
+question is whether it ends up in the image.
+
+## The scan, and a threshold that is computed
+
+```
+image=marketplace:hw28
+severity=CRITICAL+HIGH
+found=19
+max-allowed=19
+gate=pass
+```
+
+`npm run scan` saves the image to a tar, hands it to trivy **in a container** — a scanner
+is exactly the kind of tool that should not need the Docker socket to do its job — counts
+the findings in the JSON report and compares. Same script, different threshold, different
+verdict and different exit code:
+
+```bash
+SCAN_MAX=-1     npm run scan   # gate=fail, exit 1
+SCAN_MAX=99999  npm run scan   # gate=pass, exit 0
+```
+
+The working threshold is **19, measured on 18.11.2026**, and it is a ratchet rather than
+an opinion: seven findings are openssl in the distroless base, which a newer base fixes
+and nothing in this repository can; twelve are transitive npm dependencies, none of them
+direct — `body-parser` and `proxy-addr` arrive with express 4, pinned at 4.22.2 for a
+documented behavioural reason, and `multer` arrives with `@nestjs/platform-express`.
+
+Zero would be the honest-looking choice and the useless one. The gate would be red from
+the first run, and a build that is always red is a build nobody reads — which is the
+lecture's point about thresholds rather than a loophole in it. The number may be lowered;
+raising it needs a date and a sentence beside it in `scripts/scan.mjs`. The scanner's
+database is refreshed daily, so this going red one morning is the mechanism working.
+
+`--ignore-unfixed` is why a small number is honest: everything left has a published fix,
+so each one is work somebody could do. The count is **not** a measure of how good the base
+is — the lecture measured distroless at 41 findings against alpine's 16, and the distroless
+image is not the leakier one. Different distributions, different advisory feeds.
+
+## The cluster, and what it cost
+
+**kind**, on a Docker with **7,65 ГиБ** allocated. The node container settles at
+**1,23 ГиБ** with all fifteen pods running — six of them this stack's, the rest the
+control plane's — and `kind create cluster` reports `Ready after 17s`. minikube was not
+tried here; the lecture measured it at 18-19 s to start and 620-770 MiB against kind's
+520-545 MiB on a 3,8 ГиБ machine, and refusing to start below `--memory 1800`.
+
+Two files describe it. `k8s/stack.json` holds the names and ports that a shell script, a
+TypeScript program and three demos all have to agree on — spreading those strings across
+four files is four copies of one fact, and the first rename proves it.
+`k8s/kind-config.yaml` is the cluster itself, with the node image pinned by digest and one
+line that everything else depends on:
+
+```yaml
+extraPortMappings:
+    - containerPort: 30080
+      hostPort: 30080
+```
+
+A NodePort is published on the node, and in kind the node is a container — without that
+forward, 30080 answers inside Docker's network and nowhere else. `scripts/cluster-up.sh`
+refuses to start when that number and `k8s/stack.json` disagree, because nothing at
+runtime would say so: the Service would be created happily and the load generator would
+get a connection refused from a host port that forwards nowhere.
+
+And the half that costs people a morning: **an image built on the host does not exist in
+the cluster.** kind's node has its own image store, so `kind load docker-image` is not
+optional and `imagePullPolicy: IfNotPresent` does not rescue it — it is not present. The
+pod sits in `ErrImagePull`, and this is the most common form of "it works on my machine".
+
+## What goes into it: a typed program, not YAML
+
+`infra/` is a Pulumi program in TypeScript. Nothing is applied by hand.
+
+What the types buy is narrow and worth stating plainly: `seelctor` is `TS2353` and
+`replicas: "2"` is `TS2322`, both of them a second after typing and without a cluster to
+try them against. What they do **not** buy matters as much — a field left out entirely is
+legal, because the schema says it is optional. A `readinesProbe` inside a conditional
+spread is a silent no-op that type-checks cleanly and deploys a Deployment with no
+readiness probe at all. That is exactly why the probes are read back **out of the running
+cluster** rather than out of this program:
+
+```bash
+kubectl -n marketplace get deploy marketplace-api -o json
+# readiness=/readiness liveness=/health maxUnavailable=0
+```
+
+The resources: `Namespace`, two `Secret`s, a `ConfigMap`, `Deployment` + `Service` for
+Postgres and for each of the two Redis instances, a migration `Job`, then the application
+`Deployment`, a NodePort `Service`, a `PodDisruptionBudget` and a
+`HorizontalPodAutoscaler`.
+
+The data layer is in the cluster because the service refuses to start without it — its own
+environment schema requires a database and both Redis instances — and a readiness probe
+that pinged nothing would make the whole measurement a lie. `emptyDir` and one replica:
+what is being demonstrated is the application surviving an update, not Postgres surviving
+one.
+
+The schema arrives through a **Job**, not an init container: an init container runs once
+per pod, and two replicas would start two migration runs against one database. Its command
+is `/nodejs/bin/node dist/database/cli/migrate.js` — `command` replaces the image's
+entrypoint, and distroless provides nothing to resolve a bare `node` with.
+
+### `replicas` and the HPA own the same field
+
+The Deployment declares `replicas: 2` and a `HorizontalPodAutoscaler` writes to
+`spec.replicas`. In a cluster with a metrics-server that is **two writers on one field**,
+and Kubernetes keeps an account of who owns what: `pulumi up` after a `kubectl scale`
+fails with `conflict with "kubectl" with subresource "scale" using apps/v1:
+.spec.replicas`. On one machine you are the only writer and drift is cured silently; in a
+cluster there are many, and infrastructure as code stops being "apply my truth" and
+becomes "agree whose truth this field is".
+
+Three ways out, and none of them is right by default: take the field by force
+(`"pulumi.com/patchForce": "true"`), hand it over (`ignoreChanges: ["spec.replicas"]`), or
+stop declaring it — the same thing, said honestly. Declaring an HPA means not declaring
+`replicas`.
+
+It is still declared here, deliberately. kind has no metrics-server, so the autoscaler
+reports `cpu: <unknown>/70%` and scales nothing; remove `replicas` and the Deployment
+defaults to one, which breaks the disruption budget and the rollout measurement with it.
+The day this runs where metrics exist, the line to delete is that one.
+
+## Probes: two questions, two paths
+
+`/readiness` answers "may I be sent traffic". `/health` answers "should I be killed". They
+are different questions with different consequences — readiness takes the pod's address
+out of the EndpointSlice, liveness restarts the container — and putting them on one URL
+turns "busy for a moment" into a restart, and the restart into a loop.
+
+| Probe     | Path         | Shape                                          |
+| --------- | ------------ | ---------------------------------------------- |
+| readiness | `/readiness` | `periodSeconds: 1`, `failureThreshold: 1`      |
+| liveness  | `/health`    | `initialDelaySeconds: 15`, `periodSeconds: 10` |
+
+The readiness period is short because it decides how long a pod that has just been told to
+go away keeps receiving traffic. The liveness delay is long because a liveness probe that
+fires during a slow start restarts the pod for being slow, and the restart starts it
+slowly again.
+
+There is no `startupProbe`, and that is a decision rather than an omission: the warm-up
+here is a bounded four seconds, well inside the fifteen the liveness probe waits. A
+startup probe earns its place when the start is long **and uneven** — migrations, a cold
+cache — because then the alternative is raising `initialDelaySeconds` to cover the worst
+case and living with a liveness probe that notices a hang three minutes late.
+
+## The rollout, measured
+
+Two profiles, one code path. `MARKETPLACE_PROFILE` picks which, `demo:rollout --broken`
+sets it, and the four lines of difference live in `infra/profile.ts` rather than in a
+branch of the demo.
+
+| Profile    | requests | ok     | failed             | rollout-seconds |
+| ---------- | -------- | ------ | ------------------ | --------------- |
+| `hardened` | 9 821    | 9 821  | **0** (0,00 %)     | 11,13           |
+| `broken`   | 15 318   | 11 924 | **3 394** (22,2 %) | 0,63            |
+
+An earlier run of the correct profile gave 4 617 of 4 617: the zero reproduces, it is not
+one lucky pass. The broken profile loses roughly one request in five, and finishes in half
+a second precisely **because** it waits for nothing.
+
+A failure during a rolling update usually is not a 500. The connection is refused or reset
+and there is no status code at all — `000`, the way curl writes it; behind an Ingress or a
+cloud balancer the same event arrives as 502 or 503. The demo therefore counts "responses
+that were not 200", which is more honest than calling an absent answer a five hundred.
+
+Two holes exist in a default rolling update and they are both windows, not bugs:
+
+1. the new pod is already in the Service's endpoint list and **is not listening yet**;
+2. the old pod has **stopped listening** and is still in the endpoint list.
+
+Kubernetes does not promise to remove an endpoint before it sends SIGTERM — the
+EndpointSlice controller and the kubelet are separate components running in parallel — so
+the second window always exists and something has to stand in it.
+
+Four lines close both:
+
+| Line                                           | What it does                                                      |
+| ---------------------------------------------- | ----------------------------------------------------------------- |
+| `maxUnavailable: 0` + `maxSurge: 1`            | never fewer than the declared count while rolling (default: 25 %) |
+| `terminationGracePeriodSeconds: 20`            | larger than the 5 s drain; smaller means SIGKILL mid-drain        |
+| `readinessProbe` on `/readiness`, 1 s          | without it a pod counts as ready from the instant it starts       |
+| `livenessProbe` on `/health`, not `/readiness` | the same path for both is an endless restart loop                 |
+
+And one more that is in the application rather than the manifest. On SIGTERM `src/main.ts`
+**turns readiness red first**, waits out `DRAIN_MS`, and only then closes the socket.
+Closing immediately is the common mistake: it refuses connections during the window in
+which the balancer is still sending them, so the client gets a dropped connection instead
+of an answer. `WARMUP_MS` is the mirror image — four seconds waited out **before**
+`listen()`, so during it there is no listener at all. That is what a real service does
+while a pool fills, and it is what makes the broken profile's failures real rather than a
+quirk of a process that happens to start instantly.
+
+The price of zero is in the last column: the correct profile takes around eighteen times
+longer. `maxUnavailable: 0` will not take the old pod away until the new one says it is
+ready, and every pod pays the drain. That is the trade, and it is worth saying out loud
+rather than discovering it on a deploy that was expected to take three seconds.
+
+## PodDisruptionBudget: a contract, not insurance
+
+```
+healthy=2
+minAvailable=1
+evict-1=201
+evict-2=429
+delete-bypassed-budget=1
+```
+
+Two evictions through the Eviction API: `minAvailable: 1` over two replicas leaves exactly
+one disruption to spend, so the first is allowed and the second is refused. Those are the
+HTTP status codes the API server actually answered with, which is why the demo runs
+`kubectl proxy` and posts to it — `kubectl create --raw` reports success or an error
+message and never a code.
+
+The third line is the one people are surprised by. `kubectl delete pod` walks straight past
+the budget, and the documentation says so in as many words: deleting deployments or pods
+bypasses pod disruption budgets. A budget is a contract with whoever is draining a node,
+not insurance against a pod dying. It will count an unplanned death; it will not prevent
+one.
+
+Which is also why `minAvailable: replicas` is a trap. It reads like maximum protection and
+leaves zero voluntary disruptions, so no node can ever be drained and an administrator
+cannot patch the machine — a bigger risk than the one it was meant to manage. The program
+refuses to run below two replicas for the same reason: over a single replica the only
+possible budget is zero, and a budget that allows everything protects nothing.
+
+## Secrets: from the store to the cluster
+
+Nothing new was invented here. The values come out of the HW-11 store through
+`scripts/with-secrets.sh` — the same wrapper #13, #14, #22 and #24 use — and
+`SKIP_VAULT=1` steps it aside for a CI runner or a grader who already has them. No new
+`.env` file was introduced for this assignment.
+
+### Variables
+
+| Змінна                     | What                                                | Джерело (source)                                                      |
+| -------------------------- | --------------------------------------------------- | --------------------------------------------------------------------- |
+| `DB_PASSWORD`              | the database password, as a value for the CLI tools | сховище (#11) — into a K8s Secret, mounted into the service as a file |
+| `PULUMI_CONFIG_PASSPHRASE` | encrypts the local Pulumi state                     | сховище (#11); no default, because the state holds Secret data        |
+
+The four signing variables of #24 and the five object-store variables of #26 are required
+by this deployment too — they are in their own tables above, and the Pulumi program reads
+all eleven. Remove any one of them and the deployment refuses to start **naming it**:
+
+```bash
+cd infra && env -u DB_PASSWORD pulumi preview --non-interactive
+# Refusing to deploy: 1 required value(s) are not in the environment.
+#   DB_PASSWORD is missing
+```
+
+That refusal is the first statement of the program, before anything reaches for the
+cluster. The other order is worse than it sounds: a missing password surfaces as a
+connection error or a timeout somewhere in the middle of a preview, and whoever ran it
+learns that something is wrong rather than which value is absent.
+
+Two Secrets rather than one, because they have two audiences. The database password is
+read by Postgres itself and by the migration Job, and reaches the application as a **file**
+— the #13 decision, unchanged, because the service re-reads that file per connection so
+the password can be rotated under a running process. Everything else is read by the
+application as variables, through `envFrom.secretRef`. One Secret carrying both would put
+the password into the environment of every API pod for no reason.
+
+The manifest holds **references and no values**:
+
+```bash
+kubectl -n marketplace get deploy marketplace-api -o json | grep -c "$DB_PASSWORD"   # 0
+```
+
+`data` and not `stringData`, and that is not a style choice: `stringData` is write-only,
+the API server never gives it back, so the provider sees a difference on every update and
+`pulumi up` twice in a row never says "unchanged".
+
+### base64 is not encryption
+
+A Kubernetes Secret is base64, which is an encoding. In this cluster the value sits in
+etcd as plain text — `encryption-provider-config` is not configured by default — so
+"I put it in a Secret" means "I took it out of git", not "I encrypted it".
+
+The industrial answers are named here and deliberately not installed: an **External
+Secrets Operator** keeps only a reference in git (`ExternalSecret` + `SecretStore`) and
+syncs the value from a secrets manager into a Secret, and the **Secrets Store CSI driver**
+mounts it straight into the pod as a volume without a Secret object at all. Both are an
+operator in the cluster, which is a dependency this assignment does not need in order to
+demonstrate anything — the wrapper already keeps the value out of git, and that is the
+property being defended.
+
+And the boundary worth saying out loud: the **BuildKit secret lives during `docker build`
+and defends the image**; a **K8s Secret lives at runtime and defends the repository**.
+Neither replaces the other. A build secret must not reach a registry; a runtime secret
+must not reach git.
+
+## Where things are
+
+```
+docker/Dockerfile            build -> deps -> dev -> runtime (distroless, uid 65532)
+docker/leak.Dockerfile       the counter-example: the same token, passed carelessly
+k8s/stack.json               names and ports the scripts, the program and the demos share
+k8s/kind-config.yaml         one node, the pinned node image, and the port forward
+infra/index.ts               the program: validate, then namespace, data layer, app
+infra/secrets.ts             the eleven required values and the refusal that names them
+infra/profile.ts             hardened vs broken — the four lines, in one place
+infra/workloads.ts           the typed resources
+infra/Pulumi.yaml            project; Pulumi.dev.yaml is the stack config
+scripts/image-build.sh       docker build with --mount=type=secret
+scripts/cluster-up.sh        kind create + kind load, and the port check between two files
+scripts/pulumi.sh            the local file backend, the stack, and no passphrase default
+scripts/scan.mjs             trivy in a container; the threshold is a ratchet with a date
+demo/image.mjs               six numbers, and a control image that must leak
+demo/rollout.mjs             the load generator, the file it writes, the counts read back
+demo/pdb.mjs                 two evictions through kubectl proxy, for real status codes
+src/health/services/         the serving state readiness reads and SIGTERM writes
+src/database/cli/migrate.ts  migrations as a file path, because distroless has no shell
 ```
 
 ---

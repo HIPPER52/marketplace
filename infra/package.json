@@ -1,0 +1,15 @@
+{
+    "name": "marketplace-infra",
+    "version": "1.0.0",
+    "private": true,
+    "description": "The Pulumi program that describes everything this service needs in a cluster",
+    "main": "index.ts",
+    "devDependencies": {
+        "@types/node": "^22.10.5",
+        "typescript": "^5.7.3"
+    },
+    "dependencies": {
+        "@pulumi/kubernetes": "^4.19.0",
+        "@pulumi/pulumi": "^3.145.0"
+    }
+}

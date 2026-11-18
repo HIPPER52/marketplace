@@ -1,0 +1,13 @@
+config:
+  # Two, not one. The PodDisruptionBudget below it is minAvailable = replicas - 1, and a
+  # budget over a single replica can only ever be 0 — which allows every disruption and
+  # protects nothing. Two is the smallest count at which "leave one serving" means
+  # anything, and the program refuses to run below it.
+  marketplace:replicas: "2"
+# No `encryptionsalt` here, deliberately. The Kubernetes provider marks Secret data as
+# secret, so the state file is encrypted and this file grows a salt the first time
+# `pulumi up` runs. Committing one would mean committing the passphrase that goes with
+# it: everybody else would need that exact value or get "incorrect passphrase". Left
+# out, the salt is generated for whatever passphrase is in the environment, and the
+# file simply shows up as modified afterwards.
+

@@ -56,7 +56,16 @@
         "demo:cdn": "npm run build && bash scripts/with-secrets.sh dev node dist/cdn/cli/demo-cdn.js",
         "demo:multipart": "npm run build && bash scripts/with-secrets.sh dev node dist/storage/cli/demo-multipart.js",
         "demo:upload": "npm run build && bash scripts/with-secrets.sh dev node dist/storage/cli/demo-upload.js",
-        "start:reaper": "npm run build && bash scripts/with-secrets.sh dev node dist/storage/cli/reaper.js"
+        "start:reaper": "npm run build && bash scripts/with-secrets.sh dev node dist/storage/cli/reaper.js",
+        "image:build": "bash scripts/image-build.sh",
+        "cluster:up": "bash scripts/cluster-up.sh",
+        "cluster:down": "bash scripts/cluster-down.sh",
+        "scan": "node scripts/scan.mjs",
+        "up": "bash scripts/with-secrets.sh dev bash scripts/pulumi.sh up",
+        "destroy": "bash scripts/with-secrets.sh dev bash scripts/pulumi.sh destroy",
+        "demo:image": "node demo/image.mjs",
+        "demo:rollout": "bash scripts/with-secrets.sh dev node demo/rollout.mjs",
+        "demo:pdb": "node demo/pdb.mjs"
     },
     "author": "Dmitry Avtenev",
     "license": "ISC",

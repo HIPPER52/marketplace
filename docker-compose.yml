@@ -10,7 +10,11 @@ services:
     profiles: ["app"]
     build:
       context: ./
-      dockerfile: Dockerfile
+      dockerfile: docker/Dockerfile
+      # Named rather than left to "the last stage": the file ends with the distroless
+      # image on purpose, and a stage appended after it one day should not silently
+      # become what this stand runs.
+      target: runtime
     environment:
       NODE_ENV: production
       # Through the pooler, never straight at Postgres.

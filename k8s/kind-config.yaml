@@ -1,0 +1,23 @@
+# The cluster npm run cluster:up creates.
+#
+# One node, because nothing here is about scheduling across machines: a drain of another
+# node and a cloud load balancer are a different lecture and a different assignment.
+#
+# extraPortMappings is the line without which none of this is reachable. A NodePort is
+# published on the node, and in kind the node is a container — so 30080 answers inside
+# Docker's network and nowhere else unless the port is forwarded to the host here. The
+# load generator in demo/rollout.mjs speaks to 127.0.0.1 on exactly this port, and
+# scripts/cluster-up.sh refuses to start if this number and k8s/stack.json disagree.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    # Pinned with its digest, like every other version in this repository. kind's own
+    # default moves with kind, so without this line two people on two kind versions get
+    # two Kubernetes versions and only one of them has run the demos.
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 30080
+        listenAddress: "127.0.0.1"
+        protocol: TCP
