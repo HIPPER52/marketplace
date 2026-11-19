@@ -1,5 +1,6 @@
 import { Inject, Injectable } from '@nestjs/common';
 import type { CreateOrderRequest } from '../../common/types/api.types';
+import { loggerFor } from '../../observability/utils/logger.util';
 import {
     CARD_REFRESH_QUEUE,
     type CardRefreshQueue,
@@ -49,8 +50,12 @@ export type PlaceOrderResult =
  * The three refusals are returned as data, not thrown. Which HTTP status each deserves is
  * a question about the API edge, and it is answered there.
  */
+const LAYER = 'orders.place-order';
+
 @Injectable()
 export class PlaceOrderService {
+    private readonly log = loggerFor(LAYER);
+
     constructor(
         private readonly idempotency: IdempotencyRegistry,
         private readonly checkout: CheckoutService,
@@ -58,6 +63,8 @@ export class PlaceOrderService {
     ) {}
 
     async place(input: PlaceOrderInput): Promise<PlaceOrderResult> {
+        this.log.debug('claiming the idempotency key');
+
         const requestHash = this.idempotency.fingerprint(input.body);
         const claim = await this.idempotency.claim(input.key, requestHash);
 

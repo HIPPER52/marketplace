@@ -1,0 +1,23 @@
+# What Prometheus scrapes, and the one line in it that needs explaining.
+#
+# The service does not run in this compose stand — it runs on the host, started by a
+# demo or by `npm start` — so the target is `host.docker.internal`, which Docker Desktop
+# resolves to the machine the daemon runs on. On Linux the same name works because the
+# service below declares `extra_hosts: host-gateway`.
+#
+# A scrape that finds nothing is not an error here: the dashboard is empty until something
+# is listening, and none of the three demos reads Prometheus at all. They scrape the
+# application's own /metrics directly, twice, and subtract — a counter delta computed from
+# two reads is the same number Prometheus would have stored, without a 15-second wait for
+# it to notice.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: marketplace-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:3000"]
+        labels:
+          service: marketplace-api

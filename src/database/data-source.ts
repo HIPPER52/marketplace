@@ -1,6 +1,10 @@
 import 'reflect-metadata';
 import { join } from 'node:path';
 import { DataSource, type DataSourceOptions } from 'typeorm';
+import {
+    TYPEORM_LOG_LEVELS,
+    TypeOrmPinoLogger,
+} from '../observability/services/typeorm-logger.service';
 import { ENTITIES } from './constants/entities.constant';
 import { readDatasourceEnv } from './schemas/datasource-env.schema';
 
@@ -43,7 +47,8 @@ export const dataSourceOptions: DataSourceOptions = {
     // migrations, which is also what the TypeORM CLI is pointed at.
     migrations: [join(__dirname, '..', 'migrations', '*.js')],
 
-    logging: ['error', 'warn', 'migration'],
+    logger: new TypeOrmPinoLogger(),
+    logging: TYPEORM_LOG_LEVELS,
 };
 
 /**

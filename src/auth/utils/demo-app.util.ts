@@ -2,13 +2,24 @@ import { generateKeyPairSync, randomBytes } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { INestApplication } from '@nestjs/common';
+import type { INestApplication, LoggerService } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import type { DataSource } from 'typeorm';
-import { configureApp } from '../../common/utils/configure-app.util';
+import { type ConfigureOptions, configureApp } from '../../common/utils/configure-app.util';
 import { DATA_SOURCE } from '../../database/constants/database.constants';
 import { readDatasourceEnv } from '../../database/schemas/datasource-env.schema';
 import { fingerprint } from './key-fingerprint.util';
+
+/** What a demo may change about the application it raises. Both are rarely wanted. */
+export interface DemoAppOptions {
+    /**
+     * A logger to use instead of Nest's own. The observability demos pass the pino one,
+     * because they count the JSON lines the real service writes.
+     */
+    logger?: LoggerService;
+    /** Routes registered ahead of the contract validator — see ConfigureOptions. */
+    beforeValidator?: ConfigureOptions['beforeValidator'];
+}
 
 export interface DemoApp {
     baseUrl: string;
@@ -57,7 +68,7 @@ export interface DemoApp {
  * with the process. Nothing is written to disk, which is the same rule `keygen` follows:
  * a demo that created a key file would be a demo that teaches people to commit one.
  */
-export async function openDemoApp(): Promise<DemoApp> {
+export async function openDemoApp(options: DemoAppOptions = {}): Promise<DemoApp> {
     prepareDatabaseEnv();
     prepareSigningEnv();
 
@@ -67,10 +78,10 @@ export async function openDemoApp(): Promise<DemoApp> {
     const app = await NestFactory.create(AppModule, {
         bodyParser: false,
         abortOnError: false,
-        logger: ['error', 'warn'],
+        logger: options.logger ?? ['error', 'warn'],
     });
 
-    await configureApp(app);
+    await configureApp(app, { beforeValidator: options.beforeValidator });
     await app.listen(0);
 
     const url = await app.getUrl();

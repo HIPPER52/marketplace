@@ -1,0 +1,15 @@
+# The dashboard is a file in this repository, and this is what makes Grafana read it.
+apiVersion: 1
+
+providers:
+  - name: marketplace
+    folder: Marketplace
+    type: file
+    # False, and the volume below is read-only, because this file is **source** rather
+    # than state. Grafana writing back to it would mean the artefact a reviewer checks
+    # out is not the artefact that was committed, and the dashboard is one of the things
+    # this assignment is graded on. Changing a panel means editing the JSON.
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

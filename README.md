@@ -363,6 +363,34 @@ the machine. `DB_USER` is the application role, not the superuser — [`init.sql
 creates it and grants it `CREATE` on schema `public`, because Postgres 15 took away the
 implicit grant and without it the very first migration statement fails.
 
+### HW-29: logs, metrics and traces
+
+The stand is the same `docker compose up -d --wait` as everything else — it now raises
+Prometheus, Jaeger and Grafana beside the data layer. Three addresses and nothing else:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:22918   # Jaeger's OTLP/HTTP receiver
+export PROMETHEUS_URL=http://127.0.0.1:22901                # for a human, not for the demos
+export TRACE_API_URL=http://127.0.0.1:22904                 # Jaeger's query API
+
+npm run demo:logs       # non-json-lines=0 layers=4 burst-trace-ids=8 secret-in-logs=0
+npm run demo:metrics    # counter-delta=60 errors-delta=20 series-before = series-after
+npm run demo:trace      # trace-matches-header=1 trace-matches-log=1 span-status-error=1
+```
+
+Each demo builds first, raises the service as a **child process** on a port nobody asked
+for, and reads that child's stdout — the log is the measurement, so it has to be the log a
+container would actually write rather than a logger redirected for a test. Each clears the
+rate-limit keys of the previous run before it starts, which is what makes three
+consecutive runs print the same thing three times.
+
+Ports live in **22900–22999**, outside the 25xxx/26xxx/29xxx the stands of #12, #15, #19,
+#23 and #26 own. The dashboard is at <http://localhost:22900/d/marketplace-red>; anonymous
+access is Viewer, so there is nothing to log in to.
+
+`demo:trace` is the only one that needs the stand. The other two create spans without
+exporting them, which is a real deployment rather than a degraded one.
+
 ## Where the credentials come from
 
 `src/database/data-source.ts` reads five variables and nothing else: no host, no password,
@@ -3459,6 +3487,280 @@ demo/pdb.mjs                 two evictions through kubectl proxy, for real statu
 src/health/services/         the serving state readiness reads and SIGTERM writes
 src/database/cli/migrate.ts  migrations as a file path, because distroless has no shell
 ```
+
+---
+
+# Observability — HW-29
+
+HW-28 asked whether a release survives an update. This one asks a different question:
+**at 03:15 one request returned 500 — how long does it take to say what happened?** The
+answer has to be a minute, and a minute is only possible if the line in the log, the span
+in the trace and the request the client made are all the same key.
+
+## The commands
+
+```bash
+docker compose up -d --wait   # Prometheus on 22901, Jaeger on 22904, Grafana on 22900
+
+npm run demo:logs       # the correlator lives in the context, and eight at once do not mix
+npm run demo:metrics    # RED counts what happened, and a label does not multiply
+npm run demo:trace      # one key in the log line and in the span of the same request
+```
+
+The dashboard is at <http://localhost:22900/d/marketplace-red> and needs no login —
+anonymous access is Viewer. Prometheus scrapes `host.docker.internal:3000`, so the panels
+fill while `npm start` is running; the demos never read Prometheus at all.
+
+## Four questions, four tools — and the one that is missing
+
+| Tool               | Answers                       | Cannot, by construction              |
+| ------------------ | ----------------------------- | ------------------------------------ |
+| **pino**           | what happened at 03:15        | five hundred lines are not one error |
+| **Prometheus**     | how many, and how fast        | a number is not a stack trace        |
+| **OpenTelemetry**  | where in the chain it broke   | a trace is a sample                  |
+| _an error tracker_ | first time, or since Thursday | not installed here — see below       |
+
+The word the first three do not have is **fingerprint**. A metric counts events, a log
+lists them, a trace stitches them in time, and none of them knows "this is the same error
+as yesterday". That is the fourth pillar and this stand deliberately does not have one:
+grouping by fingerprint is a different product with a different storage shape, and the
+honest thing is to name the gap rather than to pretend three tools cover four questions.
+
+## Logs: an event with fields, and a correlator nobody passes
+
+A log line here is not text. `"order 42 fetched"` answers a question only if you already
+know which question to grep for; `{"msg":"reading one order","order_id":42,"trace_id":…}`
+answers "show me every request by this user that returned 5xx".
+
+The correlator is the part worth being precise about. It is **not** a uuid this service
+invents — it is `trace.getActiveSpan()?.spanContext().traceId`, read in a pino `mixin`.
+A home-grown id looks identical in a log line, sits in the same field, reads the same to a
+human, and matches nothing in any trace and nothing in any header. The whole of
+`demo:trace` is that one difference.
+
+Nothing is passed. No function in this service takes `req` so that it can log, because the
+moment one layer does not take it, that layer's lines come out with no id and the incident
+has a hole in the middle of it. What a request knows about itself — the user id once a
+signature has been checked, the `Idempotency-Key`, the route template — lives in
+`AsyncLocalStorage`, and `middleware/request-context.middleware.ts` puts it there once, on
+the way in.
+
+**Where that breaks, and it is a boundary rather than a bug.** A callback created outside
+the request's context runs without it: a connection-pool handler, a listener installed at
+startup, a BullMQ worker from #23. Its lines come out with an empty `trace_id`, and the
+cure is `AsyncResource.bind` at the point where the callback is made — not something the
+logger can do for you.
+
+### Every line is JSON, including the ones this service did not write
+
+`non-json-lines=0` is a count over the **whole** of stdout, and two other systems write to
+it: Nest's own startup lines and TypeORM's query errors, both plain text with colour
+escapes. Each has an adapter — `services/nest-logger.service.ts` and
+`services/typeorm-logger.service.ts` — pointing at the same pino instance. The second one
+earns its keep twice: a failing query is logged from inside the call that issued it, so
+`duplicate key value violates unique constraint` carries the same `trace_id` as the 500
+the client saw.
+
+### Redaction, and exactly how far it reaches
+
+`redact` hides what it was told to hide and guesses nothing. `*.token` matches `x.token`
+and not `x.y.token` — one level, not any depth — so a nested object whose path is not in
+the list travels into the log in full.
+
+This service resolves that by not having the argument: **no request body is ever logged**.
+Headers are, because `authorization` is useful and `redact` removes it; bodies are not,
+because passwords, tokens and card numbers all arrive in one. `demo:logs` sends a bearer
+token with a marker in it and a password with another, and reports `secret-in-logs=0`: the
+token is the one redaction actually works on, and the password never reaches the logger.
+
+### Three journals that get confused for each other
+
+| Journal         | Question                | Read by           | Property it must have      |
+| --------------- | ----------------------- | ----------------- | -------------------------- |
+| application log | what did the service do | an engineer       | cheap, short retention     |
+| audit log       | who did what            | security, a court | **immutability**           |
+| SIEM            | is this an attack       | a SOC             | correlation across systems |
+
+Three requirements, three stores. Putting an audit trail in the log store gives everyone
+who can read logs the right to read the audit, and #27's timestamping and counter-signing
+belong to the second column, not to this one. This assignment is about the first row.
+
+## Metrics: RED, and what a label costs
+
+Two instruments. **Rate** and **Errors** come out of one counter — an error rate is the
+same counter with a status filter, so two metrics would be two things to keep in step.
+**Duration** is a Histogram and deliberately not a Summary: a Summary computes quantiles
+inside the process, quantiles do not average, and the moment there are two replicas the
+p95 on the dashboard is the p95 of nothing.
+
+### The three panels
+
+| Panel                    | RED question | PromQL                                                                                          |
+| ------------------------ | ------------ | ----------------------------------------------------------------------------------------------- |
+| Rate — how many requests | **R**ate     | `sum by (route) (rate(http_requests_total[1m]))`                                                |
+| Errors — how many failed | **E**rrors   | `sum by (route, status) (rate(http_requests_total{status=~"5.."}[1m]))`                         |
+| Duration — how fast      | **D**uration | `histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket[1m])))` |
+
+`[1m]` and not `[5m]`: a demo that runs for ninety seconds never fills a five-minute
+window, and the panel stays flat for a reason that has nothing to do with the service.
+
+The error filter is **5xx only**. A 4xx is the client being refused — a 422 on a replayed
+`Idempotency-Key` is #22 working exactly as designed — and counting it as an error makes
+the panel useless the first time somebody fuzzes the API.
+
+### p95 is about requests, not about people
+
+`p95 = 200 ms` means 95 of every 100 **requests** were faster than 200 ms. It does not
+mean 95 % of users were happy: one customer whose every call lands in the slow tail is
+entirely invisible behind a healthy p95.
+
+And the quantile is as precise as the buckets are, because a histogram stores counters per
+bucket rather than your values — `histogram_quantile` interpolates along a straight line
+inside the bucket that contains the rank it wants.
+
+### The buckets, and the number that watches them
+
+```
+0.005  0.01  0.025  0.05  0.1  0.25  0.5  1  2.5  5   (seconds, then +Inf)
+```
+
+The top finite boundary is **5 s**, which is above the worst case this service has rather
+than above its typical one: the slowest thing it does is a checkout that retried a
+serialization failure. That matters because `histogram_quantile` **cannot see past the
+last finite `le`** — everything above lands in `+Inf`, and the quantile then stops at the
+boundary and reports a number that looks healthy exactly when it is not.
+
+`demo:metrics` prints `above-top-bucket`, which is `_count` minus `_bucket{le="5"}`, and
+it must be zero. If it ever is not, the answer is more buckets, never a shorter demo.
+
+### Cardinality is a multiplier, not a field
+
+Every distinct combination of label values is a **separate time series with its own
+memory**, kept for as long as retention says. A label whose value the caller chooses — an
+order id, a raw path, an error message — is therefore not a field: it is a multiplier.
+
+So `route` is the **template**. `/products/:productId`, never `/products/8ca1…`, and a
+request that matched nothing at all gets one shared `<unmatched>` rather than one series
+per guess a scanner makes. `demo:metrics` sends a hundred requests with a hundred
+different ids and reports `series-before=4 series-after=4`.
+
+## Traces: where the time went, and where it broke
+
+A **span** is one interval of work with a name, a duration, attributes and a status. A
+**trace** is the tree of spans sharing one `trace_id`. **Context propagation** is what
+keeps that tree whole across a process boundary, and on HTTP it is one header:
+
+```
+traceparent: 00-<32 hex trace-id>-<16 hex parent-id>-<2 hex flags>
+             ^version                                ^sampled?
+```
+
+The last byte carries the decision taken at the **start** of the trace, which is why
+sampling has to be decided there or deferred to a collector.
+
+Auto-instrumentation produces the HTTP server span, the Nest controller span and the
+`pg.query` span without a line of application code. It also produced **thirty-four** spans
+for one request, twenty-four of them Express middleware layers; those are switched off in
+`tracing.util.ts`, because a trace nobody can read is a trace nobody opens.
+
+Two things are deliberate there and both were found by measuring:
+
+- **the SDK starts before anything else is loaded.** Auto-instrumentation patches modules
+  as they are required, so a module already in the cache is a module nobody patched. That
+  is why `main.ts` starts tracing on its first executable line and reaches Nest, the
+  validator and the application module through dynamic imports afterwards.
+- **`@opentelemetry/instrumentation-pino` is off.** It injects `trace_id`, `span_id` and
+  `trace_flags` into every line by patching the logger — the same job the mixin does, in
+  source anybody here can read. Two mechanisms writing one field is one too many.
+
+### Sampling, in one paragraph, because it is not implemented here
+
+**Head** sampling decides on the first span, by probability, before anything interesting
+has happened — so it throws away whatever became interesting later. Ten per cent of traces
+is ten per cent of your incidents, because errors are not random, they are **rare**.
+**Tail** sampling decides once the trace is finished and can keep every trace that
+contains an error, at the cost of holding traces in a collector's memory until it decides.
+This stand keeps everything: it is one machine and a demo, and the honest note is that the
+choice only starts to matter when the bill does.
+
+## Numbers from this machine
+
+Three consecutive runs of each demo produced identical output. These are run 3.
+
+```
+demo:logs                       demo:metrics                 demo:trace
+non-json-lines=0                sent-ok=40                   spans=21
+layers=4                        sent-fail=20                 orphan-spans=0
+distinct-trace-ids=1            counter-delta=60             trace-matches-header=1
+trace-id-matches-header=1       errors-delta=20              trace-matches-log=1
+burst=8                         top-bucket-seconds=5         span-status-error=1
+burst-trace-ids=8               above-top-bucket=0           failing-status=500
+burst-uneven=0                  series-before=4              broken-spans=9
+secret-req-logged=1             series-after=4
+secret-in-logs=0                distinct-ids-sent=100
+```
+
+`burst-uneven=0` is the one worth staring at. Eight identical requests run at the same
+time, each with its own `traceparent`, and the log groups into exactly eight sets of
+exactly the same size. The classic way to fail it is a "current request" in a module-level
+variable: it works perfectly for one caller and silently interleaves for two, so the lines
+of one request end up filed under another's id — and the numbers come out 9 groups of
+uneven sizes, which is what this demo printed before the context was done properly.
+
+`trace-matches-log=1` is the assignment's whole point and the reason the correlator is the
+span's id rather than a uuid.
+
+The stand costs **513 MiB** with everything idle — Prometheus 37, Jaeger 56, Grafana 420.
+Grafana is four fifths of it, which is worth knowing before adding a fourth tool: the
+lecture's own GlitchTip stand was 2,84 GiB, more than everything else put together.
+
+### Variables
+
+| Variable                            | What                                        | Джерело (source)                                          |
+| ----------------------------------- | ------------------------------------------- | --------------------------------------------------------- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`       | where spans are exported; **optional**      | the HW-11 store — `.env` locally, a manager in deployment |
+| `TRACE_API_URL`                     | where `demo:trace` reads traces back from   | the HW-11 store; read by the demos, never by `src/`       |
+| `PROMETHEUS_URL`                    | the stand's Prometheus, for a human         | the HW-11 store; nothing in `src/` or the demos reads it  |
+| `GRAFANA_USER` / `GRAFANA_PASSWORD` | the stand's login; `admin`/`admin` if unset | the HW-11 store; a local stand, not a secret              |
+
+All of them arrive through `scripts/with-secrets.sh`, the same wrapper #13, #14, #22, #24
+and #28 use, and `SKIP_VAULT=1` steps it aside for a grader who has the values already.
+No new `.env` file was introduced.
+
+Only the first is in `.env.example`, because that file is held to the **service's** schema
+by `npm run check:env` and nothing in `src/` reads the other three — the same arrangement
+`BROKER_URL` has had since #19.
+
+Unset, `OTEL_EXPORTER_OTLP_ENDPOINT` is a supported deployment rather than a mistake:
+spans are still created, context still crosses process boundaries and `trace_id` still
+reaches every log line. There is simply no backend to look one up in, which is why
+`demo:logs` and `demo:metrics` need no stand and `demo:trace` says plainly that it does.
+
+## SLI, SLO, error budget — and what observability actually buys
+
+An **SLI** is a number already on the screen: the share of requests faster than 300 ms.
+An **SLO** is the share promised — 99,5 % over 30 days — and it is a decision of the
+business, not of an engineer. The **error budget** is what is left: 0,5 % of 30 days is
+`0.005 × 30 × 24 × 60` = **216 minutes a month**. An alert fires on the **burn rate** of
+that budget, never on a single 5xx; an alert that wakes somebody for one bad request is an
+alert that gets muted on the third night.
+
+Availability is `MTBF / (MTBF + MTTR)`. Nothing in this assignment makes failures rarer —
+it makes them **shorter**, and only in three of the four steps:
+
+| Step of MTTR | What cuts it                         | Where it is here                          |
+| ------------ | ------------------------------------ | ----------------------------------------- |
+| notice       | an alert on budget burn rate         | not built — named, and left to a real SLO |
+| understand   | `trace_id`, the trace, a fingerprint | the three demos above                     |
+| fix          | **your code**                        | nowhere, and that is honest               |
+| confirm      | the same metric that alerted         | the RED panels                            |
+
+## What is deliberately not here
+
+No alert ever fired on this stand, nothing is kept for longer than two hours, there is no
+tail-based sampling, no log shipping into Loki, and no error tracker with fingerprints.
+Each of those is a decision with a bill attached, and the measurements above do not depend
+on any of them.
 
 ---
 
