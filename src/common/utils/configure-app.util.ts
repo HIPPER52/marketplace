@@ -1,7 +1,9 @@
 import { join } from 'node:path';
 import type { INestApplication } from '@nestjs/common';
-import express from 'express';
+import express, { type Express } from 'express';
 import * as OpenApiValidator from 'express-openapi-validator';
+import { httpMetricsMiddleware } from '../../observability/middleware/http-metrics.middleware';
+import { requestContextMiddleware } from '../../observability/middleware/request-context.middleware';
 import { ProblemFilter } from '../filters/problem.filter';
 import { problemErrorMiddleware } from '../middleware/problem.middleware';
 
@@ -30,8 +32,43 @@ const SPEC_PATH = join(__dirname, '..', '..', '..', 'openapi', 'openapi.yaml');
  * An E2E suite that assembled this itself would drift from main.ts, and the day it did,
  * the tests would be describing an application nobody deploys.
  */
-export async function configureApp(app: INestApplication): Promise<void> {
+/**
+ * Named, and it has exactly one member, because exactly one thing needs to happen between
+ * two of the steps below.
+ */
+export interface ConfigureOptions {
+    /**
+     * Registered **after** the instrumentation and **before** the contract validator.
+     *
+     * That window exists for one caller: `demo/children/app-child.mjs`, which needs an
+     * endpoint that answers 5xx — OpenTelemetry leaves a span's status `Unset` for a 4xx,
+     * so only a server error demonstrates an ERROR span — and this service deliberately
+     * has no route whose job is to fail. Registering it here rather than in `src/` keeps
+     * that true: production passes nothing, the validator would 404 anything added later
+     * because it is not in the contract, and anything added earlier would be invisible to
+     * the metrics and the trace, which is the whole of what is being measured.
+     */
+    beforeValidator?: (express: Express) => void;
+}
+
+export async function configureApp(
+    app: INestApplication,
+    options: ConfigureOptions = {},
+): Promise<void> {
+    /**
+     * Observability first, ahead of the body parser and ahead of the validator.
+     *
+     * A request the OpenAPI validator refuses never reaches Nest, so instrumentation
+     * mounted any later counts a service that has no validation failures in it and logs
+     * nothing about the 400 the client is looking at. These two are also the only
+     * middleware here that must see *every* request, including the ones nothing serves.
+     */
+    app.use(requestContextMiddleware);
+    app.use(httpMetricsMiddleware);
+
     app.use(express.json());
+
+    options.beforeValidator?.(app.getHttpAdapter().getInstance());
 
     app.use(
         OpenApiValidator.middleware({
@@ -60,7 +97,7 @@ export async function configureApp(app: INestApplication): Promise<void> {
             // so the very first request is GET /socket.io/?EIO=4&transport=polling. The
             // validator finds no such path in the spec, answers 404, the upgrade never
             // happens — and the symptom is a client that silently never connects.
-            ignorePaths: /^\/(health|readiness)$|^\/socket\.io(\/|$)/,
+            ignorePaths: /^\/(health|readiness|metrics)$|^\/socket\.io(\/|$)/,
         }),
     );
 

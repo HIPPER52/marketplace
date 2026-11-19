@@ -132,6 +132,21 @@ export const envSchema = z.object({
         .string({ error: 'required: the bucket everything is written to' })
         .min(1, 'required: the bucket everything is written to'),
 
+    /**
+     * Where spans go, and **optional on purpose**.
+     *
+     * Unset is a supported deployment rather than a misconfiguration: spans are still
+     * created, the context still crosses process boundaries, and `trace_id` still reaches
+     * every log line — there is simply no backend to look one up in. That is the shape a
+     * developer runs in, and it is why `demo:logs` needs no stand at all while
+     * `demo:trace` says plainly that it does.
+     *
+     * Read directly from `process.env` by the tracing bootstrap, because that runs before
+     * Nest exists. It is declared here anyway: a variable this service honours and does
+     * not document is a variable nobody knows to set.
+     */
+    OTEL_EXPORTER_OTLP_ENDPOINT: z.string().url().optional(),
+
     DB_PASSWORD_FILE: z.string().min(1).default('./secrets/db_password'),
 
     DB_POOL_MAX: z.coerce.number().int().positive().max(100).default(10),

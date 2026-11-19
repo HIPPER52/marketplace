@@ -6,6 +6,7 @@ import { JobKind } from '../../jobs/constants/job-status.constant';
 import { Job } from '../../jobs/entities/job.entity';
 import type { OutboxWriter } from '../../messaging/repositories/outbox.repository';
 import { toOrderPlacedEvent, toOutboxRecord } from '../../messaging/utils/order-placed.mapper';
+import { loggerFor } from '../../observability/utils/logger.util';
 import type { User } from '../../users/entities/user.entity';
 import { OrderStatus } from '../constants/order-status.constant';
 import { CheckoutOutcome } from '../constants/outcome.constant';
@@ -90,7 +91,11 @@ interface ClaimedStockRow {
     currency: Currency;
 }
 
+const LAYER = 'orders.checkout';
+
 export class CheckoutService {
+    private readonly log = loggerFor(LAYER);
+
     constructor(
         private readonly dataSource: DataSource,
         /**
@@ -105,6 +110,8 @@ export class CheckoutService {
     ) {}
 
     async checkout(request: CheckoutRequest): Promise<CheckoutResult> {
+        this.log.debug({ lines: request.lines.length }, 'opening the checkout transaction');
+
         try {
             return await withRetry(this.dataSource, { label: 'checkout' }, (manager) =>
                 this.run(manager, request),

@@ -245,6 +245,82 @@ services:
       timeout: 30s
       retries: 10
 
+  # --- observability, HW-29 -------------------------------------------------------------
+  #
+  # Three containers for the three questions that are not the fourth: how many and how
+  # fast (Prometheus), where in the chain it broke (Jaeger), and one screen to read both
+  # on (Grafana). The fourth question — "is this error new or Thursday's" — needs an error
+  # tracker with fingerprints, and this stand deliberately does not have one.
+  #
+  # Ports live in 22900-22999 so that nothing here can collide with the stands of #12,
+  # #15, #19, #23 or #26, which own 25xxx, 26xxx and 29xxx.
+  #
+  # The application is NOT in this stand. It runs on the host, so Prometheus scrapes
+  # host.docker.internal and the service exports spans to the published OTLP port. That is
+  # the arrangement a developer actually has, and it keeps `docker compose up -d --wait`
+  # the single command everything else begins with.
+
+  prometheus:
+    image: prom/prometheus:v3.16.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2h
+      - --web.enable-lifecycle
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "22901:9090"
+    # Docker Desktop resolves host.docker.internal on its own; this line is what makes the
+    # same name work on Linux, where it does not exist.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9090/-/healthy"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  # Jaeger v2, not the v1 all-in-one: v1 prints "you are running a deprecated version" on
+  # every start, and v2 answers /api/v3/traces/{id} with OTLP JSON — the same shape the
+  # exporter sent, so the demo parses one format rather than translating between two.
+  # Memory storage, because a trace that has to survive a restart is a different product.
+  jaeger:
+    image: jaegertracing/jaeger:2.23.0
+    ports:
+      # The query API the demo reads, and the OTLP endpoint the service writes to.
+      - "22904:16686"
+      - "22918:4318"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:16686/"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
+  grafana:
+    image: grafana/grafana:13.3.1
+    environment:
+      # A login nobody has to be told, on a stand published to 127.0.0.1 and holding
+      # nothing but counters. Anonymous access as Viewer so that a reviewer who opens the
+      # link sees the dashboard rather than a form.
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "22900:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/api/health"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+
   db:
     image: postgres:17-alpine
     environment:
