@@ -3956,10 +3956,18 @@ the policy, which is the right order to ask the two questions in. `algorithms: [
 pinned on the verify for the reason #24 spells out at length — without it the token chooses
 how it is checked.
 
-What the demo substitutes for GitHub is the **identity provider**: a key pair made in the
-process, a JWKS on a loopback port. What it does not touch is the policy, including which
-subjects it trusts — the green case takes its subject from the committed file rather than
-repeating one.
+What the demo substitutes for GitHub is the **identity provider**, and only its address: a
+key pair made in the process, a discovery document and a key set on a loopback port.
+Where the keys live is **discovered**, not passed in — `scripts/oidc-gate.mjs` reads
+`/.well-known/openid-configuration` and follows its `jwks_uri`, which is the one thing in
+this chain that must never be guessed. GitHub answers 404 at the conventional
+`/.well-known/jwks.json` and publishes at `/.well-known/jwks`; an earlier version assumed
+the convention, and because the demo was handed the address directly, the wrong one
+survived all the way to a runner. The demo now serves its keys from a path no convention
+would guess, so that mistake cannot come back unnoticed.
+
+What it does not touch is the policy, including which subjects it trusts — the green case
+takes its subject from the committed file rather than repeating one.
 
 On a real runner the same `scripts/oidc-gate.mjs` asks for a token and writes the claims —
 **never the token**, which is a bearer credential and would be a credential in a log and in

@@ -32,10 +32,14 @@ import { DEPLOY_AUDIENCE, loadPolicy, verifyToken } from '../scripts/oidc-gate.m
  * therefore never reaches the policy at all — `policy-allow=0` there means "not asked",
  * which is the right order to ask the two questions in.
  *
- * What this demo substitutes for GitHub is the **identity provider**: a key pair made
- * here, a JWKS served from a port on this machine. What it does not touch is the policy,
- * which is read from `oidc/policy.json` exactly as written, including which subjects it
- * trusts — the green case takes its subject from that file rather than repeating one.
+ * What this demo substitutes for GitHub is the **identity provider**, and only its
+ * address: a key pair made here, a discovery document and a key set on a loopback port.
+ * Where those keys live is discovered rather than passed in, and they are served from a
+ * path no convention would guess — an earlier version handed the gate a JWKS address
+ * directly, which is how a wrong one survived all the way to a runner. What it does not
+ * touch is the policy, which is read from `oidc/policy.json` exactly as written,
+ * including which subjects it trusts — the green case takes its subject from that file
+ * rather than repeating one.
  */
 
 const KID = 'oidc-demo-key';
@@ -76,7 +80,23 @@ function rsaPair() {
 }
 
 /**
- * The issuer's JWKS, on a port this process owns.
+ * Where this issuer publishes its keys — and deliberately **not** where anybody would
+ * guess.
+ *
+ * `/.well-known/jwks.json` is the convention a dozen providers follow, and the gate used
+ * to assume it. GitHub does not: it answers 404 there and publishes at
+ * `/.well-known/jwks`, which the first run against a real runner discovered the
+ * expensive way. Serving the keys from a path that matches neither is what makes this
+ * demo able to catch that class of mistake rather than paper over it — the only way to
+ * find them from here is to read the discovery document, which is what the gate now does.
+ */
+const JWKS_PATH = '/oidc/keys';
+
+/** Fixed by OpenID Connect Discovery 1.0 §4, and the one convention worth relying on. */
+const DISCOVERY_PATH = '/.well-known/openid-configuration';
+
+/**
+ * The issuer, on a port this process owns: a discovery document and a key set.
  *
  * It publishes the public half of `trusted` and nothing else, which is the entire reason
  * the forged token fails: the verifier looks a key up by `kid`, finds the real one, and
@@ -85,21 +105,30 @@ function rsaPair() {
  */
 function startIssuer(publicJwk) {
     return new Promise((resolve) => {
+        let origin = '';
+
         const server = createServer((request, response) => {
-            if (request.url !== '/.well-known/jwks.json') {
+            let body = null;
+
+            if (request.url === DISCOVERY_PATH) {
+                body = { issuer: origin, jwks_uri: `${origin}${JWKS_PATH}` };
+            } else if (request.url === JWKS_PATH) {
+                body = { keys: [{ ...publicJwk, kid: KID, use: 'sig', alg: 'RS256' }] };
+            }
+
+            if (body === null) {
                 response.writeHead(404).end();
                 return;
             }
 
             response.writeHead(200, { 'content-type': 'application/json' });
-            response.end(
-                JSON.stringify({ keys: [{ ...publicJwk, kid: KID, use: 'sig', alg: 'RS256' }] }),
-            );
+            response.end(JSON.stringify(body));
         });
 
         server.listen(0, '127.0.0.1', () => {
             const { port } = server.address();
-            resolve({ server, origin: `http://127.0.0.1:${port}` });
+            origin = `http://127.0.0.1:${port}`;
+            resolve({ server, origin });
         });
     });
 }
@@ -126,7 +155,9 @@ async function main() {
     const forged = rsaPair();
 
     const { server, origin } = await startIssuer(trusted.publicJwk);
-    const overrides = { issuer: origin, jwksUri: `${origin}/.well-known/jwks.json` };
+    // The issuer, and nothing else. Everything past it — which keys, at which address —
+    // the gate discovers for itself, exactly as it does against GitHub.
+    const overrides = { issuer: origin };
 
     const scenarios = [
         new Scenario('green', trustedSubject, trusted.privatePem, new Expectation(1, 1)),

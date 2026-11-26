@@ -70,10 +70,6 @@ export class TrustPolicy {
         this.subjects = subjects;
     }
 
-    get jwksUri() {
-        return `${this.issuer}/.well-known/jwks.json`;
-    }
-
     /**
      * The two conditions the policy document actually carries.
      *
@@ -143,14 +139,43 @@ export function loadPolicy(file = POLICY_FILE) {
     return new TrustPolicy(`https://${host}`, audiences, subjects);
 }
 
-async function fetchKeys(uri) {
+async function getJson(uri) {
     const response = await fetch(uri);
 
     if (!response.ok) {
         throw new Error(`${uri} answered ${response.status}`);
     }
 
-    const document = await response.json();
+    return response.json();
+}
+
+/**
+ * Where the issuer says its keys are — asked, never assumed.
+ *
+ * This is the one piece of the chain that cannot be guessed, and guessing it is how this
+ * gate failed the first time it met a real runner. `/.well-known/jwks.json` is the
+ * convention a dozen providers follow and GitHub is not one of them: it answers 404
+ * there and publishes at `/.well-known/jwks`, which is exactly why OpenID Connect
+ * Discovery defines a document whose whole job is to say so. The issuer is a constant;
+ * the path under it is the issuer's business.
+ *
+ * `/.well-known/openid-configuration` is the discovery document's fixed location (OpenID
+ * Connect Discovery 1.0 §4), so there is precisely one convention relied on here instead
+ * of two, and it is the one that is actually standardised.
+ */
+async function discoverJwksUri(issuer) {
+    const discovery = await getJson(`${issuer}/.well-known/openid-configuration`);
+    const uri = discovery.jwks_uri;
+
+    if (typeof uri !== 'string' || uri === '') {
+        throw new Error(`${issuer} publishes no jwks_uri in its discovery document`);
+    }
+
+    return uri;
+}
+
+async function fetchKeys(uri) {
+    const document = await getJson(uri);
     return Array.isArray(document.keys) ? document.keys : [];
 }
 
@@ -163,13 +188,17 @@ async function fetchKeys(uri) {
  * repository — a real and frequently published misconfiguration rather than a theoretical
  * one. The policy answers the second question, and only the pair is an authorisation.
  *
- * `issuer` and `jwksUri` are overridable because `npm run demo:oidc` cannot be
- * token.actions.githubusercontent.com. Everything the policy *decides* — the audience and
- * the list of subjects — comes from the committed file either way.
+ * The **issuer** is overridable, because `npm run demo:oidc` cannot be
+ * token.actions.githubusercontent.com — and it is the only thing that is. Everything
+ * downstream of it is discovered or decided: the key location comes from that issuer's
+ * discovery document, and the audience and the list of subjects come from the committed
+ * policy. An earlier version let the caller override the JWKS address too, which meant
+ * the demo supplied the one value that was wrong in production and the bug could not be
+ * reproduced anywhere but on a runner. One substitution, at the top.
  */
 export async function verifyToken(token, policy, overrides = {}) {
     const issuer = overrides.issuer ?? policy.issuer;
-    const jwksUri = overrides.jwksUri ?? policy.jwksUri;
+    const jwksUri = await discoverJwksUri(issuer);
 
     const header = jwt.decode(token, { complete: true })?.header;
 
