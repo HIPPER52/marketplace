@@ -244,12 +244,23 @@ jobs:
           npm run image:build 2>&1 | tee evidence/build.log
 
           # Counted from BuildKit's own output rather than asserted. One image was
-          # written; if this is ever two, something downstream rebuilt and the promise
+          # exported; if this is ever two, something downstream rebuilt and the promise
           # that the deployed bytes are the scanned bytes is gone.
-          invocations=$(grep -c 'writing image sha256:' evidence/build.log || true)
+          #
+          # `exporting to image` and not the digest line beneath it: which digest line
+          # appears depends on the exporter — a containerd image store writes
+          # `exporting manifest sha256:…`, the classic one writes `writing image
+          # sha256:…` — and a count that knows only one of them reports zero builds for
+          # a build that plainly happened. This header is printed by both.
+          invocations=$(grep -c 'exporting to image' evidence/build.log || true)
           echo "invocations=$invocations" >> "$GITHUB_OUTPUT"
           echo "build-invocations=$invocations"
-          test "$invocations" -eq 1
+
+          if [ "$invocations" -ne 1 ]; then
+            echo "::error::expected exactly one image export, counted $invocations"
+            grep -nE 'exporting to image|exporting manifest|writing image' evidence/build.log || true
+            exit 1
+          fi
 
       - name: The four gates, each shown refusing something
         shell: bash
@@ -280,8 +291,25 @@ jobs:
           # The *manifest* digest, which is what names content in a registry — not the
           # local image id, which is a different hash of a different thing and does not
           # survive leaving this machine.
+          #
+          # Filtered by repository, and that is not belt-and-braces: with a containerd
+          # image store `RepoDigests` already carries a local entry before anything is
+          # pushed (`marketplace@sha256:…`, measured), so taking the first line would
+          # sometimes answer with a digest that was never in a registry.
           digest=$(docker image inspect --format '{{join .RepoDigests "\n"}}' "$image:$tag" \
-            | grep -o 'sha256:[0-9a-f]\{64\}' | head -1)
+            | grep -F "$image@" | grep -oE 'sha256:[0-9a-f]{64}' | head -1)
+
+          # And if that came back empty, ask the registry itself rather than failing on
+          # a property of the local daemon. Two independent routes to one fact; the echo
+          # says which one answered, so a surprise is diagnosable from the log alone.
+          if [ -z "$digest" ]; then
+            digest=$(docker buildx imagetools inspect "$image:$tag" \
+              --format '{{.Manifest.Digest}}' | grep -oE 'sha256:[0-9a-f]{64}' | head -1)
+            echo "digest-source=registry"
+          else
+            echo "digest-source=local-repo-digests"
+          fi
+
           test -n "$digest"
 
           echo "image=$image" >> "$GITHUB_OUTPUT"

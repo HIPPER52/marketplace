@@ -86,9 +86,18 @@ jobs:
         run: |
           set -euo pipefail
           npm run image:build 2>&1 | tee evidence/build.log
-          invocations=$(grep -c 'writing image sha256:' evidence/build.log || true)
+
+          # The stage header, not the digest line: which digest line BuildKit prints
+          # depends on the exporter, and a count that knows only one form reports zero
+          # builds for a build that plainly happened.
+          invocations=$(grep -c 'exporting to image' evidence/build.log || true)
           echo "build-invocations=$invocations" | tee -a evidence/release.txt
-          test "$invocations" -eq 1
+
+          if [ "$invocations" -ne 1 ]; then
+            echo "::error::expected exactly one image export, counted $invocations"
+            grep -nE 'exporting to image|exporting manifest|writing image' evidence/build.log || true
+            exit 1
+          fi
 
       - name: Scan it against the threshold
         run: npm run scan 2>&1 | tee -a evidence/release.txt
@@ -113,8 +122,21 @@ jobs:
           docker push "$image:$HEAD_SHA"
           docker push "$image:main"
 
+          # Filtered by repository: with a containerd image store `RepoDigests` already
+          # carries a local entry before anything is pushed, so the first line is not
+          # necessarily a digest that was ever in a registry. The registry itself is the
+          # fallback, and the echo says which route answered.
           digest=$(docker image inspect --format '{{join .RepoDigests "\n"}}' "$image:$HEAD_SHA" \
-            | grep -o 'sha256:[0-9a-f]\{64\}' | head -1)
+            | grep -F "$image@" | grep -oE 'sha256:[0-9a-f]{64}' | head -1)
+
+          if [ -z "$digest" ]; then
+            digest=$(docker buildx imagetools inspect "$image:$HEAD_SHA" \
+              --format '{{.Manifest.Digest}}' | grep -oE 'sha256:[0-9a-f]{64}' | head -1)
+            echo "digest-source=registry"
+          else
+            echo "digest-source=local-repo-digests"
+          fi
+
           test -n "$digest"
 
           echo "IMAGE_REF=$image@$digest" >> "$GITHUB_ENV"
