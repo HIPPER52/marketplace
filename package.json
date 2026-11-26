@@ -68,7 +68,11 @@
         "demo:pdb": "node demo/pdb.mjs",
         "demo:logs": "npm run build && bash scripts/with-secrets.sh dev node demo/logs.mjs",
         "demo:metrics": "npm run build && bash scripts/with-secrets.sh dev node demo/metrics.mjs",
-        "demo:trace": "npm run build && bash scripts/with-secrets.sh dev node demo/trace.mjs"
+        "demo:trace": "npm run build && bash scripts/with-secrets.sh dev node demo/trace.mjs",
+        "demo:gates": "node demo/gates.mjs",
+        "demo:oidc": "node demo/oidc.mjs",
+        "gate:cost": "node scripts/cost-gate.mjs",
+        "plan": "bash scripts/with-secrets.sh dev bash scripts/pulumi.sh preview --json"
     },
     "author": "Dmitry Avtenev",
     "license": "ISC",
@@ -120,6 +124,7 @@
         "@types/node": "^26.3.0",
         "@types/pg": "^8.23.1",
         "@types/supertest": "^6.0.3",
+        "dependency-cruiser": "^18.9.0",
         "jest": "^30.5.2",
         "openapi-typescript": "^7.13.0",
         "prettier": "^3.9.6",

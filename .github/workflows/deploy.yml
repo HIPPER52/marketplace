@@ -1,0 +1,212 @@
+# The release: what happens to `main` after a pull request is merged.
+#
+# It is short, and the shortness is the point rather than an omission. Everything this
+# file does is an npm script — `image:build`, `plan`, `gate:cost`, `up` — which is the
+# same code a laptop runs and the same code `pipeline.yml` runs. A workflow that held
+# logic of its own would be logic nobody can execute without pushing a commit, and the
+# first time it needed debugging the only available instrument would be another commit.
+#
+# Two differences from the pull-request pipeline, both deliberate:
+#
+#   - it runs in the `production` environment, so the OIDC token's subject is
+#     `repo:…:environment:production`, which is one of the two `oidc/policy.json` trusts;
+#   - `OIDC_REQUIRE_TRUSTED_SUB=1`, so an untrusted subject stops the deploy instead of
+#     being written down. On a pull request that same 0 is the control working; here it
+#     would mean this run cannot prove what it is, and the answer to that is not to ship.
+#
+# Where it deploys: a kind cluster created on the runner and deleted with it. This
+# project has no cloud account, and an ephemeral cluster is the honest version of that —
+# the manifests, the probes, the budget and the pull secret are all exercised for real.
+# The README's CI/CD section says so in the same words rather than implying a datacentre.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: "22"
+  REGISTRY: ghcr.io
+  KIND_VERSION: v0.33.0
+  KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+  PULUMI_VERSION: v3.276.0
+  COST_BUDGET_USD: "25"
+
+jobs:
+  release:
+    name: build, prove, deploy
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      SKIP_VAULT: "1"
+      OIDC_REQUIRE_TRUSTED_SUB: "1"
+      PULUMI_CONFIG_PASSPHRASE: ${{ github.run_id }}-${{ github.run_attempt }}
+      STORAGE_ENDPOINT: http://127.0.0.1:29000
+      STORAGE_REGION: us-east-1
+      STORAGE_ACCESS_KEY: pipeline
+      STORAGE_BUCKET: marketplace-files
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Prepare
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          echo "PULUMI_BACKEND_URL=file://$PWD/.pulumi" >> "$GITHUB_ENV"
+
+      # The identity, before anything is built with it. An untrusted subject here stops
+      # the run, which is the whole reason oidc/policy.json names subjects at all.
+      - name: Prove which run this is
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/oidc-gate.mjs 2>&1 | tee evidence/oidc.txt
+
+      - name: Build the production image, once
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run image:build 2>&1 | tee evidence/build.log
+          invocations=$(grep -c 'writing image sha256:' evidence/build.log || true)
+          echo "build-invocations=$invocations" | tee -a evidence/release.txt
+          test "$invocations" -eq 1
+
+      - name: Scan it against the threshold
+        run: npm run scan 2>&1 | tee -a evidence/release.txt
+
+      - name: Push by digest
+        id: push
+        shell: bash
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          image="$REGISTRY/$(echo "$REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+
+          printf '%s' "$GHCR_TOKEN" | docker login "$REGISTRY" \
+            --username "$GHCR_USER" --password-stdin
+
+          docker tag marketplace:hw28 "$image:$HEAD_SHA"
+          docker tag marketplace:hw28 "$image:main"
+          docker push "$image:$HEAD_SHA"
+          docker push "$image:main"
+
+          digest=$(docker image inspect --format '{{join .RepoDigests "\n"}}' "$image:$HEAD_SHA" \
+            | grep -o 'sha256:[0-9a-f]\{64\}' | head -1)
+          test -n "$digest"
+
+          echo "IMAGE_REF=$image@$digest" >> "$GITHUB_ENV"
+          echo "image-ref=$image@$digest" | tee -a evidence/release.txt
+
+      - name: Install kind and pulumi
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSLo "$RUNNER_TEMP/kind" \
+            "https://kind.sigs.k8s.io/dl/$KIND_VERSION/kind-linux-amd64"
+          echo "$KIND_SHA256  $RUNNER_TEMP/kind" | sha256sum --check --status
+          sudo install -m 0755 "$RUNNER_TEMP/kind" /usr/local/bin/kind
+
+          curl -fsSLo "$RUNNER_TEMP/pulumi.tar.gz" \
+            "https://github.com/pulumi/pulumi/releases/download/$PULUMI_VERSION/pulumi-$PULUMI_VERSION-linux-x64.tar.gz"
+          tar -xzf "$RUNNER_TEMP/pulumi.tar.gz" -C "$RUNNER_TEMP"
+          sudo install -m 0755 "$RUNNER_TEMP/pulumi/pulumi" /usr/local/bin/pulumi
+
+      - name: Mint the run's secrets
+        shell: bash
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          npm run --silent keygen > "$RUNNER_TEMP/keys.env"
+
+          while IFS='=' read -r key value; do
+            case "$key" in
+              JWT_KID|JWT_PRIVATE_KEY|JWT_PUBLIC_KEY)
+                echo "::add-mask::$value"
+                echo "$key=$value" >> "$GITHUB_ENV"
+                ;;
+            esac
+          done < "$RUNNER_TEMP/keys.env"
+          rm -f "$RUNNER_TEMP/keys.env"
+
+          for name in DB_PASSWORD REFRESH_TOKEN_PEPPER STORAGE_SECRET_KEY; do
+            value=$(openssl rand -hex 24)
+            echo "::add-mask::$value"
+            echo "$name=$value" >> "$GITHUB_ENV"
+          done
+
+          auth=$(printf '%s:%s' "$GHCR_USER" "$GHCR_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          pull=$(printf '{"auths":{"%s":{"auth":"%s"}}}' "$REGISTRY" "$auth")
+          echo "::add-mask::$pull"
+          echo "IMAGE_PULL_SECRET=$pull" >> "$GITHUB_ENV"
+
+      # Cheap, and it fails in ten seconds instead of in ten minutes. If the digest or
+      # the credential is wrong, the only other symptom is a pod in ImagePullBackOff
+      # while `pulumi up` waits out its timeout.
+      - name: The digest is pullable with this run's credential
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE_REF" > /dev/null
+          echo "pullable=$IMAGE_REF"
+
+      - name: Cluster
+        run: npm run cluster:up
+
+      - run: npm --prefix infra ci
+
+      - name: What this release would cost
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run --silent plan > evidence/plan.json
+          PLAN_JSON=evidence/plan.json npm run --silent gate:cost 2>&1 | tee evidence/cost.txt
+
+      - name: Deploy the promoted digest
+        run: npm run up
+
+      - name: What production is running
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl rollout status deployment/marketplace-api -n marketplace --timeout=5m
+          kubectl get deployment marketplace-api -n marketplace -o json > evidence/deployment.json
+          deployed=$(node -p "require('./evidence/deployment.json').spec.template.spec.containers[0].image")
+          echo "deployed-digest=${deployed##*@}" | tee -a evidence/release.txt
+          test "$deployed" = "$IMAGE_REF"
+
+      - name: Tear the cluster down
+        if: always()
+        run: npm run cluster:down || true
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: release-evidence
+          path: evidence
+          if-no-files-found: warn

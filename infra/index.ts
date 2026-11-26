@@ -2,7 +2,7 @@ import * as k8s from '@pulumi/kubernetes';
 import * as pulumi from '@pulumi/pulumi';
 import { readProfile, readRevision } from './profile';
 import { applicationSecrets, DB_PASSWORD, encode, readSecrets } from './secrets';
-import { contextOf, readStack } from './stack';
+import { contextOf, imageRef, readStack } from './stack';
 import {
     application,
     configurationFor,
@@ -109,6 +109,38 @@ const migrate = migrationJob({
     revision,
 });
 
+/**
+ * The credential the node pulls the image with, and only when there is an image to pull.
+ *
+ * `IMAGE_PULL_SECRET` carries a whole `.dockerconfigjson`, which is what the registry
+ * protocol wants and what `kubernetes.io/dockerconfigjson` holds. It is produced by the
+ * pipeline from the token GitHub already gave that job and lives as long as the cluster
+ * does, which in a pipeline is one run.
+ *
+ * Unset — a laptop, where `kind load` puts the image inside the node — and no Secret is
+ * created and no pod references one. The alternative, a Secret with an empty value that
+ * is always there, would be a credential-shaped object that authenticates nothing: the
+ * kubelet would try it, fail, and report `ImagePullBackOff` for a cluster that never
+ * needed to pull anything.
+ */
+const registryCredential = (process.env.IMAGE_PULL_SECRET ?? '').trim();
+
+const pullSecret =
+    registryCredential === ''
+        ? undefined
+        : new k8s.core.v1.Secret(
+              'registry',
+              {
+                  metadata: { name: 'registry', namespace: namespaceName },
+                  type: 'kubernetes.io/dockerconfigjson',
+                  // `data`, never `stringData`: the API server never returns the latter,
+                  // so the provider sees a difference on every update and `pulumi up`
+                  // twice in a row never says "unchanged". Same rule as the other two.
+                  data: { '.dockerconfigjson': encode(registryCredential) },
+              },
+              opts,
+          );
+
 const api = application({
     namespace: namespaceName,
     stack,
@@ -119,6 +151,7 @@ const api = application({
     configMapName: configMap.metadata.name,
     appSecretName: appSecret.metadata.name,
     dbSecretName: dbSecret.metadata.name,
+    pullSecretName: pullSecret?.metadata.name,
 });
 
 const surface = exposure({ namespace: namespaceName, stack, opts, replicas });
@@ -143,3 +176,12 @@ export const rev = revision;
  * is in the README: stop declaring it, or hand the field over with `ignoreChanges`.
  */
 export const declaredReplicas = replicas;
+
+/**
+ * What was actually deployed, as the manifest names it.
+ *
+ * This is the half of "build once, promote by digest" that can be checked after the
+ * fact: the pipeline compares it against the digest its build job pushed, and a
+ * mismatch means something was rebuilt between the gates and the cluster.
+ */
+export const image = imageRef(stack);

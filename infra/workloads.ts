@@ -298,6 +298,14 @@ export interface ApplicationArgs extends ClusterArgs {
     configMapName: pulumi.Input<string>;
     appSecretName: pulumi.Input<string>;
     dbSecretName: pulumi.Input<string>;
+    /**
+     * The registry credential, when the image comes from one.
+     *
+     * Absent locally: `kind load` puts the image inside the node and there is nothing to
+     * authenticate to. Present in the pipeline, where the image is promoted by digest out
+     * of a private package and the node has to fetch it.
+     */
+    pullSecretName?: pulumi.Input<string>;
 }
 
 export function application(args: ApplicationArgs): k8s.apps.v1.Deployment {
@@ -334,6 +342,9 @@ export function application(args: ApplicationArgs): k8s.apps.v1.Deployment {
                     },
                     spec: {
                         terminationGracePeriodSeconds: shape.gracePeriodSeconds,
+                        ...(args.pullSecretName === undefined
+                            ? {}
+                            : { imagePullSecrets: [{ name: args.pullSecretName }] }),
                         securityContext: {
                             runAsNonRoot: true,
                             // Numeric: the kubelet verifies this before the container
@@ -344,9 +355,13 @@ export function application(args: ApplicationArgs): k8s.apps.v1.Deployment {
                             {
                                 name: 'api',
                                 image: imageRef(args.stack),
-                                // The image is built on the host and loaded into the node
-                                // with `kind load`; it exists in no registry, and a pull
-                                // policy of Always would hang the pod in ErrImagePull.
+                                // `IfNotPresent` is right for both ways the image can
+                                // arrive, for two different reasons. Locally it is built
+                                // on the host and loaded into the node with `kind load`;
+                                // it exists in no registry, and `Always` would hang the
+                                // pod in ErrImagePull. From a registry it arrives by
+                                // digest, and a digest names content — once the node has
+                                // those bytes there is nothing a re-pull could change.
                                 imagePullPolicy: 'IfNotPresent',
                                 ports: [{ containerPort: args.stack.containerPort }],
                                 envFrom: [

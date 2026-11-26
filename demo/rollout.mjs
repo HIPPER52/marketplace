@@ -49,7 +49,20 @@ const REQUEST_TIMEOUT_MS = 5_000;
  * rollout is over in a few seconds, and "zero failures out of nine hundred requests" is
  * not a result — the criterion's own floor is five thousand for the same reason.
  */
-const MIN_LOAD_MS = 20_000;
+const MIN_LOAD_MS = positiveInteger('ROLLOUT_MIN_MS', process.env.ROLLOUT_MIN_MS, 20_000);
+
+/**
+ * How many responses it takes before "none of them failed" is a statement about the
+ * rollout rather than about the sample. The criterion's own floor is five thousand and
+ * that is the default; a runner with two cores hosting the cluster it is measuring is
+ * slower than the laptop the number was chosen on, and the honest lever there is
+ * `ROLLOUT_MIN_MS` — more seconds at the same rate — rather than fewer requests.
+ */
+const MIN_REQUESTS = positiveInteger(
+    'ROLLOUT_MIN_REQUESTS',
+    process.env.ROLLOUT_MIN_REQUESTS,
+    5_000,
+);
 
 /** And a little after the rollout, because the last pod to go is the one that drops things. */
 const TAIL_MS = 2_000;
@@ -85,14 +98,27 @@ class LoadTally {
     }
 }
 
-function workerCount(raw) {
-    const parsed = Number(raw ?? 32);
+/**
+ * A tuning knob read from the environment, or its default.
+ *
+ * All three of these are properties of the **machine**, not of the thing being measured,
+ * which is why none of them is a constant. A generator that is itself the bottleneck
+ * measures itself; a floor calibrated on a laptop makes a two-core runner fail for being
+ * a two-core runner. What must never move to make a run green is the claim — `failed` is
+ * compared against zero here and nowhere else, and no variable can change that.
+ */
+function positiveInteger(name, raw, fallback) {
+    const parsed = Number(raw ?? fallback);
 
     if (!Number.isInteger(parsed) || parsed < 1) {
-        throw new Error(`LOAD_WORKERS="${raw}" is not a positive integer`);
+        throw new Error(`${name}="${raw}" is not a positive integer`);
     }
 
     return parsed;
+}
+
+function workerCount(raw) {
+    return positiveInteger('LOAD_WORKERS', raw, 32);
 }
 
 /**
@@ -313,7 +339,7 @@ async function main() {
             }
         } else if (tally.failed > 0) {
             fail(`${tally.failed} of ${tally.requests} responses were not ${OK}.`);
-        } else if (tally.requests < 5_000) {
+        } else if (tally.requests < MIN_REQUESTS) {
             fail(`${tally.requests} requests is too few to call zero a result.`);
         }
     } finally {

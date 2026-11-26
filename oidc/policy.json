@@ -1,0 +1,22 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "GitHubActionsDeploysMarketplace",
+            "Effect": "Allow",
+            "Principal": {
+                "Federated": "arn:aws:iam::000000000000:oidc-provider/token.actions.githubusercontent.com"
+            },
+            "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {
+                "StringEquals": {
+                    "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+                    "token.actions.githubusercontent.com:sub": [
+                        "repo:HIPPER52/marketplace:ref:refs/heads/main",
+                        "repo:HIPPER52/marketplace:environment:production"
+                    ]
+                }
+            }
+        }
+    ]
+}

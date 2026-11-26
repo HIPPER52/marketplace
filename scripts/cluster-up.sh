@@ -35,6 +35,17 @@ fi
 
 kubectl config use-context "kind-${CLUSTER}" >/dev/null
 
+# A promoted digest is the node's business, not ours.
+#
+# `IMAGE_REF` set means the Deployment names bytes in a registry rather than a tag that
+# only exists on this machine, so there is nothing here to hand over: the kubelet pulls
+# it, with the credential the Pulumi program put in the namespace. Loading a tag nothing
+# references would copy a couple of hundred megabytes into the node to be ignored.
+if [ -n "${IMAGE_REF:-}" ]; then
+    echo "IMAGE_REF=${IMAGE_REF} — the node pulls that digest itself; nothing to load"
+    exit 0
+fi
+
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     echo "image ${IMAGE} is not on this machine. Run: npm run image:build" >&2
     exit 1

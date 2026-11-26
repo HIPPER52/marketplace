@@ -391,6 +391,48 @@ access is Viewer, so there is nothing to log in to.
 `demo:trace` is the only one that needs the stand. The other two create spans without
 exporting them, which is a real deployment rather than a degraded one.
 
+### HW-32: the pipeline
+
+Three of the four things this assignment asks for run on a laptop with nothing started but
+Docker, and none of them needs a cluster, a cloud account or a push:
+
+```bash
+npm run demo:gates      # four gates, each accepting one input and refusing another
+npm run demo:oidc       # green / foreign-sub / bad-signature against oidc/policy.json
+docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.12   # the workflows
+```
+
+`demo:gates` builds `marketplace:hw28` first if it is not already on the machine, because
+its fourth gate is the image scan. Expect:
+
+```
+types-ok=0  types-broken=2  contract-ok=0  contract-broken=1
+architecture-ok=0  architecture-broken=1  image-ok=0  image-broken=1
+gates=4  one-sided=0
+```
+
+The cost gate needs a plan, and a plan needs the cluster of #28 — the same stand, with two
+extra lines:
+
+```bash
+npm run cluster:up
+npm --prefix infra ci
+npm run plan > plan.json                                   # pulumi preview --json
+PLAN_JSON=plan.json COST_BUDGET_USD=25 npm run gate:cost   # gate=pass, plan-usd=16.93
+PLAN_JSON=plan.json COST_BUDGET_USD=5  npm run gate:cost   # gate=fail, exit 1
+npm run cluster:down
+```
+
+The fourth thing is the pipeline itself, which only exists on GitHub. Open the pull
+request's **pipeline** run and download `pipeline-evidence`; `evidence.txt` inside it is
+`key=value` lines, and the ones worth reading first are `built-digest` =
+`deployed-digest`, `build-invocations=1`, `oidc-sig-verified=1`, `gate-cost=pass`,
+`rollout-failed=0` with a non-zero `during-rollout`, and `secret-in-manifest=0`. The same
+lines are on the run's summary page, so the download is optional.
+
+There is exactly **one** workflow on a pull request, so there is exactly one successful run
+against the head commit to take that artifact from.
+
 ## Where the credentials come from
 
 `src/database/data-source.ts` reads five variables and nothing else: no host, no password,
@@ -3781,6 +3823,347 @@ No alert ever fired on this stand, nothing is kept for longer than two hours, th
 tail-based sampling, no log shipping into Loki, and no error tracker with fingerprints.
 Each of those is a decision with a bill attached, and the measurements above do not depend
 on any of them.
+
+# CI/CD — HW-32
+
+Everything above this line is a thing that works on a laptop. This chapter is about the
+machine that has to believe it without one — and about the fact that a green tick is not
+evidence, it is a tick.
+
+## The two files, and why there are two
+
+| File                             | Fires on                   | What it is for                                              |
+| -------------------------------- | -------------------------- | ----------------------------------------------------------- |
+| `.github/workflows/pipeline.yml` | `pull_request`, manual run | prove the change, build it once, deploy it, measure it      |
+| `.github/workflows/deploy.yml`   | `push` to `main`, manual   | the release: the same npm scripts, in the `production` gate |
+
+`preview` must stay without protection rules — a required reviewer on it would park every
+pull request's deploy job on an approval. `production` is where a rule belongs, and adding
+one is a decision about this repository rather than something a workflow can declare.
+
+Until #32 there were two workflows on every push — `contract.yml` ran the suites and the
+Pact chain, and anything else would have run beside it. That file is gone and its jobs are
+in `pipeline.yml` unchanged. The reason is not tidiness: two workflows on one commit mean
+two successful runs against one SHA, so "download the evidence from the successful run on
+this commit" stops having a single answer. One commit, one pipeline, one artifact.
+
+Both files are short because none of the logic is in them. `image:build`, `plan`,
+`gate:cost`, `up`, `demo:gates`, `demo:oidc`, `demo:rollout` are npm scripts, which is the
+same code a laptop runs. A workflow that held logic of its own would be logic nobody can
+execute without pushing a commit — and the only instrument available for debugging it
+would be another commit.
+
+### The jobs, and what waits for what
+
+```
+quality ───┐
+tests ─────┤
+contract ──┼──> deploy ──> evidence      (evidence runs on if: always())
+build ─────┘
+```
+
+`quality`, `tests`, `contract` and `build` have no dependencies between them and run at
+once. `deploy` needs all four: there is no point raising a cluster for a change that does
+not compile, and no point deploying an image the gates have not looked at. `evidence` runs
+whatever happened, because the run that failed is the one worth having a record of.
+
+| Job        | Grants                                                    | Why those                                    |
+| ---------- | --------------------------------------------------------- | -------------------------------------------- |
+| `quality`  | `contents: read`                                          | reads the tree and the base branch           |
+| `tests`    | `contents: read`                                          | testcontainers needs nothing from GitHub     |
+| `contract` | `contents: read`                                          | its broker is a container on the runner      |
+| `build`    | `contents: read`, `packages: write`                       | the only job that may push an image anywhere |
+| `deploy`   | `contents: read`, `packages: read`, **`id-token: write`** | the only job that may ask GitHub who it is   |
+| `evidence` | `contents: read`                                          | collects artifacts from the same run         |
+
+The file begins with `permissions: {}` — nothing is granted by default, and every job asks
+for what it needs. That is the whole reason `id-token: write` sits on one job out of six: a
+workflow-wide grant hands the ability to mint a cloud identity to the job that runs a
+contributor's proposed test code as well.
+
+## Four gates, each shown refusing something
+
+```bash
+npm run demo:gates
+```
+
+```
+types-ok=0            types-broken=2
+contract-ok=0         contract-broken=1
+architecture-ok=0     architecture-broken=1
+image-ok=0            image-broken=1
+gates=4               one-sided=0
+```
+
+A command that exits 0 on the repository as it stands is indistinguishable from `true`. It
+becomes a gate the moment the **same command with the same configuration** exits non-zero
+on an input that deserves it, so each of the four runs twice and the demo fails the process
+if any of them answers the same way both times.
+
+| Gate         | Tool                                | Accepted                          | Refused                                                   |
+| ------------ | ----------------------------------- | --------------------------------- | --------------------------------------------------------- |
+| types        | `tsc --noEmit`                      | `src` + `test` + `scripts`        | `demo/fixtures/types` — a decimal string in `total_cents` |
+| contract     | `oasdiff breaking --fail-on ERR`    | the spec plus a new operation     | the spec minus a required response field                  |
+| architecture | dependency-cruiser                  | `src/`                            | a `repositories/` module importing express                |
+| image        | trivy, against a computed threshold | the ratchet in `scripts/scan.mjs` | the same report at `SCAN_MAX=-1`                          |
+
+Two details that are the point rather than plumbing. The contract gate's **accepted** input
+is also a change — a whole new operation — because a gate that only distinguishes "the file
+moved" from "the file did not" is a diff. And the broken specs are generated at run time
+from `openapi/openapi.yaml` rather than committed: a copy of the spec with one field
+missing is a second source of truth, and it is wrong the first time the real spec moves.
+
+The architecture rules live in `.dependency-cruiser.cjs` and there are four, each a
+sentence this repository already says in prose: no cycles (entities excepted — a
+bidirectional TypeORM relation is circular by construction, and there are exactly three),
+no service/repository/entity importing the HTTP framework, no repository importing a
+controller, no entity importing a service. They match on the folder a module lives in,
+which is what lets the fixture outside `src/` be judged by the identical configuration.
+
+In the pipeline the four run on the real inputs in `quality` and `build`; `demo:gates` runs
+in `build`, where the image already exists.
+
+## Identity: a token about this run, not a key in a drawer
+
+```bash
+npm run demo:oidc
+```
+
+```
+case=green           sig-verified=1  policy-allow=1
+case=foreign-sub     sig-verified=1  policy-allow=0
+case=bad-signature   sig-verified=0  policy-allow=0
+```
+
+A long-lived access key in a repository secret is a password with no expiry, no subject and
+no audience: whoever reads it is the pipeline, for ever, from anywhere, and rotating it is a
+calendar reminder somebody eventually stops honouring. OIDC removes the stored credential —
+the runner asks GitHub for a token **about this run**, the cloud checks its signature
+against GitHub's published keys, and the credentials it hands back expire in an hour. There
+is nothing in the repository to steal.
+
+`oidc/policy.json` is an ordinary IAM role trust policy — the document you paste into AWS —
+rather than a format invented for a demo, so the cloud and `scripts/oidc-gate.mjs` read one
+file and a subject added in one place cannot be missing from the other.
+
+The middle row above is the one worth staring at. That token is **genuine**: GitHub really
+minted it and the signature really holds. What it is not is a token about _this_ repository,
+and `sub` is the only claim that says so — a trust policy with the issuer and the audience
+filled in and the subject left as a wildcard trusts every GitHub Actions run on the planet.
+The bottom row is the forgery: the claims of the top row, the `kid` of the top row, and a
+signature from a key the issuer never published. It fails at the signature and never reaches
+the policy, which is the right order to ask the two questions in. `algorithms: ['RS256']` is
+pinned on the verify for the reason #24 spells out at length — without it the token chooses
+how it is checked.
+
+What the demo substitutes for GitHub is the **identity provider**: a key pair made in the
+process, a JWKS on a loopback port. What it does not touch is the policy, including which
+subjects it trusts — the green case takes its subject from the committed file rather than
+repeating one.
+
+On a real runner the same `scripts/oidc-gate.mjs` asks for a token and writes the claims —
+**never the token**, which is a bearer credential and would be a credential in a log and in
+a downloadable artifact. A pull request's subject is `repo:…:environment:preview`, which the
+policy does not trust, so the pipeline records `oidc-sub-trusted=0` and carries on: the run
+that executes somebody's proposed code must not be able to assume the deploy role, and
+failing there would mean the only way to get a green pull request was to widen the policy
+until it trusted every branch. `deploy.yml` sets `OIDC_REQUIRE_TRUSTED_SUB=1`, where the
+same 0 stops the release.
+
+## Build once, promote by digest
+
+`build` is the only job with `packages: write`, and it is the only job that builds. It
+pushes to GHCR and publishes the **manifest digest**; `deploy` names
+`ghcr.io/<owner>/marketplace@sha256:…` and asserts that what the cluster ended up running is
+that exact string:
+
+```bash
+test "$deployed" = "$IMAGE_REF"
+```
+
+A tag cannot carry that claim. `marketplace:hw28` means whatever was pushed under that name
+most recently — fine on a laptop where the thing that built it is the thing that loads it,
+useless the moment a build job and a deploy job are two machines ten minutes apart. The
+digest names content, so the deployed bytes are the scanned bytes or the manifest is wrong.
+
+`build-invocations` is counted out of BuildKit's own output (`writing image sha256:`), not
+asserted, and the job fails if it is not 1.
+
+This is also the one place the local flow and the pipeline genuinely differ, and both are
+honest about it. On a laptop `kind load docker-image` puts the image inside the node and
+there is no registry involved; `scripts/cluster-up.sh` skips that step when `IMAGE_REF` is
+set, because the kubelet will fetch the digest itself — with the credential the Pulumi
+program put in the namespace as `imagePullSecrets`. A `kind load` would be copying a couple
+of hundred megabytes into the node for nothing.
+
+Worth knowing, because it is what forced the registry: a `kind load`ed image reports an
+`imageID` like `docker.io/library/import-2026-11-26@sha256:af41…`. That is containerd's
+digest of its own import, unrelated to anything Docker computed, so "the digest I built"
+and "the digest it runs" cannot be compared at all without a registry between them.
+
+## Money: a gate with a rate card and a date
+
+```bash
+PLAN_JSON=plan.json COST_BUDGET_USD=25 npm run gate:cost
+```
+
+```
+budget-usd=25.00  plan-usd=16.93  priced-resources=8  unpriced-resources=0  gate=pass
+```
+
+Infrastructure gets expensive one reviewed pull request at a time. Nobody ever merges "make
+this cost $900 a month"; they merge a replica count, a volume size, a second environment,
+and the bill is noticed six weeks later by somebody who was in none of those reviews. The
+estimate is computed from `pulumi preview --json` — the plan, not the program, because a
+program has to be executed to know what it creates.
+
+| Unit                    | Rate      | Source                                                                        |
+| ----------------------- | --------- | ----------------------------------------------------------------------------- |
+| vCPU-hour               | $0.04048  | AWS Fargate, Linux/x86, us-east-1 — <https://aws.amazon.com/fargate/pricing/> |
+| GB-hour of memory       | $0.004445 | the same page                                                                 |
+| GiB-month of disk       | $0.08     | Amazon EBS gp3 — <https://aws.amazon.com/ebs/general-purpose/>                |
+| hour of a load balancer | $0.0225   | Elastic Load Balancing, NLB, before capacity units                            |
+| hours in a month        | 730       | 8760/12, the figure AWS's own monthly examples assume                         |
+
+Measured **26.11.2026**. Compute is priced with the published Fargate rates rather than an
+instance type because the unit a pod spec declares is vCPU and memory, and Fargate is the
+one AWS product that sells exactly those two separately at a published number; an EC2
+instance would mean first guessing a bin-packing. Quantities in `Gi` are priced per `GB`
+unconverted, which makes every estimate 7,4 % **too high** — a budget may be wrong in one
+direction only.
+
+Two judgement calls carry the number:
+
+- **Requested capacity, not object count.** Ten ConfigMaps cost nothing; one Deployment
+  asking for 4 vCPU costs real money.
+- **An HPA's `maxReplicas`, not its `minReplicas`.** A budget that assumes the quiet hour is
+  not a budget. This one decision is most of the API line: `14.25  marketplace-api — 4
+replica(s) — the HPA ceiling, not the declared 2`.
+
+A Job is counted at zero — it is bounded work and spreading it over a month would be an
+invented number. A CronJob is deliberately **not** in the free list and would be refused as
+unpriced, which is the other half of the design: a cost model's real failure is not a wrong
+rate, it is a resource type the table has never heard of silently costing nothing, because
+the expensive thing is usually the new thing. Every type in the plan must be either priced
+or explicitly free; anything else fails the gate by name.
+
+cost-gate-bypass-label: cost-approved
+
+That label on a pull request lets it merge over budget, and what it buys is narrow on
+purpose: the verdict is **not** rewritten. `gate=fail` still goes into the evidence beside
+`bypass=cost-approved`, so the artifact records that this cost more than the budget and that
+somebody said yes anyway. A bypass that flipped the verdict to `pass` would erase the only
+thing worth keeping. It does not cover `unpriced-resources`, which is not a judgement about
+money but this script admitting it does not know what something costs.
+
+## Where it deploys
+
+| Environment  | Workflow       | What it is                                                    |
+| ------------ | -------------- | ------------------------------------------------------------- |
+| `preview`    | `pipeline.yml` | a kind cluster created on the runner and deleted with the job |
+| `production` | `deploy.yml`   | the same, on `main`, in a GitHub environment that can gate it |
+
+This project has no cloud account, and an ephemeral cluster is the honest version of that
+rather than a pretence: the manifests, the probes, the PodDisruptionBudget, the migration
+Job, the pull secret and the rolling update are all exercised for real, against the real
+image, and the release is measured under load. What is **not** exercised is anything about
+a cluster outliving a deploy — a rollback to a previous revision, a PersistentVolume with
+yesterday's data in it, a node drain. Those are named here rather than implied.
+
+The environment names matter beyond a label: they are what the OIDC subject carries, which
+is why `oidc/policy.json` trusts `repo:HIPPER52/marketplace:environment:production` and
+`repo:HIPPER52/marketplace:ref:refs/heads/main` and nothing else.
+
+## Secrets, and where masking stops
+
+| Secret              | Used by           | Set it when                                           |
+| ------------------- | ----------------- | ----------------------------------------------------- |
+| `GITHUB_TOKEN`      | `build`, `deploy` | never — GitHub mints it per run                       |
+| `PACT_BROKER_TOKEN` | `contract`        | only against a hosted broker; empty for the local one |
+
+That is the whole list, and the shortness is the result rather than an accident. There is no
+cloud access key because of OIDC, no registry password because `GITHUB_TOKEN` is one, and no
+signing key because the deploy mints a throwaway ES256 pair per run with `npm run keygen` —
+a cluster that lives for one job has no business holding a key that outlives it.
+
+Everything the run generates goes through `::add-mask::` before it reaches any later step,
+so `JWT_PRIVATE_KEY`, `DB_PASSWORD`, `REFRESH_TOKEN_PEPPER`, `STORAGE_SECRET_KEY` and the
+registry credential are `***` in the log.
+
+**And masking is not a boundary.** It is a find-and-replace over log text on its way out of
+the runner, which means it covers exactly the strings it was told about, in exactly the form
+they were given. It does not survive a transformation: a value that is base64-encoded,
+URL-escaped, JSON-escaped, split across two lines or printed one character per line is a
+different string and comes out in the clear. It does not reach a file — a secret written
+into an artifact is downloadable by anybody with read access to the repository, masked log
+or not. And it does nothing at all about where the value went: a token echoed into a `curl`
+to somebody else's host is masked in the log and delivered intact.
+
+So the pipeline does not rely on it. The values are generated per run and die with it,
+`scripts/oidc-gate.mjs` prints claims and never the token it verified, and the last step of
+`deploy` greps the plan and the live manifest for every secret value **and its base64 form**
+before either goes into an artifact:
+
+```
+secret-in-manifest=0
+```
+
+`pulumi preview --json` redacts Secret data as `"[secret]"` and `kubectl get deploy -o json`
+carries only `secretRef` names — both measured, and then checked anyway, because the point
+of the check is the day one of those stops being true.
+
+## The evidence
+
+`pipeline-evidence` is the artifact every run uploads, and `evidence.txt` inside it is
+`key=value` lines — the shape every demo in this repository has printed since #19, so a
+reader greps instead of parsing:
+
+```
+run-id / run-attempt / head-sha
+image-ref / built-digest / deployed-digest / build-invocations
+creds-source / oidc-iss / oidc-aud / oidc-sub / oidc-sig-verified / oidc-sub-trusted
+budget-usd / plan-usd / gate-cost / bypass
+rollout-requests / rollout-ok / rollout-failed / rollout-seconds / during-rollout
+one-sided / image-broken / secret-in-manifest
+job-quality / job-tests / job-contract / job-build / job-deploy
+```
+
+Beside it: `plan.json`, `deployment.json`, `build.log`, `rollout.txt`, `gates.txt`,
+`cost.txt`, `oidc.txt`. The same lines are written to the run summary, so the common case
+needs no download at all.
+
+`rollout-failed=0` is the release claim, and `during-rollout` is what stops it being a
+coincidence — a count of requests is not a measurement of a rolling update unless the
+requests happened **during** one. A runner has two cores and is also hosting the cluster it
+measures, so `ROLLOUT_MIN_MS` is raised to 45 s rather than the floor being lowered: more
+seconds at the same rate keeps the claim, a smaller sample would not. Nothing in the
+environment can change what `failed` is compared against.
+
+## Variables
+
+| Variable                   | What                                              | Джерело (source)                                           |
+| -------------------------- | ------------------------------------------------- | ---------------------------------------------------------- |
+| `IMAGE_REF`                | the digest a release promotes; overrides the tag  | the pipeline's build job; unset on a laptop                |
+| `IMAGE_PULL_SECRET`        | a `.dockerconfigjson` the kubelet pulls with      | the run's `GITHUB_TOKEN`; unset on a laptop                |
+| `COST_BUDGET_USD`          | the monthly ceiling `gate:cost` compares against  | the workflow; no default, because a gate needs a threshold |
+| `PLAN_JSON`                | the `pulumi preview --json` document to price     | the workflow; defaults to `plan.json`                      |
+| `COST_GATE_BYPASS`         | `1` when the pull request carries `cost-approved` | the workflow, from the label                               |
+| `OIDC_REQUIRE_TRUSTED_SUB` | `1` makes an untrusted subject fatal              | `deploy.yml` only                                          |
+| `LOAD_WORKERS`             | concurrency of the rollout's load generator       | the HW-11 store or the workflow; a property of the machine |
+| `ROLLOUT_MIN_MS`           | how long the load runs whatever the rollout does  | the workflow; 20 s by default                              |
+| `ROLLOUT_MIN_REQUESTS`     | the sample size below which zero is not a result  | the workflow; 5 000 by default                             |
+
+None of them is in `.env.example`: that file is held to the **service's** schema by
+`npm run check:env`, and nothing in `src/` reads any of these — the same arrangement
+`BROKER_URL` has had since #19.
+
+## What is deliberately not here
+
+No fork pull requests (their token cannot reach this repository's packages, which is
+correct and would need a different design), no deployment that survives its job, no
+rollback path, no canary or blue-green, no matrix across Node versions, and no self-hosted
+runner. Each of those is a decision with a bill attached, and nothing measured above
+depends on one.
 
 ---
 

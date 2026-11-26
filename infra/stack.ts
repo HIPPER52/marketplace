@@ -50,8 +50,26 @@ export function readStack(): Stack {
     return stack as Stack;
 }
 
-/** `repository:tag`, in one place so nothing builds it by hand. */
+/**
+ * `repository:tag`, in one place so nothing builds it by hand — unless a pipeline has
+ * already named the exact bytes, in which case those win.
+ *
+ * `IMAGE_REF` is how a promotion speaks. A tag is a mutable pointer: `marketplace:hw28`
+ * means whatever was pushed under that name most recently, which is fine on a laptop
+ * where the thing that built it is the thing that loads it, and useless the moment a
+ * build job and a deploy job are two machines minutes apart. `ghcr.io/…@sha256:…` names
+ * content, so the deploy cannot run bytes the gates did not pass — the digest in the
+ * Deployment is the digest the build produced or the manifest is wrong.
+ *
+ * Unset — the local flow, every demo, the README — and nothing changes.
+ */
 export function imageRef(stack: Stack): string {
+    const promoted = process.env.IMAGE_REF;
+
+    if (promoted !== undefined && promoted.trim() !== '') {
+        return promoted.trim();
+    }
+
     return `${stack.image}:${stack.tag}`;
 }
 
