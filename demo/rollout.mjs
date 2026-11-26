@@ -4,7 +4,7 @@ import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { emit, fail } from '../scripts/lib/emit.mjs';
-import { delay, must } from '../scripts/lib/shell.mjs';
+import { delay, must, mustAsync } from '../scripts/lib/shell.mjs';
 import { KUBE_CONTEXT, REPO_ROOT, STACK } from '../scripts/lib/stack.mjs';
 
 /**
@@ -29,9 +29,18 @@ import { KUBE_CONTEXT, REPO_ROOT, STACK } from '../scripts/lib/stack.mjs';
 const BROKEN_FLAG = '--broken';
 const Profile = { Hardened: 'hardened', Broken: 'broken' };
 
-/** Thirty-two in flight, paced: enough to clear the criterion's floor of five thousand
- * requests inside one rollout, and nowhere near enough to be the thing that breaks it. */
-const CONCURRENCY = 32;
+/**
+ * How many requests are in flight at once. Thirty-two by default: enough to clear the
+ * criterion's floor of five thousand inside one rollout, and nowhere near enough to be
+ * the thing that breaks it.
+ *
+ * From the environment, because the right number is a property of the machine rather than
+ * of this file — a smaller laptop, or a kind cluster sharing its CPU with everything else,
+ * wants a gentler rate, and a generator that is itself the bottleneck measures itself.
+ *
+ *     LOAD_WORKERS=8 npm run demo:rollout
+ */
+const CONCURRENCY = workerCount(process.env.LOAD_WORKERS);
 const PACE_MS = 20;
 const REQUEST_TIMEOUT_MS = 5_000;
 
@@ -54,6 +63,16 @@ const OK = '200';
 const target = `http://127.0.0.1:${STACK.nodePort}/health`;
 const deployment = 'marketplace-api';
 
+/** What the rolling update itself cost, as opposed to the run that contains it. */
+class RolloutMeasurement {
+    constructor(seconds, during, failedDuring) {
+        this.seconds = seconds;
+        /** Responses that came back **while the rollout was in flight**. */
+        this.during = during;
+        this.failedDuring = failedDuring;
+    }
+}
+
 /** Named: the load generator produces it and three keys are printed out of it. */
 class LoadTally {
     constructor(requests, ok) {
@@ -66,12 +85,40 @@ class LoadTally {
     }
 }
 
+function workerCount(raw) {
+    const parsed = Number(raw ?? 32);
+
+    if (!Number.isInteger(parsed) || parsed < 1) {
+        throw new Error(`LOAD_WORKERS="${raw}" is not a positive integer`);
+    }
+
+    return parsed;
+}
+
+/**
+ * Synchronous, and only where nothing else has to keep running.
+ *
+ * Every call made **while the load generator is working** goes through `kubectlAsync`
+ * instead — see the comment on `measuredRollout`.
+ */
 function kubectl(args) {
     return must('kubectl', ['--context', KUBE_CONTEXT, '-n', STACK.namespace, ...args]);
 }
 
-function generation() {
-    return Number(kubectl(['get', 'deploy', deployment, '-o', 'jsonpath={.metadata.generation}']));
+function kubectlAsync(args) {
+    return mustAsync('kubectl', ['--context', KUBE_CONTEXT, '-n', STACK.namespace, ...args]);
+}
+
+async function generation() {
+    const raw = await kubectlAsync([
+        'get',
+        'deploy',
+        deployment,
+        '-o',
+        'jsonpath={.metadata.generation}',
+    ]);
+
+    return Number(raw);
 }
 
 /** One request, one line in the file. No keep-alive: every attempt re-resolves an endpoint. */
@@ -93,21 +140,42 @@ function probe() {
     });
 }
 
+/**
+ * The generator, plus a live count of what it has done.
+ *
+ * The counts are kept in memory as well as written to the file, and the two answer
+ * different questions. The file is the record the final numbers are read back from — a
+ * count computed from the thing that was written, not from a variable this script also
+ * increments. The counters are sampled at the two edges of the rollout, which is the only
+ * way to say how many responses arrived **during** it rather than around it.
+ */
 function startLoad(path) {
     const sink = createWriteStream(path, { flags: 'a' });
+    const live = { requests: 0, failed: 0 };
     let running = true;
 
     const workers = Array.from({ length: CONCURRENCY }, async () => {
         while (running) {
-            sink.write(`${await probe()}\n`);
+            const code = await probe();
+
+            live.requests += 1;
+
+            if (code !== OK) {
+                live.failed += 1;
+            }
+
+            sink.write(`${code}\n`);
             await delay(PACE_MS);
         }
     });
 
-    return async () => {
-        running = false;
-        await Promise.all(workers);
-        await new Promise((resolve) => sink.end(resolve));
+    return {
+        live,
+        stop: async () => {
+            running = false;
+            await Promise.all(workers);
+            await new Promise((resolve) => sink.end(resolve));
+        },
     };
 }
 
@@ -151,26 +219,46 @@ async function deploy(profile, revision) {
 }
 
 /**
- * The rollout itself, timed from the moment the cluster is told about it.
+ * The rollout itself, timed from the moment the cluster is told about it — and measured
+ * **while the generator is still generating**.
  *
  * `metadata.generation` moves when the spec changes, which is the first observable
- * instant of a release — earlier than "pulumi finished" and later than "pulumi started",
+ * instant of a release: earlier than "pulumi finished" and later than "pulumi started",
  * both of which would time this tool rather than the rolling update.
+ *
+ * ## Why every command in here is asynchronous
+ *
+ * `spawnSync` blocks the event loop until the child exits. `kubectl rollout status`
+ * exits when the rollout is over, so a synchronous call freezes this process for exactly
+ * the window being measured — the thirty-two workers above stop, their timers do not
+ * fire, their sockets are not read, and every request they would have made during the
+ * rolling update is simply never sent.
+ *
+ * The run still finished with thousands of requests and `failed=0`, because the load
+ * before and after the window is real. The number was true and it proved nothing: a
+ * release that drops every request in flight would have printed the same zero. Caught in
+ * review, and the cure is both halves — the commands here are async, and
+ * `during-rollout` is printed so that a zero overlap can never pass silently again.
  */
-async function measuredRollout(profile, revision) {
-    const before = generation();
+async function measuredRollout(profile, revision, live) {
+    const before = await generation();
     const finished = deployAsync(profile, revision);
 
-    while (generation() === before) {
+    while ((await generation()) === before) {
         await delay(100);
     }
 
     const started = Date.now();
-    kubectl(['rollout', 'status', `deploy/${deployment}`, '--timeout=5m']);
+    const atStart = { ...live };
+
+    await kubectlAsync(['rollout', 'status', `deploy/${deployment}`, '--timeout=5m']);
+
     const seconds = (Date.now() - started) / 1000;
+    const during = live.requests - atStart.requests;
+    const failedDuring = live.failed - atStart.failed;
 
     await finished;
-    return seconds;
+    return new RolloutMeasurement(seconds, during, failedDuring);
 }
 
 async function main() {
@@ -186,10 +274,10 @@ async function main() {
     const codes = join(directory, 'codes.txt');
 
     try {
-        const stop = startLoad(codes);
+        const load = startLoad(codes);
         const startedAt = Date.now();
 
-        const seconds = await measuredRollout(profile, `run-${Date.now()}`);
+        const rollout = await measuredRollout(profile, `run-${Date.now()}`, load.live);
 
         await delay(TAIL_MS);
         const elapsed = Date.now() - startedAt;
@@ -198,7 +286,7 @@ async function main() {
             await delay(MIN_LOAD_MS - elapsed);
         }
 
-        await stop();
+        await load.stop();
 
         const tally = tallyOf(codes);
 
@@ -206,7 +294,12 @@ async function main() {
         emit('requests', tally.requests);
         emit('ok', tally.ok);
         emit('failed', tally.failed);
-        emit('rollout-seconds', seconds.toFixed(2));
+        emit('rollout-seconds', rollout.seconds.toFixed(2));
+        // The number that makes the one above it mean something: how many of those
+        // responses came back **while** the new revision was replacing the old one.
+        emit('during-rollout', rollout.during);
+        emit('failed-during-rollout', rollout.failedDuring);
+        emit('workers', CONCURRENCY);
 
         if (broken) {
             // The control run: it is supposed to lose requests. Losing none would mean the

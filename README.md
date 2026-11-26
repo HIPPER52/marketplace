@@ -3045,7 +3045,8 @@ docker history --no-trunc myapp | grep -i password  # empty
 
 Up to #26 the question about this image was whether it starts. This one asks whether it
 **survives an update while people are using it**, and the only honest answer to that is a
-number: `failed=0` out of 9 821 requests, counted from a file the load generator wrote.
+number: `failed=0` out of 25 159 requests — 14 792 of them sent **while** the new
+revision was replacing the old one — counted from a file the load generator wrote.
 Not "we use Kubernetes" — a count, and a control run proving the count can come out
 otherwise.
 
@@ -3298,14 +3299,33 @@ Two profiles, one code path. `MARKETPLACE_PROFILE` picks which, `demo:rollout --
 sets it, and the four lines of difference live in `infra/profile.ts` rather than in a
 branch of the demo.
 
-| Profile    | requests | ok     | failed             | rollout-seconds |
-| ---------- | -------- | ------ | ------------------ | --------------- |
-| `hardened` | 9 821    | 9 821  | **0** (0,00 %)     | 11,13           |
-| `broken`   | 15 318   | 11 924 | **3 394** (22,2 %) | 0,63            |
+| Profile    | requests | ok     | failed             | during-rollout | rollout-seconds |
+| ---------- | -------- | ------ | ------------------ | -------------- | --------------- |
+| `hardened` | 25 159   | 25 159 | **0** (0,00 %)     | 14 792         | 11,91           |
+| `broken`   | 18 028   | 13 219 | **4 809** (26,7 %) | 565            | 0,41            |
 
-An earlier run of the correct profile gave 4 617 of 4 617: the zero reproduces, it is not
-one lucky pass. The broken profile loses roughly one request in five, and finishes in half
-a second precisely **because** it waits for nothing.
+**`during-rollout` is the column that makes the others mean anything**, and it is there
+because the first version of this demo did not have it.
+
+That version called `kubectl rollout status` through `spawnSync`. The command returns when
+the rolling update is over, and `spawnSync` blocks Node's event loop until the child
+exits — so for the whole of the window being measured the thirty-two workers were frozen:
+no timer fired, no socket was read, not one request was sent. The run still ended with
+`requests=9 821 failed=0`, because the traffic before and after the window is real. The
+number was true and it proved nothing; a release that dropped **every** request in flight
+would have printed exactly the same zero. Caught in review, and fixed in both halves —
+every command in the measured path is asynchronous now, and `during-rollout` is printed so
+that a zero overlap can never pass quietly again. The demo fails the process when it is 0.
+
+`LOAD_WORKERS` sets the concurrency, because the right number belongs to the machine
+rather than to this file: `LOAD_WORKERS=8` on the same cluster gives 6 502 requests, 3 879
+of them inside the window, and the same zero.
+
+The broken profile's `rollout-seconds` is the other thing worth reading twice. **0,41 s is
+not fast, it is wrong**: with no readiness probe the Deployment is "complete" the moment
+its pods exist, so `kubectl rollout status` returns before the new pod is listening and
+most of the 4 809 lost requests land after the rollout is officially over. That is the
+same lie the panel would tell, told to a command-line tool.
 
 A failure during a rolling update usually is not a 500. The connection is refused or reset
 and there is no status code at all — `000`, the way curl writes it; behind an Ingress or a
