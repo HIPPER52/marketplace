@@ -1,6 +1,7 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { DataSource, type Repository } from 'typeorm';
 import { DATA_SOURCE } from '../../database/constants/database.constants';
+import { loggerFor } from '../../observability/utils/logger.util';
 import { Order } from '../entities/order.entity';
 
 /**
@@ -13,8 +14,12 @@ import { Order } from '../entities/order.entity';
  * orders; 'query' issues one statement for the page and one for its items — two
  * statements for any page size, which is the property that stops this being an N+1.
  */
+const LAYER = 'orders.repository';
+
 @Injectable()
 export class OrdersRepository {
+    private readonly log = loggerFor(LAYER);
+
     private readonly orders: Repository<Order>;
 
     constructor(@Inject(DATA_SOURCE) dataSource: DataSource) {
@@ -30,6 +35,8 @@ export class OrdersRepository {
      * nothing at all.
      */
     async page(userId: string, limit: number, offset: number): Promise<OrderPage> {
+        this.log.debug({ limit, offset }, 'reading a page of orders');
+
         const [rows, total] = await this.orders.findAndCount({
             // Through the relation, not through `userId`: that property is a
             // `@RelationId`, which TypeORM fills with a second query after the fact and

@@ -1,0 +1,22 @@
+# Provisioned, not clicked. A datasource created in the UI lives in Grafana's own
+# database and disappears with the volume; this file is in git and is applied on every
+# start, which is the whole difference between a dashboard somebody has and a dashboard
+# the repository has.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: marketplace-prometheus
+    access: proxy
+    # Service names on the compose network, not the published ports: Grafana is inside.
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 5s
+
+  - name: Jaeger
+    type: jaeger
+    uid: marketplace-jaeger
+    access: proxy
+    url: http://jaeger:16686

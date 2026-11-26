@@ -4,6 +4,7 @@ import { AuthModule } from './auth/auth.module';
 import { validate } from './config/schemas/env.schema';
 import { DatabaseModule } from './database/database.module';
 import { HealthModule } from './health/health.module';
+import { ObservabilityModule } from './observability/observability.module';
 import { OrdersModule } from './orders/orders.module';
 import { ProductsModule } from './products/products.module';
 import { QueueModule } from './queue/queue.module';
@@ -24,6 +25,7 @@ import { UsersModule } from './users/users.module';
         DatabaseModule,
         RedisModule,
         HealthModule,
+        ObservabilityModule,
         // The order of these three is the order their global guards run in: Nest
         // instantiates APP_GUARD providers in module-registration order, and each of
         // these contributes one. Rate limiting first, because refusing a flood should not

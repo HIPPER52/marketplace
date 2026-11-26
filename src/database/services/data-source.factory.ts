@@ -4,6 +4,10 @@ import { ConfigService } from '@nestjs/config';
 import { DataSource } from 'typeorm';
 import type { Env } from '../../config/schemas/env.schema';
 import { parseDatabaseUrl } from '../../config/utils/database-url.util';
+import {
+    TYPEORM_LOG_LEVELS,
+    TypeOrmPinoLogger,
+} from '../../observability/services/typeorm-logger.service';
 import { ENTITIES } from '../constants/entities.constant';
 
 /**
@@ -36,7 +40,10 @@ export async function createDataSource(config: ConfigService<Env, true>): Promis
         migrationsRun: false,
 
         entities: ENTITIES,
-        logging: ['error', 'warn'],
+        // Through pino, so a failing query carries the trace_id of the request that
+        // issued it and the 500 the client saw is one search away from the reason.
+        logger: new TypeOrmPinoLogger(),
+        logging: TYPEORM_LOG_LEVELS,
     });
 
     await dataSource.initialize();

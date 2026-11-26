@@ -1,0 +1,88 @@
+{
+    "uid": "marketplace-red",
+    "title": "Marketplace — RED",
+    "description": "Three panels for the three questions RED asks: how many, how many failed, how fast. Rate and Errors come from one counter, Duration from a histogram, because a quantile of a Summary cannot be aggregated across instances.",
+    "tags": ["marketplace", "red"],
+    "timezone": "browser",
+    "schemaVersion": 39,
+    "version": 1,
+    "refresh": "10s",
+    "time": { "from": "now-15m", "to": "now" },
+    "templating": { "list": [] },
+    "panels": [
+        {
+            "id": 1,
+            "type": "timeseries",
+            "title": "Rate — how many requests",
+            "description": "R of RED. rate() over a one-minute window rather than five: a demo that runs for ninety seconds never fills a five-minute window, and the panel stays flat for a reason that has nothing to do with the service.",
+            "datasource": { "type": "prometheus", "uid": "marketplace-prometheus" },
+            "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+            "fieldConfig": {
+                "defaults": { "unit": "reqps", "min": 0 },
+                "overrides": []
+            },
+            "targets": [
+                {
+                    "refId": "A",
+                    "datasource": { "type": "prometheus", "uid": "marketplace-prometheus" },
+                    "editorMode": "code",
+                    "range": true,
+                    "legendFormat": "{{route}}",
+                    "expr": "sum by (route) (rate(http_requests_total[1m]))"
+                }
+            ]
+        },
+        {
+            "id": 2,
+            "type": "timeseries",
+            "title": "Errors — how many failed",
+            "description": "E of RED, and the filter is 5xx on purpose. A 4xx is the client being refused — a 422 on a replayed Idempotency-Key is this service working exactly as designed — while a 5xx is this service failing. Counting them together makes the panel useless the first time somebody fuzzes the API.",
+            "datasource": { "type": "prometheus", "uid": "marketplace-prometheus" },
+            "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+            "fieldConfig": {
+                "defaults": { "unit": "reqps", "min": 0 },
+                "overrides": []
+            },
+            "targets": [
+                {
+                    "refId": "A",
+                    "datasource": { "type": "prometheus", "uid": "marketplace-prometheus" },
+                    "editorMode": "code",
+                    "range": true,
+                    "legendFormat": "{{route}} {{status}}",
+                    "expr": "sum by (route, status) (rate(http_requests_total{status=~\"5..\"}[1m]))"
+                }
+            ]
+        },
+        {
+            "id": 3,
+            "type": "timeseries",
+            "title": "Duration — how fast (p95, p99)",
+            "description": "D of RED. histogram_quantile interpolates inside a bucket, so the answer is as precise as the bucket boundaries are — and it cannot see past the last finite le at all. If p99 ever sits exactly on the top boundary, the panel is not healthy, it is blind: add buckets.",
+            "datasource": { "type": "prometheus", "uid": "marketplace-prometheus" },
+            "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+            "fieldConfig": {
+                "defaults": { "unit": "s", "min": 0 },
+                "overrides": []
+            },
+            "targets": [
+                {
+                    "refId": "A",
+                    "datasource": { "type": "prometheus", "uid": "marketplace-prometheus" },
+                    "editorMode": "code",
+                    "range": true,
+                    "legendFormat": "p95 {{route}}",
+                    "expr": "histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket[1m])))"
+                },
+                {
+                    "refId": "B",
+                    "datasource": { "type": "prometheus", "uid": "marketplace-prometheus" },
+                    "editorMode": "code",
+                    "range": true,
+                    "legendFormat": "p99 {{route}}",
+                    "expr": "histogram_quantile(0.99, sum by (le, route) (rate(http_request_duration_seconds_bucket[1m])))"
+                }
+            ]
+        }
+    ]
+}

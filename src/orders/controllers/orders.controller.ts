@@ -21,6 +21,11 @@ import type {
     UpdateOrderStatusRequest,
 } from '../../common/types/api.types';
 import { pageOf, readCursor, readLimit } from '../../common/utils/pagination.util';
+import { loggerFor } from '../../observability/utils/logger.util';
+import {
+    IDEMPOTENCY_KEY_HEADER,
+    IDEMPOTENCY_REPLAY_HEADER,
+} from '../constants/idempotency.constant';
 import { CheckoutOutcome, PlaceOrderOutcome } from '../constants/outcome.constant';
 import { ORDER_STATUS_EVENT } from '../constants/realtime.constant';
 import { OrdersRepository } from '../repositories/orders.repository';
@@ -31,8 +36,19 @@ import type { CheckoutResult } from '../types/checkout.types';
 import { type OrderEvent, toPayload } from '../types/order-event.types';
 import { toApiOrder } from '../utils/order.mapper';
 
+/**
+ * One name per component, so a line can say which part of the service wrote it.
+ *
+ * A request for an order crosses four of them — this controller, the use case, the
+ * transaction and the repository — and "the same trace_id in three layers" is only
+ * provable if each layer says which one it is. `demo:logs` counts the distinct values.
+ */
+const LAYER = 'orders.controller';
+
 @Controller()
 export class OrdersController {
+    private readonly log = loggerFor(LAYER);
+
     constructor(
         private readonly placeOrder: PlaceOrderService,
         private readonly orders: OrdersRepository,
@@ -46,6 +62,8 @@ export class OrdersController {
         @Query('limit') limit?: string,
         @Query('cursor') cursor?: string,
     ) {
+        this.log.info('listing orders');
+
         const offset = readCursor(cursor);
         const { rows, total } = await this.orders.page(me.userId, readLimit(limit), offset);
 
@@ -54,6 +72,8 @@ export class OrdersController {
 
     @Get('orders/:orderId')
     async get(@CurrentUser() me: Principal, @Param('orderId') orderId: string) {
+        this.log.info({ order_id: orderId }, 'reading one order');
+
         const order = await this.orders.findById(orderId);
 
         if (order === null) {
@@ -79,10 +99,12 @@ export class OrdersController {
     @HttpCode(201)
     async create(
         @CurrentUser() me: Principal,
-        @Headers('idempotency-key') key: string,
+        @Headers(IDEMPOTENCY_KEY_HEADER) key: string,
         @Body() body: CreateOrderRequest,
         @Res({ passthrough: true }) res: Response,
     ): Promise<Order> {
+        this.log.info({ items: body.items.length }, 'placing an order');
+
         // One transaction moves the stock, the money, the order, its receipt job and the
         // outbox row that announces it. Every way it can refuse is data, not an exception
         // — see services/place-order.service.ts and types/checkout.types.ts.
@@ -114,7 +136,7 @@ export class OrdersController {
         }
 
         if (placement.outcome === PlaceOrderOutcome.Replayed) {
-            res.setHeader('Idempotency-Replay', 'true');
+            res.setHeader(IDEMPOTENCY_REPLAY_HEADER, 'true');
         }
 
         const order = await this.orders.findById(placement.orderId);

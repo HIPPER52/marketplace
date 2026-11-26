@@ -1,6 +1,7 @@
 import { type CanActivate, type ExecutionContext, Injectable } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import type { Request } from 'express';
+import { amendRequestContext } from '../../observability/utils/request-context.util';
 import { IS_PUBLIC } from '../decorators/public.decorator';
 import { Authenticator, unauthenticated } from '../services/authenticator.service';
 import type { Principal } from '../types/auth.types';
@@ -48,6 +49,11 @@ export class JwtAuthGuard implements CanActivate {
         }
 
         request.principal = await this.authenticator.identify(token);
+
+        // Who this is, into the context every later log line reads from. It cannot be set
+        // at the edge, because at the edge there is only a header: a subject exists once a
+        // signature has been checked, and this is the first line after that is true.
+        amendRequestContext({ userId: request.principal.userId });
 
         return true;
     }

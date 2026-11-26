@@ -23,4 +23,4 @@ export const RATE_WINDOW_MS = 60_000;
  * alive, and a limiter that answered 429 to a liveness probe would get the container
  * killed for being popular. `/socket.io` is a long-lived transport, not a request rate.
  */
-export const RATE_LIMIT_EXEMPT = /^\/(health|readiness)$|^\/socket\.io(\/|$)/;
+export const RATE_LIMIT_EXEMPT = /^\/(health|readiness|metrics)$|^\/socket\.io(\/|$)/;
