@@ -392,7 +392,21 @@ jobs:
           curl -fsSLo "$RUNNER_TEMP/pulumi.tar.gz" \
             "https://github.com/pulumi/pulumi/releases/download/$PULUMI_VERSION/pulumi-$PULUMI_VERSION-linux-x64.tar.gz"
           tar -xzf "$RUNNER_TEMP/pulumi.tar.gz" -C "$RUNNER_TEMP"
-          sudo install -m 0755 "$RUNNER_TEMP/pulumi/pulumi" /usr/local/bin/pulumi
+
+          # The whole directory, not just the `pulumi` binary. The CLI does not run a
+          # Pulumi program itself — it execs a sibling called `pulumi-language-nodejs`
+          # and finds it on $PATH, so installing one file out of the eleven in the
+          # tarball gives a CLI that starts, prints its version, and then fails with
+          # "no language plugin 'pulumi-language-nodejs' found in the workspace or on
+          # your $PATH". One directory, all of it, on the path — which is also what the
+          # official installer does.
+          sudo mkdir -p /opt/pulumi
+          sudo install -m 0755 "$RUNNER_TEMP"/pulumi/* /opt/pulumi/
+
+          # $GITHUB_PATH is for the steps after this one; the export is for this one,
+          # where `pulumi version` below is the check that the install actually worked.
+          echo /opt/pulumi >> "$GITHUB_PATH"
+          export PATH="/opt/pulumi:$PATH"
 
           kind version
           pulumi version
