@@ -1,0 +1,1078 @@
+openapi: 3.0.3
+
+info:
+  title: Marketplace API
+  version: 1.0.0
+  license:
+    name: ISC
+    url: https://opensource.org/license/isc-license-txt
+  description: |
+    Contract-first API for a small marketplace: a product catalogue and customer orders.
+
+    Conventions that hold across every operation:
+
+    - **Money is integer minor units.** Every `*_cents` field is an integer number of
+      cents. There are no floats and no decimal strings anywhere in this contract.
+    - **Lists are cursor-paginated.** List operations take `limit` and `cursor` and
+      answer with `{ items, next_cursor }`. A `next_cursor` of `null` means the caller
+      has reached the end of the collection.
+    - **Errors are RFC 7807 problem documents** served as `application/problem+json`.
+    - **Everything is closed unless it says otherwise.** The default below is a bearer
+      access token; the handful of operations that need none declare `security: []`.
+      A missing, expired, forged or revoked token is `401`; a valid token whose holder
+      may not do this is `403`, and the two are never interchanged.
+
+security:
+  - bearerAuth: []
+
+servers:
+  - url: https://api.marketplace.local
+    description: >-
+      Placeholder host; the service is not deployed yet. Run it locally with
+      `npm start` and call http://localhost:3000 — the server declares no base path,
+      so every route below sits at the root either way.
+
+tags:
+  - name: Auth
+    description: Signing in, rotating tokens, and signing out
+  - name: Products
+    description: Product catalogue
+  - name: Orders
+    description: Customer orders
+  - name: Uploads
+    description: Putting bytes in the object store, and getting them back
+
+paths:
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Exchange a password for a token pair
+      description: >
+        Answers with a short-lived access token and a long-lived opaque refresh token. The
+        refresh token is a random string rather than a JWT: there is nothing in it to read,
+        and the server stores only a keyed hash of it.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: The caller is who they said they were.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenPair"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refreshTokens
+      summary: Rotate a refresh token for a new pair
+      description: >
+        Every call issues a new pair and spends the presented token. A token that was
+        already spent is treated as evidence that two parties hold it: the whole family
+        descended from that login is revoked, and this call answers `401`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshRequest"
+      responses:
+        "200":
+          description: A new pair. The presented token no longer works.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenPair"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: End this session
+      description: >
+        Two things happen, against two different stores. The refresh family is revoked, so
+        no further pair can be minted; and the access token's `jti` goes on a denylist for
+        the remainder of its life, so the token already in the caller's hand stops working
+        too. A signature cannot be withdrawn — only refused.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LogoutRequest"
+      responses:
+        "204":
+          description: The session is over.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      operationId: whoAmI
+      summary: Who the presented token says you are
+      responses:
+        "200":
+          description: The authenticated caller.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Identity"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /uploads/intent:
+    post:
+      tags: [Uploads]
+      operationId: createUploadIntent
+      summary: Ask for the right to write one object
+      description: >
+        Answers with everything a client needs to put bytes in the store **without them
+        passing through this service**: an object key the server composed, and a presigned
+        URL (or one per part) that the store itself will check.
+
+
+        The key is composed here, from the token's subject and a uuid, with the extension
+        taken from the content-type allowlist. Nothing the client sends reaches it — a
+        filename is a string somebody wrote, and a client with any say over the key has
+        been handed the right to write anywhere in the bucket.
+
+
+        The grant is narrow on purpose: one method, one key, one content type, and a few
+        minutes. A presigned URL cannot be revoked, so the expiry is the only thing
+        bounding the damage of a leak.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateUploadIntentRequest"
+      responses:
+        "200":
+          description: The grant, and the row that records it.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadIntent"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /uploads/commit:
+    post:
+      tags: [Uploads]
+      operationId: commitUpload
+      summary: Confirm that the bytes actually arrived
+      description: >
+        The second half of the contract, and not a formality. The service never saw the
+        bytes, so the only way it can know an object exists is to ask the store —
+        `HeadObject`, and for a multipart upload `ListParts` and the atomic
+        `CompleteMultipartUpload` first.
+
+
+        Without this step a client can "commit" what it never uploaded, and the database
+        fills with rows pointing at nothing while the bucket fills with objects nothing
+        points at. A commit over an object that is not there is `409`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CommitUploadRequest"
+      responses:
+        "200":
+          description: The object is there, and the row now says so.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StoredFile"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: >
+            The reservation exists and the object does not. Nothing was uploaded, or the
+            upload failed, or a multipart was never completed — all of them mean the same
+            thing to this operation, and all of them are the client's to retry.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /files/{fileId}:
+    get:
+      tags: [Uploads]
+      operationId: getFile
+      summary: Follow a redirect to a short-lived download URL
+      description: >
+        Answers `302` to a presigned `GET` that lives for a minute.
+
+
+        This is the one revocation strategy that survives contact with a presigned URL.
+        There is no `jti` to deny, no registry to mark and nobody to introspect — so
+        instead of handing out a long-lived link that can never be taken back, the service
+        stays in the **authorisation** path and out of the **data** path: the guard runs on
+        every request, and the bytes still travel from the store straight to the client.
+      parameters:
+        - name: fileId
+          in: path
+          required: true
+          description: Identifier of the stored file.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "302":
+          description: Where to get the bytes. The URL expires in a minute.
+          headers:
+            Location:
+              description: A presigned URL for this object.
+              schema:
+                type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /products:
+    get:
+      tags: [Products]
+      operationId: listProducts
+      summary: List products
+      security: []
+      description: Returns a cursor-paginated page of the product catalogue.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of products to return in one page.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          required: false
+          description: >-
+            Opaque pagination token. Clients must treat it as a meaningless string:
+            pass back the `next_cursor` returned by the previous page and never parse,
+            decode or construct it by hand. Its encoding is an implementation detail
+            and may change without notice.
+          schema:
+            type: string
+            pattern: "^[A-Za-z0-9_-]+$"
+            minLength: 4
+            maxLength: 256
+      responses:
+        "200":
+          description: A page of products.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProductPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+    post:
+      tags: [Products]
+      operationId: createProduct
+      summary: Add a product to the catalogue
+      description: >
+        Writing to the catalogue is for sellers and administrators. A customer holding a
+        perfectly valid token is answered `403`: they are known, and the answer is still no.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateProductRequest"
+      responses:
+        "201":
+          description: The product as stored.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Product"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /products/{productId}:
+    get:
+      tags: [Products]
+      operationId: getProduct
+      summary: Get a product by id
+      security: []
+      description: >
+        Returns a single product together with what has been sold of it. The totals are an
+        aggregate over every order line that ever named this product, which makes this the
+        most expensive read in the contract — and the reason it is served from a cache.
+      parameters:
+        - name: productId
+          in: path
+          required: true
+          description: Identifier of the product.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The requested product and its sales totals.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProductCard"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /orders:
+    get:
+      tags: [Orders]
+      operationId: listOrders
+      summary: List orders
+      description: Returns a cursor-paginated page of orders, newest first.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of orders to return in one page.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: cursor
+          in: query
+          required: false
+          description: >-
+            Opaque pagination token. Clients must treat it as a meaningless string:
+            pass back the `next_cursor` returned by the previous page and never parse,
+            decode or construct it by hand. Its encoding is an implementation detail
+            and may change without notice.
+          schema:
+            type: string
+            pattern: "^[A-Za-z0-9_-]+$"
+            minLength: 4
+            maxLength: 256
+      responses:
+        "200":
+          description: A page of orders.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderPage"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+    post:
+      tags: [Orders]
+      operationId: createOrder
+      summary: Create an order
+      description: |
+        Places a new order. The operation is idempotent: see the `Idempotency-Key`
+        header for the exact replay semantics.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          description: >-
+            Client-generated key that makes order creation safe to retry. Replaying the
+            same key with the same request body returns the original 201 response
+            unchanged, together with an `Idempotency-Replay: true` header, and creates
+            no second order. Reusing the same key with a different body is a client
+            bug and is rejected with 422. Use a fresh UUID per logical order and keep
+            it stable across network retries of that order.
+          schema:
+            type: string
+            minLength: 8
+            maxLength: 255
+          example: 3f1a9c1e-9a5e-4a54-8f2f-2b1f0d9c7a11
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateOrderRequest"
+      responses:
+        "201":
+          description: The order was created, or an identical request was replayed.
+          headers:
+            Idempotency-Replay:
+              description: >-
+                Present and `true` when this response is a replay of an earlier request
+                carrying the same `Idempotency-Key`. Absent on first creation.
+              schema:
+                type: boolean
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /orders/{orderId}:
+    get:
+      tags: [Orders]
+      operationId: getOrder
+      summary: Get an order by id
+      description: Returns a single order with its line items.
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          description: Identifier of the order.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The requested order.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+    patch:
+      tags: [Orders]
+      operationId: updateOrderStatus
+      summary: Move an order to a new status
+      description: >-
+        Advances an order through its lifecycle. The change is pushed to everyone
+        currently watching this order: subscribers of
+        `GET /orders/{orderId}/events` and members of the WebSocket room
+        `orders:{orderId}`.
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          description: Identifier of the order.
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateOrderStatusRequest"
+      responses:
+        "200":
+          description: The order, with its new status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+  /orders/{orderId}/events:
+    get:
+      tags: [Orders]
+      operationId: streamOrderEvents
+      summary: Stream this order's status changes
+      description: >-
+        A Server-Sent Events stream: one `id:` / `event:` / `data:` block per status
+        change, for this order only. The response never completes on its own.
+
+        The stream is private to the order's buyer: the access token says who is
+        asking, and anybody else is answered 403 — the same rule the WebSocket gateway
+        applies to a room join.
+
+        Every event carries an `id:` that increases within the order. A client that
+        reconnects with `Last-Event-ID` receives everything numbered above it before the
+        live stream resumes, so a dropped connection costs no events. The buffer lives in
+        the process, so it does not survive a restart.
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          description: Identifier of the order.
+          schema:
+            type: string
+            format: uuid
+        - name: Last-Event-ID
+          in: header
+          required: false
+          description: >-
+            Id of the last event this client already has. Events numbered above it are
+            replayed before the stream continues. Set automatically by `EventSource` on
+            reconnect.
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        "200":
+          description: An open event stream. One block per status change.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                example: |
+                  id: 4
+                  event: order.status
+                  data: {"order_id":"3fa85f64-5717-4562-b3fc-2c963f66afa6","status":"shipped","id":4}
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        An ES256-signed access token. Verification pins the algorithm explicitly, so a
+        token that nominates its own — `alg: none`, or HS256 against the public key — is
+        refused rather than trusted (RFC 8725 §3.1).
+
+  responses:
+    BadRequest:
+      description: The request does not satisfy this contract.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+    Forbidden:
+      description: The caller said who they are, and it is not whose this is.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+    Unauthorized:
+      description: >
+        Who the caller is could not be established: no token, an expired one, one this
+        service did not sign, or one that has been revoked. A client should refresh and
+        try again — which is precisely what it must not do with a 403.
+      headers:
+        WWW-Authenticate:
+          description: The scheme this resource expects (RFC 6750 §3).
+          schema:
+            type: string
+            example: Bearer
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+    NotFound:
+      description: The requested resource does not exist.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+    UnprocessableEntity:
+      description: The request is well-formed but cannot be processed.
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+    TooManyRequests:
+      description: >
+        The caller has spent its allowance for the current window. The limit is counted in
+        shared storage, so every instance of this service enforces the same one.
+      headers:
+        Retry-After:
+          description: Whole seconds to wait before the allowance frees up (RFC 6585).
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+
+  schemas:
+    Problem:
+      type: object
+      description: An RFC 7807 problem document.
+      required: [type, title, status, detail, instance]
+      properties:
+        type:
+          type: string
+          format: uri
+          description: URI identifying the problem type.
+          example: https://api.marketplace.local/problems/validation-error
+        title:
+          type: string
+          description: Short, human-readable summary of the problem type.
+          example: Request validation failed
+        status:
+          type: integer
+          description: HTTP status code of this response.
+          example: 400
+        detail:
+          type: string
+          description: Human-readable explanation specific to this occurrence.
+          example: request/headers must have required property 'idempotency-key'
+        instance:
+          type: string
+          format: uri-reference
+          description: URI reference identifying this specific occurrence.
+          example: /orders
+
+    Product:
+      type: object
+      required: [id, title, price_cents, currency, in_stock]
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+          example: Mechanical keyboard
+        price_cents:
+          type: integer
+          minimum: 0
+          description: Price in minor units (cents).
+          example: 260000
+        currency:
+          $ref: "#/components/schemas/Currency"
+        in_stock:
+          type: integer
+          minimum: 0
+          description: Units currently available.
+          example: 7
+
+    CreateUploadIntentRequest:
+      type: object
+      required: [content_type, size_bytes]
+      additionalProperties: false
+      properties:
+        content_type:
+          type: string
+          description: >
+            What is being uploaded, from the allowlist. It decides the key's extension and
+            is signed into the grant, so the upload must send exactly this type. It is
+            still the client's own word about the bytes — a lie inside the allowlist is
+            caught by reading the file, which is a different assignment.
+          enum: [image/png, image/jpeg, image/webp, application/pdf, text/css]
+        size_bytes:
+          type: integer
+          minimum: 1
+          description: >
+            How big it is going to be. Declared rather than discovered, because the choice
+            between one PUT and the multipart protocol has to be made before a byte moves
+            — and because the part size is computed from it. `commit` reads the real size
+            back from the store, so a number that was wrong is caught there.
+        filename:
+          type: string
+          maxLength: 255
+          description: >
+            What the client calls the file, kept for display only. **It does not reach the
+            object key**, and `demo:upload` sends a path traversal here on purpose to show
+            that it does not.
+      example:
+        content_type: image/png
+        size_bytes: 102400
+        filename: avatar.png
+
+    UploadIntent:
+      type: object
+      required: [file_id, object_key, mode, expires_in]
+      properties:
+        file_id:
+          type: string
+          format: uuid
+          description: What `commit` and `GET /files/{fileId}` name this upload by.
+        object_key:
+          type: string
+          description: Where it will live in the bucket. Composed by the server.
+        mode:
+          type: string
+          enum: [single, multipart]
+          description: >
+            `single` for one PUT, `multipart` above the threshold. The threshold and the
+            part size are computed, not constants — see README, "Files".
+        expires_in:
+          type: integer
+          minimum: 1
+          description: Seconds the grant below is good for.
+        url:
+          type: string
+          nullable: true
+          description: The presigned PUT, for `single`. Null otherwise.
+        upload_id:
+          type: string
+          nullable: true
+          description: The multipart handle, for `multipart`. Null otherwise.
+        part_size_bytes:
+          type: integer
+          nullable: true
+          minimum: 1
+          description: How large every part but the last must be. Null for `single`.
+        parts:
+          type: array
+          nullable: true
+          description: One presigned URL per part, in order. Null for `single`.
+          items:
+            $ref: "#/components/schemas/UploadPart"
+
+    UploadPart:
+      type: object
+      required: [part_number, url]
+      properties:
+        part_number:
+          type: integer
+          minimum: 1
+          maximum: 10000
+        url:
+          type: string
+
+    CommitUploadRequest:
+      type: object
+      required: [file_id]
+      additionalProperties: false
+      properties:
+        file_id:
+          type: string
+          format: uuid
+      example:
+        file_id: 3fa85f64-5717-4562-b3fc-2c963f66afa6
+
+    StoredFile:
+      type: object
+      required: [id, object_key, content_type, status, size_bytes]
+      properties:
+        id:
+          type: string
+          format: uuid
+        object_key:
+          type: string
+        content_type:
+          type: string
+        status:
+          type: string
+          enum: [pending, completed]
+        size_bytes:
+          type: integer
+          minimum: 0
+          description: Read back from the store, never taken from the client.
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      additionalProperties: false
+      properties:
+        email:
+          type: string
+          format: email
+          example: buyer@marketplace.local
+        password:
+          type: string
+          minLength: 1
+          format: password
+
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      additionalProperties: false
+      properties:
+        refresh_token:
+          type: string
+          minLength: 1
+          description: The opaque string the previous call handed out.
+
+    LogoutRequest:
+      type: object
+      required: [refresh_token]
+      additionalProperties: false
+      properties:
+        refresh_token:
+          type: string
+          minLength: 1
+          description: >
+            Which session to end. Named explicitly rather than inferred from the access
+            token, so that signing out of one device does not sign out of the others.
+
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token, token_type, expires_in]
+      properties:
+        access_token:
+          type: string
+          description: "A signed JWT. Send it as `Authorization: Bearer <token>`."
+        refresh_token:
+          type: string
+          description: >
+            An opaque random string — deliberately not a JWT. Only a keyed hash of it is
+            stored, so a dump of the table is not a dump of live sessions.
+        token_type:
+          type: string
+          enum: [Bearer]
+        expires_in:
+          type: integer
+          minimum: 1
+          description: Seconds the access token remains valid.
+          example: 900
+
+    Identity:
+      type: object
+      required: [id, email, display_name, role]
+      properties:
+        id:
+          type: string
+          example: "1"
+        email:
+          type: string
+          format: email
+        display_name:
+          type: string
+        role:
+          type: string
+          enum: [customer, seller, admin]
+          description: >
+            Read from the database at the moment of the request, not from the token. A
+            role that changed a second ago is already in force here.
+
+    CreateProductRequest:
+      type: object
+      required: [title, price_cents, in_stock]
+      additionalProperties: false
+      properties:
+        title:
+          type: string
+          minLength: 1
+        price_cents:
+          type: integer
+          minimum: 0
+        currency:
+          $ref: "#/components/schemas/Currency"
+        in_stock:
+          type: integer
+          minimum: 0
+
+    ProductCard:
+      description: >
+        A product plus what has been sold of it. Separate from `Product` because the totals
+        cost a join and an aggregate over every order line, and a list of twenty of them
+        would pay that twenty times.
+      allOf:
+        - $ref: "#/components/schemas/Product"
+        - type: object
+          required: [units_sold, revenue_cents]
+          properties:
+            units_sold:
+              type: integer
+              minimum: 0
+              description: Units of this product across every order ever placed.
+              example: 12
+            revenue_cents:
+              type: integer
+              minimum: 0
+              description: What those units came to, in minor units.
+              example: 3120000
+
+    ProductPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Product"
+        next_cursor:
+          type: string
+          nullable: true
+          description: >-
+            Opaque token pointing at the next page, or `null` when this is the last
+            page. Pass it back unchanged in the `cursor` query parameter.
+
+    OrderStatus:
+      type: string
+      description: Where an order is in its lifecycle.
+      enum: [pending, paid, shipped, cancelled]
+
+    UpdateOrderStatusRequest:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          $ref: "#/components/schemas/OrderStatus"
+
+    Order:
+      type: object
+      required: [id, status, items, total_cents, currency, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          $ref: "#/components/schemas/OrderStatus"
+        items:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/OrderItem"
+        total_cents:
+          type: integer
+          minimum: 0
+          description: Order total in minor units (cents).
+          example: 520000
+        currency:
+          $ref: "#/components/schemas/Currency"
+        created_at:
+          type: string
+          format: date-time
+
+    OrderPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Order"
+        next_cursor:
+          type: string
+          nullable: true
+          description: >-
+            Opaque token pointing at the next page, or `null` when this is the last
+            page. Pass it back unchanged in the `cursor` query parameter.
+
+    OrderItem:
+      type: object
+      required: [product_id, quantity, unit_price_cents, subtotal_cents]
+      properties:
+        product_id:
+          type: string
+          format: uuid
+        quantity:
+          type: integer
+          minimum: 1
+        unit_price_cents:
+          type: integer
+          minimum: 0
+          description: Price of one unit at the time the order was placed, in cents.
+        subtotal_cents:
+          type: integer
+          minimum: 0
+          description: quantity × unit_price_cents, in cents.
+
+    CreateOrderRequest:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          description: Line items to order. At least one is required.
+          items:
+            $ref: "#/components/schemas/CreateOrderItem"
+        currency:
+          $ref: "#/components/schemas/Currency"
+
+    CreateOrderItem:
+      type: object
+      additionalProperties: false
+      required: [product_id, quantity]
+      properties:
+        product_id:
+          type: string
+          format: uuid
+        quantity:
+          type: integer
+          minimum: 1
+          maximum: 100
+
+    Currency:
+      type: string
+      enum: [UAH, USD, EUR]
+      default: UAH

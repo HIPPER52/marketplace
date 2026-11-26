@@ -1,0 +1,53 @@
+services:
+  app:
+    # Same reason as in docker-compose.yml: `docker compose up -d --wait` must not need a
+    # secret a fresh clone does not have. `docker compose --profile app up -d` runs it.
+    profiles: ["app"]
+    build:
+      context: ./
+      dockerfile: docker/Dockerfile
+      target: dev
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgres://marketplace_app@pgbouncer:6432/marketplace
+      DB_PASSWORD_FILE: /run/secrets/db_password
+      # The two Redis instances, by service name on the compose network — the published
+      # 26379/26380 are for the host, not for a container beside them.
+      REDIS_URL: redis://redis-cache:6379
+      REDIS_QUEUE_URL: redis://redis-queue:6379
+      # Interpolated from the host environment (compose also reads `.env` for this), and
+      # deliberately **not** `${VAR:?message}`: compose interpolates the whole file no
+      # matter which profile is active, so a `:?` here would make the bare
+      # `docker compose up -d --wait` fail for somebody who is not running the service.
+      # Unset, they arrive empty and the application's own schema refuses to start and
+      # says which secret is missing — which is the better error anyway.
+      JWT_KID: ${JWT_KID}
+      JWT_PRIVATE_KEY: ${JWT_PRIVATE_KEY}
+      JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY}
+      REFRESH_TOKEN_PEPPER: ${REFRESH_TOKEN_PEPPER}
+    volumes:
+      - ./src:/app/src
+      - ./openapi:/app/openapi
+      - ./secrets/db_password:/run/secrets/db_password:ro
+      - /app/node_modules
+    ports:
+      - "3000:3000"
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+      redis-queue:
+        condition: service_healthy
+
+  pgbouncer:
+    ports:
+      # What everything outside Docker connects to: .env.example, the npm scripts, the
+      # backup and the restore drill.
+      - "26432:6432"
+
+  db:
+    ports:
+      # Still published, but only so that `psql -f db/schema.sql` from HW-12 and the
+      # restore drill can reach Postgres itself. Application traffic goes through 26432.
+      - "25432:5432"

@@ -1,0 +1,630 @@
+# The pull-request pipeline: four gates, one build, one deploy, one measurement.
+#
+# Everything a reviewer has to take on trust is a thing this file failed to measure, so
+# each job ends by writing a number down and the last one collects them into an artifact
+# called `pipeline-evidence`. A green tick says a workflow finished; the artifact says
+# what it found.
+#
+# There is deliberately **one** workflow on a pull request. Until #32 there were two
+# files and both ran on every push, which cost a second `npm ci` and a second Postgres
+# for no information — and, worse, left two successful runs against one commit, so
+# "download the evidence from the successful run on this SHA" had two answers. The
+# contract jobs below are the old `contract.yml`, moved rather than rewritten.
+name: pipeline
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+# Nothing is granted here. Every job below asks for exactly what it needs and no job
+# inherits anything it forgot to think about — which is the only way `id-token: write`
+# ends up on one job out of six rather than on all of them.
+permissions: {}
+
+concurrency:
+  group: pipeline-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+  REGISTRY: ghcr.io
+  # Pinned like every other tool in this repository. kind's node image is pinned by
+  # digest inside k8s/kind-config.yaml; this is the client that reads it.
+  KIND_VERSION: v0.33.0
+  KIND_SHA256: aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d
+  PULUMI_VERSION: v3.276.0
+  ACTIONLINT_IMAGE: rhysd/actionlint:1.7.12
+  OASDIFF_IMAGE: tufin/oasdiff:v1.41.0
+  # The ceiling this stack may cost per month before somebody has to agree to it out
+  # loud. Measured at $16.93 today, so doubling the API's replicas trips it — which is
+  # the point of a budget that is not round.
+  COST_BUDGET_USD: "25"
+
+jobs:
+  # ---------------------------------------------------------------------------------
+  # The four gates, on the real inputs. `npm run demo:gates` in the build job is what
+  # proves each of them can also say no.
+  # ---------------------------------------------------------------------------------
+  quality:
+    name: gates
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # oasdiff compares against the branch this pull request targets, which a
+          # shallow clone does not have.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Types, lint, environment and spec
+        run: npm run check
+
+      - name: Architecture
+        run: npx depcruise src --config .dependency-cruiser.cjs
+
+      - name: The workflows themselves
+        run: docker run --rm --volume "$PWD:/repo:ro" --workdir /repo "$ACTIONLINT_IMAGE" -color
+
+      - name: No breaking change to the contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${{ github.base_ref }}"
+          [ -n "$base" ] || base="${{ github.event.repository.default_branch }}"
+
+          git fetch --no-tags --depth=1 origin "$base"
+          specs="$RUNNER_TEMP/specs"
+          mkdir -p "$specs"
+
+          # A base branch that has no spec yet cannot be broken by one: every operation
+          # in this pull request is new. Saying so is better than comparing the file
+          # against itself and calling the tautology a gate.
+          if ! git show "origin/$base:openapi/openapi.yaml" > "$specs/base.yaml" 2>/dev/null; then
+            echo "contract-base=absent"
+            exit 0
+          fi
+
+          cp openapi/openapi.yaml "$specs/revision.yaml"
+          echo "contract-base=origin/$base"
+
+          # --fail-on ERR: without it oasdiff prints the breaking changes and exits 0.
+          docker run --rm --volume "$specs:/specs:ro" "$OASDIFF_IMAGE" \
+            breaking /specs/base.yaml /specs/revision.yaml --fail-on ERR --color never
+
+  tests:
+    name: integration + e2e
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      # Nothing to start: @testcontainers/postgresql raises its own Postgres from inside
+      # the tests, on a port it picks, and ryuk removes it even if the suite dies.
+      - name: Integration suite
+        run: npm run test:integration
+
+      - name: End to end
+        run: npm run test:e2e
+
+      # The suites run from source and never touch the Dockerfile, so a broken image
+      # build reaches a reviewer unnoticed — which is exactly how a `COPY tsconfig.json`
+      # that no longer matched `tsc -p tsconfig.build.json` got committed once.
+      - name: The dev image still builds
+        run: docker compose --profile app build app
+
+  contract:
+    name: publish -> verify -> can-i-deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      # The address of this workflow's own broker, not a secret — it is a loopback port on
+      # the runner. The token is, which is why it comes from GitHub secrets and is empty
+      # against a local broker that asks for none.
+      PACT_BROKER_URL: http://127.0.0.1:29292
+      PACT_BROKER_TOKEN: ${{ secrets.PACT_BROKER_TOKEN }}
+      # The commit, not a constant. A fixed version on a broker that outlives the run
+      # means the prod tag from last time is still there, so can-i-deploy answers "yes"
+      # before anything has verified today's contract — and the gate, which exists to say
+      # no, has nothing left to say it about.
+      PACT_VERSION: ${{ github.event.pull_request.head.sha || github.sha }}
+      CONSUMER: marketplace-web
+      PROVIDER: marketplace-api
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Raise the broker
+        run: docker compose up -d --wait pact-broker
+
+      - name: Consumer test writes the contract
+        run: npm run test:contract
+
+      - name: Publish the contract
+        run: |
+          status=$(curl -s -o /tmp/publish.json -w '%{http_code}' \
+            -X PUT "$PACT_BROKER_URL/pacts/provider/$PROVIDER/consumer/$CONSUMER/version/$PACT_VERSION" \
+            -H 'Content-Type: application/json' \
+            --data-binary "@pacts/$CONSUMER-$PROVIDER.json")
+          echo "HTTP $status"
+          cat /tmp/publish.json
+          test "$status" = "200" -o "$status" = "201"
+
+      # Proves the gate is a gate, and asks about the right participant to do it.
+      #
+      # The question is "may this provider build go to prod", not "may the consumer go".
+      # Asking about the consumer looks equivalent and is not: the broker attaches a
+      # verification result to the *content* of a pact, so an unchanged contract
+      # republished under a new consumer version is already verified and the answer comes
+      # back "yes" before this build has done anything.
+      - name: The gate refuses before verification
+        run: |
+          curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=$PROVIDER&version=$PACT_VERSION&to=prod" \
+            -o /tmp/before.json
+          node -e '
+            const summary = require("/tmp/before.json").summary;
+            console.log(JSON.stringify(summary));
+            if (summary.deployable === true) {
+              console.error("The gate said yes before this build verified anything.");
+              process.exit(1);
+            }
+          '
+
+      - name: Provider verification, published back to the broker
+        run: npm run verify:provider
+
+      - name: Tag this provider version as prod
+        run: |
+          curl -sf -o /dev/null \
+            -X PUT "$PACT_BROKER_URL/pacticipants/$PROVIDER/versions/$PACT_VERSION/tags/prod" \
+            -H 'Content-Type: application/json'
+
+      - name: can-i-deploy
+        run: |
+          curl -s "$PACT_BROKER_URL/can-i-deploy?pacticipant=$PROVIDER&version=$PACT_VERSION&to=prod" \
+            -o /tmp/after.json
+          node -e '
+            const summary = require("/tmp/after.json").summary;
+            console.log(JSON.stringify(summary));
+            if (summary.deployable !== true) {
+              console.error(summary.reason);
+              process.exit(1);
+            }
+          '
+
+  # ---------------------------------------------------------------------------------
+  # Built once. Everything downstream names the digest this job pushed, so there is no
+  # second build to be subtly different from the one the gates looked at.
+  # ---------------------------------------------------------------------------------
+  build:
+    name: build once
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+      digest: ${{ steps.push.outputs.digest }}
+      invocations: ${{ steps.build.outputs.invocations }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Build the production image
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          npm run image:build 2>&1 | tee evidence/build.log
+
+          # Counted from BuildKit's own output rather than asserted. One image was
+          # exported; if this is ever two, something downstream rebuilt and the promise
+          # that the deployed bytes are the scanned bytes is gone.
+          #
+          # `exporting to image` and not the digest line beneath it: which digest line
+          # appears depends on the exporter — a containerd image store writes
+          # `exporting manifest sha256:…`, the classic one writes `writing image
+          # sha256:…` — and a count that knows only one of them reports zero builds for
+          # a build that plainly happened. This header is printed by both.
+          invocations=$(grep -c 'exporting to image' evidence/build.log || true)
+          echo "invocations=$invocations" >> "$GITHUB_OUTPUT"
+          echo "build-invocations=$invocations"
+
+          if [ "$invocations" -ne 1 ]; then
+            echo "::error::expected exactly one image export, counted $invocations"
+            grep -nE 'exporting to image|exporting manifest|writing image' evidence/build.log || true
+            exit 1
+          fi
+
+      - name: The four gates, each shown refusing something
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run --silent demo:gates 2>&1 | tee evidence/gates.txt
+
+      - name: Push by digest
+        id: push
+        shell: bash
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          # A registry rejects an uppercase path, and a GitHub owner may well be one.
+          image="$REGISTRY/$(echo "$REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          tag="$HEAD_SHA"
+
+          printf '%s' "$GHCR_TOKEN" | docker login "$REGISTRY" \
+            --username "$GHCR_USER" --password-stdin
+
+          docker tag marketplace:hw28 "$image:$tag"
+          docker push "$image:$tag"
+
+          # The *manifest* digest, which is what names content in a registry — not the
+          # local image id, which is a different hash of a different thing and does not
+          # survive leaving this machine.
+          #
+          # Filtered by repository, and that is not belt-and-braces: with a containerd
+          # image store `RepoDigests` already carries a local entry before anything is
+          # pushed (`marketplace@sha256:…`, measured), so taking the first line would
+          # sometimes answer with a digest that was never in a registry.
+          digest=$(docker image inspect --format '{{join .RepoDigests "\n"}}' "$image:$tag" \
+            | grep -F "$image@" | grep -oE 'sha256:[0-9a-f]{64}' | head -1)
+
+          # And if that came back empty, ask the registry itself rather than failing on
+          # a property of the local daemon. Two independent routes to one fact; the echo
+          # says which one answered, so a surprise is diagnosable from the log alone.
+          if [ -z "$digest" ]; then
+            digest=$(docker buildx imagetools inspect "$image:$tag" \
+              --format '{{.Manifest.Digest}}' | grep -oE 'sha256:[0-9a-f]{64}' | head -1)
+            echo "digest-source=registry"
+          else
+            echo "digest-source=local-repo-digests"
+          fi
+
+          test -n "$digest"
+
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "image-ref=$image@$digest"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: build-evidence
+          path: evidence
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------------
+  # The deploy: a cluster, the promoted digest, a budget and a measured release.
+  # ---------------------------------------------------------------------------------
+  deploy:
+    name: deploy and measure
+    runs-on: ubuntu-latest
+    needs: [quality, tests, contract, build]
+    environment: preview
+    permissions:
+      contents: read
+      packages: read
+      # The only job in this file that may ask GitHub to mint a token about this run,
+      # and the reason this is declared per job rather than at the top: a workflow-wide
+      # `id-token: write` hands that ability to the job that runs a contributor's test
+      # code as well.
+      id-token: write
+    env:
+      IMAGE_REF: ${{ needs.build.outputs.image }}@${{ needs.build.outputs.digest }}
+      SKIP_VAULT: "1"
+      PULUMI_CONFIG_PASSPHRASE: ${{ github.run_id }}-${{ github.run_attempt }}
+      # The values the application's own schema requires. None of them is a real
+      # credential: this cluster lives for the length of this job and is deleted with
+      # the runner, which is the only reason a generated password is acceptable here.
+      STORAGE_ENDPOINT: http://127.0.0.1:29000
+      STORAGE_REGION: us-east-1
+      STORAGE_ACCESS_KEY: pipeline
+      STORAGE_BUCKET: marketplace-files
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - run: npm ci
+
+      - name: Prepare
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          echo "PULUMI_BACKEND_URL=file://$PWD/.pulumi" >> "$GITHUB_ENV"
+
+      # ---- identity -------------------------------------------------------------
+      - name: The runner's own OIDC token, verified against GitHub's keys
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/oidc-gate.mjs 2>&1 | tee evidence/oidc.txt
+
+      - name: The trust policy, shown refusing two tokens
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run --silent demo:oidc 2>&1 | tee evidence/oidc-demo.txt
+
+      # ---- tools ----------------------------------------------------------------
+      - name: Install kind and pulumi
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSLo "$RUNNER_TEMP/kind" \
+            "https://kind.sigs.k8s.io/dl/$KIND_VERSION/kind-linux-amd64"
+          echo "$KIND_SHA256  $RUNNER_TEMP/kind" | sha256sum --check --status
+          sudo install -m 0755 "$RUNNER_TEMP/kind" /usr/local/bin/kind
+
+          curl -fsSLo "$RUNNER_TEMP/pulumi.tar.gz" \
+            "https://github.com/pulumi/pulumi/releases/download/$PULUMI_VERSION/pulumi-$PULUMI_VERSION-linux-x64.tar.gz"
+          tar -xzf "$RUNNER_TEMP/pulumi.tar.gz" -C "$RUNNER_TEMP"
+
+          # The whole directory, not just the `pulumi` binary. The CLI does not run a
+          # Pulumi program itself — it execs a sibling called `pulumi-language-nodejs`
+          # and finds it on $PATH, so installing one file out of the eleven in the
+          # tarball gives a CLI that starts, prints its version, and then fails with
+          # "no language plugin 'pulumi-language-nodejs' found in the workspace or on
+          # your $PATH". One directory, all of it, on the path — which is also what the
+          # official installer does.
+          sudo mkdir -p /opt/pulumi
+          sudo install -m 0755 "$RUNNER_TEMP"/pulumi/* /opt/pulumi/
+
+          # $GITHUB_PATH is for the steps after this one; the export is for this one,
+          # where `pulumi version` below is the check that the install actually worked.
+          echo /opt/pulumi >> "$GITHUB_PATH"
+          export PATH="/opt/pulumi:$PATH"
+
+          kind version
+          pulumi version
+          kubectl version --client
+
+      # ---- the values the program refuses to start without ----------------------
+      - name: Mint the run's secrets
+        shell: bash
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          npm run --silent keygen > "$RUNNER_TEMP/keys.env"
+
+          while IFS='=' read -r key value; do
+            case "$key" in
+              JWT_KID|JWT_PRIVATE_KEY|JWT_PUBLIC_KEY)
+                echo "::add-mask::$value"
+                echo "$key=$value" >> "$GITHUB_ENV"
+                ;;
+            esac
+          done < "$RUNNER_TEMP/keys.env"
+          rm -f "$RUNNER_TEMP/keys.env"
+
+          for name in DB_PASSWORD REFRESH_TOKEN_PEPPER STORAGE_SECRET_KEY; do
+            value=$(openssl rand -hex 24)
+            echo "::add-mask::$value"
+            echo "$name=$value" >> "$GITHUB_ENV"
+          done
+
+          # The credential the kubelet pulls the promoted digest with. It is the token
+          # GitHub already gave this job, scoped to `packages: read`, and it lives as
+          # long as the cluster does — which is this job. It reaches the shell through
+          # the environment rather than through an expression interpolated into the
+          # script, so the value is never part of the text the runner assembles.
+          auth=$(printf '%s:%s' "$GHCR_USER" "$GHCR_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          pull=$(printf '{"auths":{"%s":{"auth":"%s"}}}' "$REGISTRY" "$auth")
+          echo "::add-mask::$pull"
+          echo "IMAGE_PULL_SECRET=$pull" >> "$GITHUB_ENV"
+
+      # Cheap, and it fails in ten seconds instead of in ten minutes. If the digest or
+      # the credential is wrong, the only other symptom is a pod in ImagePullBackOff
+      # while `pulumi up` waits out its timeout.
+      - name: The digest is pullable with this run's credential
+        shell: bash
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | docker login "$REGISTRY" \
+            --username "$GHCR_USER" --password-stdin
+          docker pull "$IMAGE_REF" > /dev/null
+          echo "pullable=$IMAGE_REF"
+
+      - name: Cluster
+        run: npm run cluster:up
+
+      - run: npm --prefix infra ci
+
+      # ---- the budget, before anything is applied -------------------------------
+      - name: What this plan would cost
+        shell: bash
+        env:
+          # The one documented way past this gate. It does not rewrite the verdict —
+          # `gate=fail` still reaches the evidence beside `bypass=cost-approved` — it
+          # only stops the verdict from blocking a merge somebody has agreed to. The
+          # label is named in the README as `cost-gate-bypass-label: cost-approved`.
+          COST_GATE_BYPASS: ${{ contains(github.event.pull_request.labels.*.name, 'cost-approved') && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          npm run --silent plan > evidence/plan.json
+          PLAN_JSON=evidence/plan.json npm run --silent gate:cost 2>&1 | tee evidence/cost.txt
+
+      - name: Deploy the promoted digest
+        run: npm run up
+
+      # ---- the measurement ------------------------------------------------------
+      - name: A release under load
+        shell: bash
+        env:
+          # A runner has two cores and is also hosting the cluster it measures, so the
+          # generator is given longer rather than a smaller sample: the claim stays
+          # "no request failed", and `during-rollout` says how much of the traffic was
+          # inside the window that claim is about.
+          LOAD_WORKERS: "16"
+          ROLLOUT_MIN_MS: "45000"
+          ROLLOUT_MIN_REQUESTS: "2000"
+        run: |
+          set -euo pipefail
+          npm run --silent demo:rollout 2>&1 | tee evidence/rollout.txt
+
+      - name: What the cluster is actually running
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl get deployment marketplace-api -n marketplace -o json > evidence/deployment.json
+          deployed=$(node -p "require('./evidence/deployment.json').spec.template.spec.containers[0].image")
+          echo "deployed-image=$deployed"
+          echo "deployed-image=$deployed" >> evidence/deploy.txt
+
+          # Promote by digest, and this is the line that makes it a claim rather than a
+          # habit: the manifest in the cluster names the bytes the build job pushed, or
+          # this job fails.
+          test "$deployed" = "$IMAGE_REF"
+          echo "deployed-digest=${deployed##*@}" >> evidence/deploy.txt
+
+      - name: No secret value in anything published
+        shell: bash
+        run: |
+          set -euo pipefail
+          leaks=0
+
+          # Both the plan and the live manifest go into an artifact anybody with read
+          # access to this repository can download, so the question is not whether they
+          # *should* carry a value — it is whether they do.
+          for value in "$DB_PASSWORD" "$REFRESH_TOKEN_PEPPER" "$STORAGE_SECRET_KEY" "$JWT_PRIVATE_KEY"; do
+            encoded=$(printf '%s' "$value" | base64 -w0)
+            for file in evidence/plan.json evidence/deployment.json; do
+              if grep -qF -- "$value" "$file"; then leaks=$((leaks + 1)); fi
+              if grep -qF -- "$encoded" "$file"; then leaks=$((leaks + 1)); fi
+            done
+          done
+
+          echo "secret-in-manifest=$leaks" | tee -a evidence/deploy.txt
+          test "$leaks" -eq 0
+
+      - name: Tear the cluster down
+        if: always()
+        run: npm run cluster:down || true
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: deploy-evidence
+          path: evidence
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------------
+  # One file somebody can read without opening six job logs. `if: always()` because the
+  # run that failed is the one worth having evidence about.
+  # ---------------------------------------------------------------------------------
+  evidence:
+    name: evidence
+    runs-on: ubuntu-latest
+    needs: [quality, tests, contract, build, deploy]
+    if: always()
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          path: downloaded
+
+      - name: Assemble
+        shell: bash
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          INVOCATIONS: ${{ needs.build.outputs.invocations }}
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cp -r downloaded/build-evidence/. evidence/ 2>/dev/null || true
+          cp -r downloaded/deploy-evidence/. evidence/ 2>/dev/null || true
+
+          # Every line is `key=value`, the shape every demo in this repository has
+          # printed since #19, so a grader greps instead of parsing.
+          pick() { grep -m1 "^$1=" "$2" 2>/dev/null || true; }
+
+          {
+            echo "run-id=${{ github.run_id }}"
+            echo "run-attempt=${{ github.run_attempt }}"
+            echo "head-sha=${{ github.event.pull_request.head.sha || github.sha }}"
+            echo "image-ref=$IMAGE@$DIGEST"
+            echo "built-digest=$DIGEST"
+            echo "build-invocations=${INVOCATIONS:-0}"
+
+            pick deployed-digest evidence/deploy.txt
+            pick secret-in-manifest evidence/deploy.txt
+
+            pick creds-source evidence/oidc.txt
+            pick oidc-iss evidence/oidc.txt
+            pick oidc-aud evidence/oidc.txt
+            pick oidc-sub evidence/oidc.txt
+            pick oidc-sig-verified evidence/oidc.txt
+            pick oidc-sub-trusted evidence/oidc.txt
+
+            pick budget-usd evidence/cost.txt
+            pick plan-usd evidence/cost.txt
+            echo "gate-cost=$(grep -m1 '^gate=' evidence/cost.txt | cut -d= -f2 || true)"
+            pick bypass evidence/cost.txt
+
+            grep -m1 '^requests=' evidence/rollout.txt | sed 's/^/rollout-/' || true
+            grep -m1 '^ok=' evidence/rollout.txt | sed 's/^/rollout-/' || true
+            grep -m1 '^failed=' evidence/rollout.txt | sed 's/^/rollout-/' || true
+            pick rollout-seconds evidence/rollout.txt
+            pick during-rollout evidence/rollout.txt
+
+            pick one-sided evidence/gates.txt
+            pick image-broken evidence/gates.txt
+
+            echo "job-quality=${{ needs.quality.result }}"
+            echo "job-tests=${{ needs.tests.result }}"
+            echo "job-contract=${{ needs.contract.result }}"
+            echo "job-build=${{ needs.build.result }}"
+            echo "job-deploy=${{ needs.deploy.result }}"
+          } > evidence/evidence.txt
+
+          cat evidence/evidence.txt
+          cat evidence/evidence.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: pipeline-evidence
+          path: evidence
+          if-no-files-found: error
