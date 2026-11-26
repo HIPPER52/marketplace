@@ -40,6 +40,19 @@ jobs:
           docker compose --profile app build app
           docker compose -f docker-compose.yml --profile app build app
 
+      # The production image as the cluster gets it — through docker/Dockerfile with the
+      # build-stage secret mounted — and then the gate over it.
+      #
+      # The threshold is the ratchet in scripts/scan.mjs: measured, dated and allowed to
+      # go down. It is not set here, because a number in two places is a number that
+      # disagrees with itself by next month. What this step adds is that somebody has to
+      # look at it: `npm run scan` exits non-zero when the count goes above the ratchet,
+      # and the scanner's database is refreshed daily, so that will happen.
+      - name: Image scan against the threshold
+        run: |
+          npm run image:build
+          npm run scan
+
   contract:
     name: publish -> verify -> can-i-deploy
     runs-on: ubuntu-latest

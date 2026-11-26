@@ -1,0 +1,4 @@
+name: marketplace
+runtime: nodejs
+description: The marketplace API in a Kubernetes cluster — image, data layer, rollout, budget.
+main: index.ts
